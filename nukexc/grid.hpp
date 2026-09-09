@@ -36,8 +36,6 @@
 #pragma once
 
 #include <Kokkos_Core.hpp>
-#include <catch2/catch_all.hpp>
-#include <catch2/matchers/catch_matchers.hpp>
 
 #include <integratorxx/composite_quadratures/spherical_quadrature.hpp>
 #include <integratorxx/generators/radial_factory.hpp>
