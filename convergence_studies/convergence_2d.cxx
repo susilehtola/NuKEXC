@@ -88,6 +88,8 @@
 #include <iostream>
 #include <vector>
 
+#include "sto_basis_reader.hpp"
+
 using namespace Nukexc;
 
 using bk_type = IntegratorXX::Becke<double, double>;
@@ -177,7 +179,7 @@ int main() {
     const size_t nang_ref = 41;
 
     auto mol = make_h2_mol();
-    auto basis = load_adf_basis(mol, "input/zorabasis/QZ4P");
+    auto basis = test::load_adf_basis(mol, "input/zorabasis/QZ4P");
 
     // ---- Shared reference (mean of both schemes on the finest grid) --------
     size_t npts_ref_bk = 0, npts_ref_ta = 0;

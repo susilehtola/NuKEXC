@@ -34,6 +34,7 @@
  */
 
 #include "standalone_helpers.hpp"
+#include "sto_basis_reader.hpp"
 
 #include <armadillo>
 #include <integratorxx/quadratures/s2/lebedev_laikov.hpp>
@@ -232,8 +233,9 @@ int main() {
     ;
     STOBasisSet basis, basis_aux;
     double screening_tol = 1e-3; // Not used in dense algorithm
-    basis = load_adf_basis(mol, basis_dir);
-    basis_aux = load_adf_basis(mol, basis_dir, screening_tol, true);
+    basis = test::load_adf_basis(mol, basis_dir);
+    basis_aux =
+        test::load_adf_basis(mol, basis_dir, screening_tol, /*fit=*/true);
 
     // Create the quadrature grid
     int radial_points = 50;

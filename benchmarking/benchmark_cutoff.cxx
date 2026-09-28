@@ -52,6 +52,8 @@
 #include <stdexcept>
 #include <string>
 
+#include "sto_basis_reader.hpp"
+
 struct Config {
   std::string xyz_file = "input/water.xyz";
   std::string basis_dir = "input/zorabasis/QZ4P";
@@ -137,7 +139,7 @@ int main(int argc, char *argv[]) {
     std::cout << "├─────────────────┼───────────────┼───────────────┤\n";
 
     for (double tol = cfg.tol_start; tol > cfg.tol_end; tol /= 10) {
-      STOBasisSet basis = load_adf_basis(mol, cfg.basis_dir, tol);
+      STOBasisSet basis = test::load_adf_basis(mol, cfg.basis_dir, tol);
       int N = basis.nbf();
 
       Kokkos::View<int64_t> counter("counter");

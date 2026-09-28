@@ -55,6 +55,8 @@
 
 #include "test_io.hpp"
 
+#include "sto_basis_reader.hpp"
+
 using namespace Nukexc;
 
 struct Config {
@@ -121,19 +123,19 @@ void print_config(const Config &cfg) {
 TEST_CASE("H2O_thakkar", "[h20_thakkar]") {
   Molecule mol;
   read_xyz("input/water.xyz", mol);
-  STOBasisSet basis = load_thakkar_basis(mol, "input/k99light/neutral");
+  STOBasisSet basis = test::load_thakkar_primitives(mol, "input/k99light/neutral");
 };
 
 TEST_CASE("H2O_adf_regular", "[h20][adf]") {
   Molecule mol;
   read_xyz("input/water.xyz", mol);
-  STOBasisSet basis = load_adf_basis(mol);
+  STOBasisSet basis = test::load_adf_basis(mol, "input/zorabasis/TZP");
 };
 
 TEST_CASE("H2O_adf_QZ4P", "[h20][adf]") {
   Molecule mol;
   read_xyz("input/water.xyz", mol);
-  STOBasisSet basis = load_adf_basis(mol, "input/zorabasis/QZ4P");
+  STOBasisSet basis = test::load_adf_basis(mol, "input/zorabasis/QZ4P");
 };
 
 TEST_CASE("H2O_adf_QZ4P_AUX", "[h20][adf][fit]") {
@@ -141,7 +143,7 @@ TEST_CASE("H2O_adf_QZ4P_AUX", "[h20][adf][fit]") {
   read_xyz("input/water.xyz", mol);
   const bool fit = true;
   const double tol = 1e-10;
-  STOBasisSet basis = load_adf_basis(mol, "input/zorabasis/QZ4P", tol, fit);
+  STOBasisSet basis = test::load_adf_basis(mol, "input/zorabasis/QZ4P", tol, fit);
 };
 
 TEST_CASE("H2O_adf_QZ4P_AUX_cholesky", "[h20][adf][fit][cholesky]") {
@@ -150,12 +152,12 @@ TEST_CASE("H2O_adf_QZ4P_AUX_cholesky", "[h20][adf][fit][cholesky]") {
   const bool fit = true;
   const double tol = 1e-10;
 
-  STOBasisSet basis = load_adf_basis(mol, "input/zorabasis/QZ4P", tol);
+  STOBasisSet basis = test::load_adf_basis(mol, "input/zorabasis/QZ4P", tol);
   STOBasisSet basis_cholesky =
-      load_adf_basis(mol, "input/zorabasis_cholesky/QZ4P.cholesky", tol);
-  STOBasisSet basis_aux = load_adf_basis(mol, "input/zorabasis/QZ4P", tol, fit);
+      test::load_adf_basis(mol, "input/zorabasis_cholesky/QZ4P.cholesky", tol);
+  STOBasisSet basis_aux = test::load_adf_basis(mol, "input/zorabasis/QZ4P", tol, fit);
   STOBasisSet basis_aux_cholesky =
-      load_adf_basis(mol, "input/zorabasis_cholesky/QZ4P.cholesky", tol, fit);
+      test::load_adf_basis(mol, "input/zorabasis_cholesky/QZ4P.cholesky", tol, fit);
 
   // Check that both regular basis sets are the same
   REQUIRE(basis.nbf() == basis_cholesky.nbf());
@@ -174,7 +176,7 @@ TEST_CASE("Basis Cutoff", "[h20][cutoff]") {
   double cutoff_tol = 1e-15;
   Molecule mol;
   read_xyz("input/water.xyz", mol);
-  STOBasisSet basis = load_adf_basis(mol, "input/zorabasis/QZ4P", cutoff_tol);
+  STOBasisSet basis = test::load_adf_basis(mol, "input/zorabasis/QZ4P", cutoff_tol);
 
   FlatGrid grid = make_flat_grid<ta_type, ll_type>(mol, 100, 50);
 
@@ -223,7 +225,7 @@ void benchmark_collocation(Config cfg) {
   double cutoff_tol = cfg.screening_tol;
   Molecule mol;
   read_xyz("input/water.xyz", mol);
-  STOBasisSet basis = load_adf_basis(mol, "input/zorabasis/QZ4P", cutoff_tol);
+  STOBasisSet basis = test::load_adf_basis(mol, "input/zorabasis/QZ4P", cutoff_tol);
 
   FlatGrid grid = make_flat_grid<bk_type, ll_type>(mol, cfg.nrad, cfg.nang);
   int N_bf = basis.nbf();
@@ -757,14 +759,15 @@ int main(int argc, char *argv[]) {
   }
 
   Kokkos::initialize();
+  int result = 0;
   {
     if (cfg.benchmark) {
       print_config(cfg);
       benchmark_collocation(cfg);
     } else {
-      int result = Catch::Session().run();
+      result = Catch::Session().run();
     }
   }
   Kokkos::finalize();
-  return 0;
+  return result;
 }

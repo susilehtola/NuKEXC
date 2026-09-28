@@ -57,6 +57,8 @@
 #include "nukexc/octree.hpp"
 #include "standards.hpp"
 
+#include "sto_basis_reader.hpp"
+
 using namespace Nukexc;
 
 using ta_type = IntegratorXX::TreutlerAhlrichs<double, double>;
@@ -66,7 +68,7 @@ TEST_CASE("H20", "[h20_weights]") {
 
   // Generate water
   Molecule mol = make_water();
-  STOBasisSet stobasis = load_adf_basis(mol);
+  STOBasisSet stobasis = test::load_adf_basis(mol, "input/zorabasis/TZP");
   FlatGrid grid = make_flat_grid<ta_type, ll_type>(mol);
 
   DeviceView2DLeft S =
@@ -86,7 +88,7 @@ TEST_CASE("Compute core Hamiltonian with screening",
   using angular_type = ll_type;
 
   Molecule mol = make_water();
-  STOBasisSet basis = load_adf_basis(mol, "input/zorabasis/QZ4P", 1e-10);
+  STOBasisSet basis = test::load_adf_basis(mol, "input/zorabasis/QZ4P", 1e-10);
   FlatGrid grid = make_flat_grid<radial_type, angular_type>(mol, 50, 30);
   FlatGrid grid_ref = make_flat_grid<radial_type, angular_type>(mol, 50, 30);
 
@@ -136,7 +138,7 @@ TEST_CASE("Compute core Hamiltonian with screening (basis on the fly)",
   using angular_type = ll_type;
 
   Molecule mol = make_water();
-  STOBasisSet basis = load_adf_basis(mol, "input/zorabasis/QZ4P", 1e-10);
+  STOBasisSet basis = test::load_adf_basis(mol, "input/zorabasis/QZ4P", 1e-10);
   FlatGrid grid = make_flat_grid<radial_type, angular_type>(mol, 50, 30);
   FlatGrid grid_ref = make_flat_grid<radial_type, angular_type>(mol, 50, 30);
 
@@ -186,7 +188,7 @@ TEST_CASE("Compute core Hamiltonian with screening (basis tiled)",
   using angular_type = ll_type;
 
   Molecule mol = make_water();
-  STOBasisSet basis = load_adf_basis(mol, "input/zorabasis/QZ4P", 1e-10);
+  STOBasisSet basis = test::load_adf_basis(mol, "input/zorabasis/QZ4P", 1e-10);
   FlatGrid grid = make_flat_grid<radial_type, angular_type>(mol, 50, 30);
   FlatGrid grid_ref = make_flat_grid<radial_type, angular_type>(mol, 50, 30);
 
@@ -248,7 +250,7 @@ TEST_CASE("Compute core Hamiltonian with screening (basis sparse)",
   using angular_type = ll_type;
 
   Molecule mol = make_water();
-  STOBasisSet basis = load_adf_basis(mol, "input/zorabasis/QZ4P", 1e-10);
+  STOBasisSet basis = test::load_adf_basis(mol, "input/zorabasis/QZ4P", 1e-10);
   FlatGrid grid = make_flat_grid<radial_type, angular_type>(mol, 50, 30);
   FlatGrid grid_ref = make_flat_grid<radial_type, angular_type>(mol, 50, 30);
 

@@ -52,6 +52,8 @@
 #include "standards.hpp"
 #include "test_io.hpp"
 
+#include "sto_basis_reader.hpp"
+
 using namespace Nukexc;
 
 // ── Config
@@ -190,7 +192,7 @@ void run_benchmark_fused(const Config &cfg) {
 
   std::vector<BenchmarkResult> results;
   for (auto &[name, mol] : make_molecules()) {
-    STOBasisSet basis = load_adf_basis(mol, cfg.basis_dir, cfg.screening_tol);
+    STOBasisSet basis = test::load_adf_basis(mol, cfg.basis_dir, cfg.screening_tol);
 
     Kokkos::Timer total_timer, grid_timer, core_hamiltonian_timer;
     total_timer.reset();
@@ -221,7 +223,7 @@ void run_benchmark_screened(const Config &cfg) {
 
   std::vector<BenchmarkResult> results;
   for (auto &[name, mol] : make_molecules()) {
-    STOBasisSet basis = load_adf_basis(mol, cfg.basis_dir, cfg.screening_tol);
+    STOBasisSet basis = test::load_adf_basis(mol, cfg.basis_dir, cfg.screening_tol);
 
     Kokkos::Timer total_timer, grid_timer, nl_timer, core_hamiltonian_timer;
 
@@ -261,7 +263,7 @@ void run_benchmark_scratch(const Config &cfg) {
 
   std::vector<BenchmarkResult> results;
   for (auto &[name, mol] : make_molecules()) {
-    STOBasisSet basis = load_adf_basis(mol, cfg.basis_dir, cfg.screening_tol);
+    STOBasisSet basis = test::load_adf_basis(mol, cfg.basis_dir, cfg.screening_tol);
 
     Kokkos::Timer total_timer, grid_timer, nl_timer, core_hamiltonian_timer;
     total_timer.reset();
@@ -300,7 +302,7 @@ void run_benchmark_tiled(const Config &cfg) {
 
   std::vector<BenchmarkResult> results;
   for (auto &[name, mol] : make_molecules()) {
-    STOBasisSet basis = load_adf_basis(mol, cfg.basis_dir, cfg.screening_tol);
+    STOBasisSet basis = test::load_adf_basis(mol, cfg.basis_dir, cfg.screening_tol);
 
     Kokkos::Timer total_timer, grid_timer, nl_timer, core_hamiltonian_timer;
     total_timer.reset();
@@ -339,7 +341,7 @@ void run_benchmark_sparse(const Config &cfg) {
 
   std::vector<BenchmarkResult> results;
   for (auto &[name, mol] : make_molecules()) {
-    STOBasisSet basis = load_adf_basis(mol, cfg.basis_dir, cfg.screening_tol);
+    STOBasisSet basis = test::load_adf_basis(mol, cfg.basis_dir, cfg.screening_tol);
 
     Kokkos::Timer total_timer, grid_timer, nl_timer, core_hamiltonian_timer;
     total_timer.reset();

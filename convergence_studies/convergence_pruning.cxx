@@ -87,6 +87,8 @@
 #include <iostream>
 #include <vector>
 
+#include "sto_basis_reader.hpp"
+
 using namespace Nukexc;
 
 using ta_type = IntegratorXX::TreutlerAhlrichs<double, double>;
@@ -142,8 +144,8 @@ int main() {
 
     ExecSpace space;
     auto mol = make_water();
-    auto basis = load_adf_basis(mol, "input/zorabasis/QZ4P");
-    auto basis_aux = load_adf_basis(mol, "input/zorabasis/QZ4P", 1e-10, true);
+    auto basis = test::load_adf_basis(mol, "input/zorabasis/QZ4P");
+    auto basis_aux = test::load_adf_basis(mol, "input/zorabasis/QZ4P", 1e-10, true);
 
     // Reference: fine uniform unpruned grid (finer than every swept level).
     size_t npts_ref = 0;

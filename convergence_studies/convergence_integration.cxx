@@ -61,6 +61,8 @@
 #include "standards.hpp"
 #include "test_io.hpp"
 
+#include "sto_basis_reader.hpp"
+
 using namespace Nukexc;
 
 using bk_type = IntegratorXX::Becke<double, double>;
@@ -131,7 +133,7 @@ CoreHamiltonianResult compute_reference(const Config cfg, size_t nrad,
                                         size_t ang_order) {
   Molecule mol;
   read_xyz(cfg.xyz_file, mol);
-  STOBasisSet stobasis = load_adf_basis(mol, cfg.basis_dir, cfg.screening_tol);
+  STOBasisSet stobasis = test::load_adf_basis(mol, cfg.basis_dir, cfg.screening_tol);
 
   FlatGrid grid =
       make_flat_grid<radial_type, angular_type>(mol, nrad, ang_order);
@@ -159,7 +161,7 @@ void convergence_analysis(const Config &cfg,
 
   Molecule mol;
   read_xyz(cfg.xyz_file, mol);
-  STOBasisSet stobasis = load_adf_basis(mol, cfg.basis_dir, cfg.screening_tol);
+  STOBasisSet stobasis = test::load_adf_basis(mol, cfg.basis_dir, cfg.screening_tol);
 
   FlatGrid grid =
       make_flat_grid<radial_type, angular_type>(mol, nrad, ang_order);
