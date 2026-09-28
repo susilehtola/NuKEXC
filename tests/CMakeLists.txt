@@ -68,3 +68,5 @@ add_test( NAME DENSITY_TEST COMMAND $<TARGET_FILE:test_density> )
 add_test( NAME LIBXC_TEST COMMAND $<TARGET_FILE:test_libxc> )
 add_test( NAME HELIUM_TEST COMMAND $<TARGET_FILE:test_helium> )
 add_test( NAME GTO_BASIS_TEST COMMAND $<TARGET_FILE:test_gto_basis> )
+# test_arborx was built but never registered, so nothing ran it.
+add_test( NAME ARBORX_TEST COMMAND $<TARGET_FILE:test_arborx> )

@@ -49,9 +49,10 @@ TEST_CASE("H20", "[h20_molecule]") {
 
 int main() {
   Kokkos::initialize();
+  int result = 0;
   {
-    int result = Catch::Session().run();
+    result = Catch::Session().run();
   }
   Kokkos::finalize();
-  return 0;
+  return result;
 }
