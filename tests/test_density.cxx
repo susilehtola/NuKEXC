@@ -127,7 +127,7 @@ TEST_CASE("hydrogen 1s density -- integrates to one electron",
   Kokkos::deep_copy(mo_orbitals, orbitals_h);
   Kokkos::deep_copy(mo_coeff, coeff_h);
 
-  DeviceView1D density = compute_density(basis, grid, mo_orbitals, mo_coeff);
+  DeviceView1D density = compute_density(STOPrimitiveEvaluator(basis), grid, mo_orbitals, mo_coeff);
 
   // Integrate density against quadrature weights: ∫ρ(r)dr should equal N_elec =
   // 1
@@ -182,7 +182,7 @@ TEST_CASE("H2+ bonding MO density -- integrates to one electron",
   Kokkos::deep_copy(mo_orbitals, orbitals_h);
   Kokkos::deep_copy(mo_coeff, coeff_h);
 
-  DeviceView1D density = compute_density(basis, grid, mo_orbitals, mo_coeff);
+  DeviceView1D density = compute_density(STOPrimitiveEvaluator(basis), grid, mo_orbitals, mo_coeff);
   write_density_vtk("h2plus_density_1s.vtk", grid, density);
 
   double integrated_density = 0.0;
@@ -237,7 +237,7 @@ TEST_CASE("H2+ QZ4P lowest MO density -- integrates to one electron",
   Kokkos::deep_copy(mo_occ_coeff, 1.0);
 
   DeviceView1D density =
-      compute_density(basis, grid, mo_occ_orbitals, mo_occ_coeff);
+      compute_density(STOPrimitiveEvaluator(basis), grid, mo_occ_orbitals, mo_occ_coeff);
   write_density_vtk("h2plus_density_QZ4P.vtk", grid, density);
 
   double integrated_density = 0.0;
