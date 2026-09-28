@@ -37,9 +37,7 @@
 
 #include <Kokkos_Core.hpp>
 #include <Kokkos_Macros.hpp>
-#include <cctype>
-#include <fstream>
-#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -63,15 +61,6 @@ struct STOBasisSet {
   size_t nbf() const { return O.extent(0); };
 };
 
-// Map shell labels to l values
-int label_to_l(char label) {
-  label = std::toupper(label);
-  static const std::string order =
-      "SPDFGHI"; // Standard spectroscopic notation (skipping J)
-  size_t pos = order.find(label);
-  return (pos != std::string::npos) ? static_cast<int>(pos) : -1;
-}
-
 // ============================================================
 //  Manual STOBasisSet
 // ============================================================
@@ -87,7 +76,7 @@ struct STOFunc {
   double zeta;
   double ox, oy, oz;
 };
-double compute_cutoff(STOFunc f, const double norm, const double cutoff_tol) {
+inline double compute_cutoff(STOFunc f, const double norm, const double cutoff_tol) {
   // Preconditions
   KOKKOS_ASSERT(f.n >= 1);
   KOKKOS_ASSERT(f.zeta > 0.0);
@@ -172,9 +161,73 @@ double compute_cutoff(STOFunc f, const double norm, const double cutoff_tol) {
   return r;
 }
 
-STOBasisSet make_manual_basis(const std::vector<STOFunc> &funcs,
-                              double cutoff_tol = 1e-10) {
-  const size_t nbf = funcs.size();
+// ============================================================
+//  Caller-supplied basis-set input
+// ============================================================
+//
+// NuKEXC does not read basis-set files. The calling program owns basis-set
+// input -- file formats, library paths, element tables -- and hands the result
+// over as plain arrays through STOBasisInput, which any C-ABI caller can fill.
+// (The Gaussian- and ADF-format readers that used to live here now sit in
+// tests/sto_basis_reader.hpp, where they serve the vendored test data under
+// input/.)
+//
+// Each entry is one Slater-type basis function
+//
+//     chi(r) = norm * r^(n-1) * exp(-zeta r) * S_lm(x, y, z)
+//
+// with S_lm the real solid harmonic of spherical_harmonics.hpp.
+
+/// Caller-supplied description of an STO basis set.
+struct STOBasisInput {
+  /// Number of basis functions.
+  int nbf = 0;
+
+  /// Principal quantum number per function. [nbf]
+  const int *n = nullptr;
+  /// Angular momentum per function. [nbf]
+  const int *l = nullptr;
+  /// Magnetic quantum number per function, -l .. +l. [nbf]
+  const int *m = nullptr;
+  /// Slater exponents. [nbf]
+  const double *zeta = nullptr;
+  /// Function centers, x/y/z interleaved. [3 * nbf]
+  const double *centers = nullptr;
+
+  /// Optional explicit normalization constants. [nbf]
+  /// When null, the Slater norm (2 zeta)^(n + 1/2) / sqrt((2n)!) is used.
+  const double *norm = nullptr;
+
+  /// Amplitude below which a function is treated as zero; sets the per-function
+  /// screening radius handed to the ArborX neighbour lists.
+  double cutoff_tolerance = 1e-10;
+};
+
+/**
+ *  @brief Build an STOBasisSet from caller-supplied arrays.
+ *
+ *  Validates eagerly and throws std::invalid_argument on malformed input: a
+ *  bad basis is a caller bug, and quietly dropping functions would produce a
+ *  wrong answer that still looks like a converged calculation.
+ */
+inline STOBasisSet make_sto_basis(const STOBasisInput &in) {
+  auto require = [](bool cond, const std::string &what) {
+    if (!cond)
+      throw std::invalid_argument("make_sto_basis: " + what);
+  };
+
+  require(in.nbf >= 0, "negative basis-function count");
+  if (in.nbf == 0)
+    return STOBasisSet{};
+
+  require(in.n != nullptr, "n array is null");
+  require(in.l != nullptr, "l array is null");
+  require(in.m != nullptr, "m array is null");
+  require(in.zeta != nullptr, "zeta array is null");
+  require(in.centers != nullptr, "centers array is null");
+  require(in.cutoff_tolerance > 0.0, "non-positive cutoff tolerance");
+
+  const size_t nbf = static_cast<size_t>(in.nbf);
 
   STOBasisSet basis;
   basis.n = Kokkos::View<int *>("n", nbf);
@@ -192,25 +245,39 @@ STOBasisSet make_manual_basis(const std::vector<STOFunc> &funcs,
   auto norm_h = Kokkos::create_mirror_view(basis.norm);
   auto O_h = Kokkos::create_mirror_view(basis.O);
   auto cutoff_radii_h = Kokkos::create_mirror_view(basis.cutoff_radii);
+
   for (size_t i = 0; i < nbf; ++i) {
-    const auto &f = funcs[i];
+    const int ni = in.n[i];
+    const int li = in.l[i];
+    const int mi = in.m[i];
+    const double zi = in.zeta[i];
+    const std::string at = "function " + std::to_string(i) + ": ";
 
-    // Matches the normalization used by load_sto_basis:
-    //   N = (2*zeta)^{n+0.5} / sqrt((2n)!)
-    const double norm = std::pow(2.0 * f.zeta, f.n + 0.5) /
-                        std::sqrt(static_cast<double>(factorial(2 * f.n)));
+    require(ni >= 1, at + "principal quantum number must be >= 1");
+    require(li >= 0, at + "negative angular momentum");
+    require(li < ni, at + "l must be < n");
+    require(mi >= -li && mi <= li, at + "|m| > l");
+    require(zi > 0.0, at + "non-positive exponent");
 
-    // Compute cutoff radius, with the Newton-Raphson method
-    //
-    n_h(i) = f.n;
-    l_h(i) = f.l;
-    m_h(i) = f.m;
-    zeta_h(i) = f.zeta;
+    // Slater normalization, matching what the ADF/Thakkar readers produced:
+    //   N = (2 zeta)^(n + 1/2) / sqrt((2n)!)
+    const double norm =
+        in.norm ? in.norm[i]
+                : std::pow(2.0 * zi, ni + 0.5) /
+                      std::sqrt(static_cast<double>(factorial(2 * ni)));
+    require(norm > 0.0, at + "non-positive normalization constant");
+
+    n_h(i) = ni;
+    l_h(i) = li;
+    m_h(i) = mi;
+    zeta_h(i) = zi;
     norm_h(i) = norm;
-    O_h(i)[0] = f.ox;
-    O_h(i)[1] = f.oy;
-    O_h(i)[2] = f.oz;
-    cutoff_radii_h(i) = compute_cutoff(f, norm, cutoff_tol);
+    O_h(i)[0] = in.centers[3 * i + 0];
+    O_h(i)[1] = in.centers[3 * i + 1];
+    O_h(i)[2] = in.centers[3 * i + 2];
+    cutoff_radii_h(i) =
+        compute_cutoff(STOFunc{ni, li, mi, zi, 0.0, 0.0, 0.0}, norm,
+                       in.cutoff_tolerance);
   }
 
   Kokkos::deep_copy(basis.n, n_h);
@@ -224,150 +291,32 @@ STOBasisSet make_manual_basis(const std::vector<STOFunc> &funcs,
   return basis;
 }
 
-STOBasisSet load_adf_basis(const Molecule &mol,
-                           const std::string &data_dir = "input/zorabasis/TZP",
-                           const double cutoff_tol = 1e-10,
-                           const bool fit = false) {
-
-  std::vector<STOFunc> temp_basis;
-  auto Z_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, mol.Z);
-
-  for (size_t i = 0; i < mol.natoms; ++i) {
-    std::string element_symbol = detail::symbols[Z_h(i)];
-    element_symbol[0] = std::toupper(element_symbol[0]);
-
-    std::string filename = data_dir + "/" + element_symbol;
-
-    std::ifstream file(filename);
-    if (!file.is_open())
-      continue;
-
-    std::string line;
-
-    // Skip all lines until we find the basis keyword
-    std::string basis_keyword = fit ? "FIT" : "BASIS";
-    while (std::getline(file, line)) {
-      if (line.find(basis_keyword) != std::string::npos)
-        break;
-    }
-
-    // Read line by line until we find END keyword
-    while (std::getline(file, line)) {
-
-      if (line.find("END") != std::string::npos) {
-        break;
-
-        // Skip the line if it is empty
-      } else if (line.empty()) {
-        continue;
-
-      } else {
-
-        // momentum labels This handles S, P, D, F, G, H, I, K (l=0 to 7)
-
-        //  Parse Basis rows: Label (e.g. 4F), zeta
-        std::stringstream ss(line);
-        std::string label;
-        double zeta;
-
-        if (ss >> label >> zeta) {
-
-          int n = std::stoi(label.substr(0, 1));
-          int l = label_to_l(label[1]);
-
-          auto atom_centers_h = Kokkos::create_mirror_view_and_copy(
-              HostSpace{}, mol.atom_centers);
-
-          // 4. Expand for each m component (-l to +l)
-          // This accounts for the degeneracy of higher l states
-          for (int m = -l; m <= l; ++m) {
-            temp_basis.push_back({n, l, m, zeta, atom_centers_h(i)[0],
-                                  atom_centers_h(i)[1], atom_centers_h(i)[2]});
-          }
-        }
-      }
-    }
-  }
-  return make_manual_basis(temp_basis, cutoff_tol);
-}
-
-STOBasisSet
-load_thakkar_basis(const Molecule &mol,
-                   const std::string &data_dir = "input/k99light/neutral",
-                   const double cutoff_tol = 1e-10) {
-
-  std::vector<STOFunc> temp_basis;
-
-  auto Z_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, mol.Z);
-  for (size_t i = 0; i < mol.natoms; ++i) {
-    std::string element_symbol = detail::symbols[Z_h(i)];
-    element_symbol[0] = std::tolower(element_symbol[0]);
-
-    std::string filename = data_dir + "/" + element_symbol;
-
-    std::ifstream file(filename);
-    if (!file.is_open())
-      continue;
-
-    std::string line;
-    int current_l = 0;
-
-    while (std::getline(file, line)) {
-      if (line.empty())
-        continue;
-
-      // 1. Peek at the first word of the line
-      std::stringstream check_ss(line);
-      std::string first_word;
-      check_ss >> first_word;
-
-      // 2. If the first word is a single letter (S, P, D, etc.)
-      if (first_word.length() == 1) {
-        int found_l = label_to_l(first_word[0]);
-        if (found_l != -1) {
-          current_l = found_l;
-          // Don't 'continue' here!
-          // The line might also contain the first basis function.
-        }
-      }
-
-      // Detect any shell block by checking for single-letter angular
-      // momentum labels This handles S, P, D, F, G, H, I, K (l=0 to 7)
-
-      // Skip headers/metadata
-      if (line.find("BASIS") != std::string::npos ||
-          line.find("CUSP") != std::string::npos)
-        continue;
-
-      //  Parse Basis rows: Label (e.g. 4F), zeta, then coefficients
-      std::stringstream ss(line);
-      std::string label;
-      double zeta;
-
-      if (ss >> label >> zeta) {
-        // Ensure the label starts with a digit (the n quantum number)
-        if (!std::isdigit(label[0]))
-          continue;
-
-        int n = std::stoi(label.substr(0, 1));
-        std::vector<double> coeffs;
-        double c;
-        while (ss >> c)
-          coeffs.push_back(c);
-
-        auto atom_centers_h =
-            Kokkos::create_mirror_view_and_copy(HostSpace{}, mol.atom_centers);
-        // 4. Expand for each m component (-l to +l)
-        // This accounts for the degeneracy of higher l states
-        for (int m = -current_l; m <= current_l; ++m) {
-          temp_basis.push_back({n, current_l, m, zeta, atom_centers_h(i)[0],
-                                atom_centers_h(i)[1], atom_centers_h(i)[2]});
-        }
-      }
-    }
+/// Convenience wrapper over make_sto_basis for C++ callers holding a list of
+/// STOFunc. Kept because it reads better in tests than filling five arrays.
+inline STOBasisSet make_manual_basis(const std::vector<STOFunc> &funcs,
+                                     double cutoff_tol = 1e-10) {
+  const size_t nbf = funcs.size();
+  std::vector<int> n(nbf), l(nbf), m(nbf);
+  std::vector<double> zeta(nbf), centers(3 * nbf);
+  for (size_t i = 0; i < nbf; ++i) {
+    n[i] = funcs[i].n;
+    l[i] = funcs[i].l;
+    m[i] = funcs[i].m;
+    zeta[i] = funcs[i].zeta;
+    centers[3 * i + 0] = funcs[i].ox;
+    centers[3 * i + 1] = funcs[i].oy;
+    centers[3 * i + 2] = funcs[i].oz;
   }
 
-  return make_manual_basis(temp_basis, cutoff_tol);
+  STOBasisInput in;
+  in.nbf = static_cast<int>(nbf);
+  in.n = n.data();
+  in.l = l.data();
+  in.m = m.data();
+  in.zeta = zeta.data();
+  in.centers = centers.data();
+  in.cutoff_tolerance = cutoff_tol;
+  return make_sto_basis(in);
 }
 
 struct ShellParams {

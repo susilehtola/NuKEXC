@@ -62,6 +62,8 @@
 
 #include <xc.h>
 #include <xc_funcs.h>
+
+#include "sto_basis_reader.hpp"
 using namespace Nukexc;
 
 using bk_type = IntegratorXX::Becke<double, double>;
@@ -401,7 +403,7 @@ TEST_CASE("H2+ Energies", "[h2_plus][energies]") {
   auto grid = make_flat_grid<bk_type, ll_type>(mol);
 
   // Build the basis explicitly so the zeta value is unambiguous.
-  STOBasisSet basis = load_adf_basis(mol, "input/zorabasis/QZ4P");
+  STOBasisSet basis = test::load_adf_basis(mol, "input/zorabasis/QZ4P");
   CoreHamiltonianResult result = compute_core_hamiltonian(basis, grid);
   DeviceView2DLeft S = result.overlap;
   DeviceView2DLeft T = result.kinetic;
@@ -499,7 +501,7 @@ TEST_CASE("H2+ Energies Fused Hamiltonian",
   auto grid = make_flat_grid<bk_type, ll_type>(mol);
 
   // Build the basis explicitly so the zeta value is unambiguous.
-  STOBasisSet basis = load_adf_basis(mol, "input/zorabasis/QZ4P");
+  STOBasisSet basis = test::load_adf_basis(mol, "input/zorabasis/QZ4P");
 
   int n_basis = basis.nbf();
 

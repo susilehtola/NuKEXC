@@ -74,6 +74,8 @@
 #include <iostream>
 #include <vector>
 
+#include "sto_basis_reader.hpp"
+
 using namespace Nukexc;
 
 using bk_type = IntegratorXX::Becke<double, double>;
@@ -172,7 +174,7 @@ TEST_CASE("H2+ Core Hamiltonian radial convergence", "[convergence][radial]") {
   const size_t nang_order_fixed = 50; // high enough to be negligible
 
   auto mol = make_h2_mol();
-  auto basis = load_adf_basis(mol, "input/zorabasis/QZ4P");
+  auto basis = test::load_adf_basis(mol, "input/zorabasis/QZ4P");
 
   std::vector<ConvergencePoint> data;
   data.reserve(nrad_sweep.size());
@@ -270,7 +272,7 @@ TEST_CASE("H2+ Core Hamiltonian angular convergence",
   const size_t nrad_fixed = 2000;
 
   auto mol = make_h2_mol();
-  auto basis = load_adf_basis(mol, "input/zorabasis/QZ4P");
+  auto basis = test::load_adf_basis(mol, "input/zorabasis/QZ4P");
 
   // Compute reference
   double ref_energy;

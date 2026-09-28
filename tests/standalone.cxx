@@ -63,6 +63,8 @@
 #include <tuple>
 #include <vector>
 
+#include "sto_basis_reader.hpp"
+
 using namespace Nukexc;
 using bk_type = IntegratorXX::Becke<double, double>;
 using ta_type = IntegratorXX::TreutlerAhlrichs<double, double>;
@@ -297,12 +299,12 @@ int main(int argc, char *argv[]) {
       TIME_SCOPE(startup_timing, "Load basis sets");
       {
         TIME_SCOPE(startup_timing, "Load primary basis");
-        basis = load_adf_basis(mol, cfg.basis_file, screening_tol);
+        basis = test::load_adf_basis(mol, cfg.basis_file, screening_tol);
       }
       {
         TIME_SCOPE(startup_timing, "Load auxiliary (fitting) basis");
         basis_aux =
-            load_adf_basis(mol, cfg.basis_file, screening_tol, /*fit=*/true);
+            test::load_adf_basis(mol, cfg.basis_file, screening_tol, /*fit=*/true);
       }
     }
 
