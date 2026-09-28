@@ -45,6 +45,8 @@
 #include <iostream>
 #include <vector>
 
+#include "sto_basis_reader.hpp"
+
 using namespace Nukexc;
 
 TEST_CASE("NeighborList: benzene regression",
@@ -59,7 +61,7 @@ TEST_CASE("NeighborList: benzene regression",
   using ll_type = IntegratorXX::LebedevLaikov<double>;
 
   Molecule mol = make_benzene();
-  STOBasisSet basis = load_adf_basis(mol, "input/zorabasis/QZ4P", 1e-6);
+  STOBasisSet basis = test::load_adf_basis(mol, "input/zorabasis/QZ4P", 1e-6);
   FlatGrid grid = make_flat_grid<ta_type, ll_type>(mol, 30, 30);
 
   const int points_per_box = 8;
@@ -107,7 +109,7 @@ TEST_CASE("NeighborList: taxol regression",
   using ll_type = IntegratorXX::LebedevLaikov<double>;
 
   Molecule mol = make_taxol();
-  STOBasisSet basis = load_adf_basis(mol, "input/zorabasis/TZP", 1e-6);
+  STOBasisSet basis = test::load_adf_basis(mol, "input/zorabasis/TZP", 1e-6);
   FlatGrid grid = make_flat_grid<ta_type, ll_type>(mol, 30, 30);
 
   const int points_per_box = 8;
@@ -145,9 +147,10 @@ TEST_CASE("NeighborList: taxol regression",
 
 int main(int argc, char *argv[]) {
   Kokkos::initialize(argc, argv);
+  int result = 0;
   {
-    int result = Catch::Session().run(argc, argv);
+    result = Catch::Session().run(argc, argv);
   }
   Kokkos::finalize();
-  return 0;
+  return result;
 }
