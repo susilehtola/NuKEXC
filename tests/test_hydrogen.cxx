@@ -674,11 +674,10 @@ TEST_CASE("compute_coulomb sparse -- hydrogen 1s self-repulsion",
 
   // Compute (A|B)
   DeviceView2DLeft aux_overlap_sym =
-      coulomb_overlap_integral_sparse(space, basis_aux, grid, nl_aux);
+      coulomb_overlap_integral_sparse(space, STOPotentialEvaluator(basis_aux), grid, nl_aux);
   DeviceView2DLeft half_inverse_X = compute_half_inverse(aux_overlap_sym, 1e-4);
 
-  DeviceView2DLeft J = compute_coulomb_sparse(
-      space, mo_orbitals, mo_coeff, basis, basis_aux, grid, nl, half_inverse_X);
+  DeviceView2DLeft J = compute_coulomb_sparse(space, mo_orbitals, mo_coeff, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl, half_inverse_X);
 
   auto J_h = Kokkos::create_mirror_view(J);
   Kokkos::deep_copy(J_h, J);
@@ -801,11 +800,10 @@ TEST_CASE("compute_exchange sparse -- hydrogen 1s self-exchange",
 
   // Compute (A|B)
   DeviceView2DLeft aux_overlap_sym =
-      coulomb_overlap_integral_sparse(space, basis_aux, grid, nl_aux);
+      coulomb_overlap_integral_sparse(space, STOPotentialEvaluator(basis_aux), grid, nl_aux);
   DeviceView2DLeft half_inverse_X = compute_half_inverse(aux_overlap_sym, 1e-4);
 
-  DeviceView2DLeft K = compute_exact_exchange_sparse(
-      space, mo_orbitals, mo_coeff, basis, basis_aux, grid, nl, half_inverse_X);
+  DeviceView2DLeft K = compute_exact_exchange_sparse(space, mo_orbitals, mo_coeff, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl, half_inverse_X);
 
   auto K_h = Kokkos::create_mirror_view(K);
   Kokkos::deep_copy(K_h, K);
@@ -944,11 +942,10 @@ TEST_CASE("compute_coulomb_tiled -- hydrogen 1s self-repulsion",
   build_neighbor_list(STOPrimitiveEvaluator(basis_aux), bb, max_points_per_box,
                       grid.quad_points.extent(0), nl_aux);
   auto aux_overlap_sym =
-      coulomb_overlap_integral_sparse(space, basis_aux, grid, nl_aux);
+      coulomb_overlap_integral_sparse(space, STOPotentialEvaluator(basis_aux), grid, nl_aux);
   auto half_inverse_X = compute_half_inverse(aux_overlap_sym, 1e-4);
 
-  DeviceView2DLeft J = compute_coulomb_tiled(
-      space, mo_orbitals, mo_coeff, basis, basis_aux, grid, nl, half_inverse_X);
+  DeviceView2DLeft J = compute_coulomb_tiled(space, mo_orbitals, mo_coeff, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl, half_inverse_X);
   auto J_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, J);
   REQUIRE_THAT(J_h(0, 0), Catch::Matchers::WithinRel(5.0 / 8.0, 1e-10));
 }
@@ -984,11 +981,10 @@ TEST_CASE("compute_exact_exchange_tiled -- hydrogen 1s self-exchange",
   build_neighbor_list(STOPrimitiveEvaluator(basis_aux), bb, max_points_per_box,
                       grid.quad_points.extent(0), nl_aux);
   auto aux_overlap_sym =
-      coulomb_overlap_integral_sparse(space, basis_aux, grid, nl_aux);
+      coulomb_overlap_integral_sparse(space, STOPotentialEvaluator(basis_aux), grid, nl_aux);
   auto half_inverse_X = compute_half_inverse(aux_overlap_sym, 1e-4);
 
-  DeviceView2DLeft K = compute_exact_exchange_tiled(
-      space, mo_orbitals, mo_coeff, basis, basis_aux, grid, nl, half_inverse_X);
+  DeviceView2DLeft K = compute_exact_exchange_tiled(space, mo_orbitals, mo_coeff, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl, half_inverse_X);
   auto K_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, K);
   REQUIRE_THAT(K_h(0, 0), Catch::Matchers::WithinRel(5.0 / 8.0, 1e-10));
 }
@@ -1036,14 +1032,14 @@ TEST_CASE("tiled Coulomb/exchange match sparse (multi-tile, tile=1)",
   build_neighbor_list(STOPrimitiveEvaluator(basis_aux), bb, max_points_per_box,
                       grid.quad_points.extent(0), nl_aux);
   auto aux_overlap_sym =
-      coulomb_overlap_integral_sparse(space, basis_aux, grid, nl_aux);
+      coulomb_overlap_integral_sparse(space, STOPotentialEvaluator(basis_aux), grid, nl_aux);
   auto half_inverse_X = compute_half_inverse(aux_overlap_sym, 1e-6);
 
   const int N_aux = basis_aux.nbf();
 
   // --- Coulomb overlap metric (A|B): tiled(tile=1) vs sparse, element-wise ---
   auto aux_overlap_tiled =
-      coulomb_overlap_integral_tiled(space, basis_aux, grid, nl_aux, 1);
+      coulomb_overlap_integral_tiled(space, STOPotentialEvaluator(basis_aux), grid, nl_aux, 1);
   auto So_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, aux_overlap_sym);
   auto St_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, aux_overlap_tiled);
   for (int a = 0; a < N_aux; ++a)
@@ -1051,10 +1047,8 @@ TEST_CASE("tiled Coulomb/exchange match sparse (multi-tile, tile=1)",
       REQUIRE_THAT(St_h(a, b), Catch::Matchers::WithinAbs(So_h(a, b), 1e-9));
 
   // --- Coulomb: tiled(tile=1) vs sparse, element-wise ---
-  auto J_sparse = compute_coulomb_sparse(space, mo_orbitals, mo_coeff, basis,
-                                         basis_aux, grid, nl, half_inverse_X);
-  auto J_tiled = compute_coulomb_tiled(space, mo_orbitals, mo_coeff, basis,
-                                       basis_aux, grid, nl, half_inverse_X, 1);
+  auto J_sparse = compute_coulomb_sparse(space, mo_orbitals, mo_coeff, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl, half_inverse_X);
+  auto J_tiled = compute_coulomb_tiled(space, mo_orbitals, mo_coeff, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl, half_inverse_X, 1);
   auto Js_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, J_sparse);
   auto Jt_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, J_tiled);
   for (int a = 0; a < N_bf; ++a)
@@ -1062,10 +1056,8 @@ TEST_CASE("tiled Coulomb/exchange match sparse (multi-tile, tile=1)",
       REQUIRE_THAT(Jt_h(a, b), Catch::Matchers::WithinAbs(Js_h(a, b), 1e-9));
 
   // --- Exchange: tiled(tile=1) vs sparse, element-wise ---
-  auto K_sparse = compute_exact_exchange_sparse(
-      space, mo_orbitals, mo_coeff, basis, basis_aux, grid, nl, half_inverse_X);
-  auto K_tiled = compute_exact_exchange_tiled(
-      space, mo_orbitals, mo_coeff, basis, basis_aux, grid, nl, half_inverse_X,
+  auto K_sparse = compute_exact_exchange_sparse(space, mo_orbitals, mo_coeff, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl, half_inverse_X);
+  auto K_tiled = compute_exact_exchange_tiled(space, mo_orbitals, mo_coeff, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl, half_inverse_X,
       1);
   auto Ks_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, K_sparse);
   auto Kt_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, K_tiled);

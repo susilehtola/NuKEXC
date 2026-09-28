@@ -38,6 +38,7 @@
 #include "density.hpp"
 #include "grid.hpp"
 #include "nukexc/octree.hpp"
+#include "basis_evaluator.hpp"
 #include "nukexc_config.hpp"
 #include "stobasis.hpp"
 #include "stopotential.hpp"
@@ -114,10 +115,13 @@ compute_coulomb(const ExecSpace space, const DeviceView2DLeft mo_orbitals,
   return result;
 }
 
+template <typename Evaluator, typename PotEvaluator>
+  requires BasisEvaluatorWith<Evaluator, BasisDeriv::Value> &&
+           PotentialEvaluator<PotEvaluator>
 DeviceView2DLeft compute_coulomb_sparse(
     const ExecSpace space, const DeviceView2DLeft mo_orbitals,
-    const DeviceView1D mo_coeff, const STOBasisSet basis,
-    const STOBasisSet basis_aux, const FlatGrid grid, const NeighborList nl,
+    const DeviceView1D mo_coeff, const Evaluator basis,
+    const PotEvaluator basis_aux, const FlatGrid grid, const NeighborList nl,
     const DeviceView2DLeft half_inverse_X) {
 
   Kokkos::Profiling::pushRegion("Compute Coulomb Integral Sparse");
@@ -208,7 +212,7 @@ DeviceView2DLeft compute_coulomb_sparse(
               for (int local_i = 0; local_i < num_neighbors; ++local_i) {
 
                 const int global_i = nl.neighbors(start_neighbors + local_i);
-                const ShellParams shell_i = load_shell(basis, global_i);
+                const auto shell_i = load_shell(basis, global_i);
                 phi_i = basis_eval_fast(shell_i, points_scratch(local_g)[0],
                                         points_scratch(local_g)[1],
                                         points_scratch(local_g)[2]);
@@ -217,7 +221,7 @@ DeviceView2DLeft compute_coulomb_sparse(
 
                   const int global_j = nl.neighbors(start_neighbors + local_j);
 
-                  const ShellParams shell_j = load_shell(basis, global_j);
+                  const auto shell_j = load_shell(basis, global_j);
                   phi_j = basis_eval_fast(shell_j, points_scratch(local_g)[0],
                                           points_scratch(local_g)[1],
                                           points_scratch(local_g)[2]);
@@ -242,18 +246,10 @@ DeviceView2DLeft compute_coulomb_sparse(
 
               for (int local_g = 0; local_g < num_points; ++local_g) {
 
-                const double dx =
-                    points_scratch(local_g)[0] - basis_aux.O(global_alpha)[0];
-                const double dy =
-                    points_scratch(local_g)[1] - basis_aux.O(global_alpha)[1];
-                const double dz =
-                    points_scratch(local_g)[2] - basis_aux.O(global_alpha)[2];
-                const double r =
-                    dist(points_scratch(local_g), basis_aux.O(global_alpha));
-
+                
                 local_sum_alpha +=
                     density_scratch_scaled(local_g) *
-                    sto_potential(basis_aux, global_alpha, dx, dy, dz, r);
+                    eval_aux_potential(basis_aux, global_alpha, points_scratch(local_g));
               }
               Kokkos::atomic_add(&expansion_coeff(global_alpha),
                                  local_sum_alpha);
@@ -309,17 +305,9 @@ DeviceView2DLeft compute_coulomb_sparse(
             Kokkos::TeamThreadRange(team_member, N_bf_aux),
             [=](const int global_alpha) {
               for (int local_g = 0; local_g < num_points; ++local_g) {
-                const double x =
-                    points_scratch(local_g)[0] - basis_aux.O(global_alpha)[0];
-                const double y =
-                    points_scratch(local_g)[1] - basis_aux.O(global_alpha)[1];
-                const double z =
-                    points_scratch(local_g)[2] - basis_aux.O(global_alpha)[2];
-                const double r =
-                    dist(points_scratch(local_g), basis_aux.O(global_alpha));
-
+                
                 double potential_alpha_scaled =
-                    sto_potential(basis_aux, global_alpha, x, y, z, r) *
+                    eval_aux_potential(basis_aux, global_alpha, points_scratch(local_g)) *
                     weights_scratch(local_g) * expansion_coeff(global_alpha);
 
                 Kokkos::atomic_add(&potential_scratch_scaled(local_g),
@@ -332,13 +320,13 @@ DeviceView2DLeft compute_coulomb_sparse(
             Kokkos::TeamThreadRange(team_member, num_neighbors),
             [=](const int local_i) {
               const int global_i = nl.neighbors(start_neighbors + local_i);
-              const ShellParams shell_i = load_shell(basis, global_i);
+              const auto shell_i = load_shell(basis, global_i);
 
               double phi_i;
               for (int local_j = 0; local_j <= local_i; ++local_j) {
 
                 const int global_j = nl.neighbors(start_neighbors + local_j);
-                const ShellParams shell_j = load_shell(basis, global_j);
+                const auto shell_j = load_shell(basis, global_j);
 
                 double phi_j;
                 double local_result = 0;
@@ -380,10 +368,13 @@ DeviceView2DLeft compute_coulomb_sparse(
 //   2 * tile_size * max_points_per_box * sizeof(double)
 // and is INDEPENDENT of the number of neighbors -- so unlike a full
 // [neighbors x points] cache it does not overflow scratch on large molecules.
+template <typename Evaluator, typename PotEvaluator>
+  requires BasisEvaluatorWith<Evaluator, BasisDeriv::Value> &&
+           PotentialEvaluator<PotEvaluator>
 DeviceView2DLeft compute_coulomb_tiled(
     const ExecSpace space, const DeviceView2DLeft mo_orbitals,
-    const DeviceView1D mo_coeff, const STOBasisSet basis,
-    const STOBasisSet basis_aux, const FlatGrid grid, const NeighborList nl,
+    const DeviceView1D mo_coeff, const Evaluator basis,
+    const PotEvaluator basis_aux, const FlatGrid grid, const NeighborList nl,
     const DeviceView2DLeft half_inverse_X, const int tile_size = 32) {
 
   Kokkos::Profiling::pushRegion("Compute Coulomb Integral Tiled");
@@ -479,7 +470,7 @@ DeviceView2DLeft compute_coulomb_tiled(
           Kokkos::parallel_for(
               Kokkos::TeamThreadRange(team_member, ilen), [=](const int li) {
                 const int gi = nl.neighbors(start_neighbors + i0 + li);
-                const ShellParams shell = load_shell(basis, gi);
+                const auto shell = load_shell(basis, gi);
                 const int base = li * num_points;
                 for (int g = 0; g < num_points; ++g)
                   phi_a(base + g) = basis_eval_fast(shell, points_scratch(g)[0],
@@ -497,7 +488,7 @@ DeviceView2DLeft compute_coulomb_tiled(
                   Kokkos::TeamThreadRange(team_member, jlen),
                   [=](const int lj) {
                     const int gj = nl.neighbors(start_neighbors + j0 + lj);
-                    const ShellParams shell = load_shell(basis, gj);
+                    const auto shell = load_shell(basis, gj);
                     const int base = lj * num_points;
                     for (int g = 0; g < num_points; ++g)
                       phi_b(base + g) = basis_eval_fast(
@@ -539,17 +530,9 @@ DeviceView2DLeft compute_coulomb_tiled(
             [=](const int global_alpha) {
               double local_sum_alpha = 0;
               for (int g = 0; g < num_points; ++g) {
-                const double dx =
-                    points_scratch(g)[0] - basis_aux.O(global_alpha)[0];
-                const double dy =
-                    points_scratch(g)[1] - basis_aux.O(global_alpha)[1];
-                const double dz =
-                    points_scratch(g)[2] - basis_aux.O(global_alpha)[2];
-                const double r =
-                    dist(points_scratch(g), basis_aux.O(global_alpha));
                 local_sum_alpha +=
                     density_scratch_scaled(g) *
-                    sto_potential(basis_aux, global_alpha, dx, dy, dz, r);
+                    eval_aux_potential(basis_aux, global_alpha, points_scratch(g));
               }
               Kokkos::atomic_add(&expansion_coeff(global_alpha),
                                  local_sum_alpha);
@@ -610,16 +593,8 @@ DeviceView2DLeft compute_coulomb_tiled(
             Kokkos::TeamThreadRange(team_member, N_bf_aux),
             [=](const int global_alpha) {
               for (int g = 0; g < num_points; ++g) {
-                const double x =
-                    points_scratch(g)[0] - basis_aux.O(global_alpha)[0];
-                const double y =
-                    points_scratch(g)[1] - basis_aux.O(global_alpha)[1];
-                const double z =
-                    points_scratch(g)[2] - basis_aux.O(global_alpha)[2];
-                const double r =
-                    dist(points_scratch(g), basis_aux.O(global_alpha));
                 const double pot =
-                    sto_potential(basis_aux, global_alpha, x, y, z, r) *
+                    eval_aux_potential(basis_aux, global_alpha, points_scratch(g)) *
                     weights_scratch(g) * expansion_coeff(global_alpha);
                 Kokkos::atomic_add(&potential_scratch_scaled(g), pot);
               }
@@ -634,7 +609,7 @@ DeviceView2DLeft compute_coulomb_tiled(
           Kokkos::parallel_for(
               Kokkos::TeamThreadRange(team_member, ilen), [=](const int li) {
                 const int gi = nl.neighbors(start_neighbors + i0 + li);
-                const ShellParams shell = load_shell(basis, gi);
+                const auto shell = load_shell(basis, gi);
                 const int base = li * num_points;
                 for (int g = 0; g < num_points; ++g)
                   phi_a(base + g) = basis_eval_fast(shell, points_scratch(g)[0],
@@ -652,7 +627,7 @@ DeviceView2DLeft compute_coulomb_tiled(
                   Kokkos::TeamThreadRange(team_member, jlen),
                   [=](const int lj) {
                     const int gj = nl.neighbors(start_neighbors + j0 + lj);
-                    const ShellParams shell = load_shell(basis, gj);
+                    const auto shell = load_shell(basis, gj);
                     const int base = lj * num_points;
                     for (int g = 0; g < num_points; ++g)
                       phi_b(base + g) = basis_eval_fast(
@@ -688,8 +663,10 @@ DeviceView2DLeft compute_coulomb_tiled(
   return result;
 }
 
+template <typename PotEvaluator>
+  requires PotentialEvaluator<PotEvaluator>
 DeviceView2DLeft coulomb_overlap_integral_sparse(const ExecSpace space,
-                                                 const STOBasisSet &basis_aux,
+                                                 const PotEvaluator &basis_aux,
                                                  const FlatGrid &grid,
                                                  const NeighborList nl) {
 
@@ -765,17 +742,9 @@ DeviceView2DLeft coulomb_overlap_integral_sparse(const ExecSpace space,
             Kokkos::TeamThreadRange(team_member, N_bf_aux),
             [=](const int global_alpha) {
               for (int local_g = 0; local_g < num_points; ++local_g) {
-                const double x =
-                    points_scratch(local_g)[0] - basis_aux.O(global_alpha)[0];
-                const double y =
-                    points_scratch(local_g)[1] - basis_aux.O(global_alpha)[1];
-                const double z =
-                    points_scratch(local_g)[2] - basis_aux.O(global_alpha)[2];
-                const double r =
-                    dist(points_scratch(local_g), basis_aux.O(global_alpha));
-
+                
                 double potential_alpha =
-                    sto_potential(basis_aux, global_alpha, x, y, z, r);
+                    eval_aux_potential(basis_aux, global_alpha, points_scratch(local_g));
 
                 potential_scratch_scaled(local_g) =
                     potential_alpha * weights_scratch(local_g);
@@ -784,7 +753,7 @@ DeviceView2DLeft coulomb_overlap_integral_sparse(const ExecSpace space,
               for (int local_i = 0; local_i < num_neighbors; ++local_i) {
 
                 const int global_i = nl.neighbors(start_neighbors + local_i);
-                const ShellParams shell_i = load_shell(basis_aux, global_i);
+                const auto shell_i = load_shell(basis_aux, global_i);
 
                 double phi_i;
                 double local_result = 0;
@@ -824,8 +793,10 @@ DeviceView2DLeft coulomb_overlap_integral_sparse(const ExecSpace space,
 // single PerTeam [num_points] buffer rather than a per-thread one -- so the
 // shared-memory footprint is independent of both num_neighbors and the team
 // size.
+template <typename PotEvaluator>
+  requires PotentialEvaluator<PotEvaluator>
 DeviceView2DLeft coulomb_overlap_integral_tiled(const ExecSpace space,
-                                                const STOBasisSet &basis_aux,
+                                                const PotEvaluator &basis_aux,
                                                 const FlatGrid &grid,
                                                 const NeighborList nl,
                                                 const int tile_size = 32) {
@@ -902,7 +873,7 @@ DeviceView2DLeft coulomb_overlap_integral_tiled(const ExecSpace space,
           Kokkos::parallel_for(
               Kokkos::TeamThreadRange(team_member, jlen), [=](const int lj) {
                 const int gi = nl.neighbors(start_neighbors + j0 + lj);
-                const ShellParams shell = load_shell(basis_aux, gi);
+                const auto shell = load_shell(basis_aux, gi);
                 const int base = lj * num_points;
                 for (int g = 0; g < num_points; ++g)
                   phi_cache(base + g) = basis_eval_fast(
@@ -917,16 +888,8 @@ DeviceView2DLeft coulomb_overlap_integral_tiled(const ExecSpace space,
             Kokkos::parallel_for(
                 Kokkos::TeamVectorRange(team_member, num_points),
                 [=](const int g) {
-                  const double x =
-                      points_scratch(g)[0] - basis_aux.O(global_alpha)[0];
-                  const double y =
-                      points_scratch(g)[1] - basis_aux.O(global_alpha)[1];
-                  const double z =
-                      points_scratch(g)[2] - basis_aux.O(global_alpha)[2];
-                  const double r =
-                      dist(points_scratch(g), basis_aux.O(global_alpha));
                   potential_scratch_scaled(g) =
-                      sto_potential(basis_aux, global_alpha, x, y, z, r) *
+                      eval_aux_potential(basis_aux, global_alpha, points_scratch(g)) *
                       weights_scratch(g);
                 });
             team_member.team_barrier();

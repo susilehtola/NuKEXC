@@ -38,6 +38,7 @@
 #include "density.hpp"
 #include "grid.hpp"
 #include "nukexc/octree.hpp"
+#include "basis_evaluator.hpp"
 #include "nukexc_config.hpp"
 #include "stobasis.hpp"
 #include "stopotential.hpp"
@@ -118,10 +119,13 @@ DeviceView2DLeft compute_exact_exchange(
   return result;
 }
 
+template <typename Evaluator, typename PotEvaluator>
+  requires BasisEvaluatorWith<Evaluator, BasisDeriv::Value> &&
+           PotentialEvaluator<PotEvaluator>
 DeviceView2DLeft compute_exact_exchange_sparse(
     const ExecSpace space, const DeviceView2DLeft mo_orbitals,
-    const DeviceView1D mo_coeff, const STOBasisSet basis,
-    const STOBasisSet basis_aux, const FlatGrid grid, const NeighborList nl,
+    const DeviceView1D mo_coeff, const Evaluator basis,
+    const PotEvaluator basis_aux, const FlatGrid grid, const NeighborList nl,
     const DeviceView2DLeft half_inverse_X) {
 
   Kokkos::Profiling::pushRegion("Compute Exact Exchange Integral Sparse");
@@ -222,23 +226,15 @@ DeviceView2DLeft compute_exact_exchange_sparse(
               [=](const int global_alpha) {
                 // Pcompute the potential once and store in scratch
                 for (int local_g = 0; local_g < num_points; ++local_g) {
-                  const double x =
-                      points_scratch(local_g)[0] - basis_aux.O(global_alpha)[0];
-                  const double y =
-                      points_scratch(local_g)[1] - basis_aux.O(global_alpha)[1];
-                  const double z =
-                      points_scratch(local_g)[2] - basis_aux.O(global_alpha)[2];
-                  const double r =
-                      dist(points_scratch(local_g), basis_aux.O(global_alpha));
-
+                  
                   potential_scratch_scaled(local_g) =
-                      sto_potential(basis_aux, global_alpha, x, y, z, r) *
+                      eval_aux_potential(basis_aux, global_alpha, points_scratch(local_g)) *
                       weights_scratch(local_g);
                 }
 
                 for (int local_j = 0; local_j < num_neighbors; ++local_j) {
                   const int global_j = nl.neighbors(start_neighbors + local_j);
-                  ShellParams shell_j = load_shell(basis, global_j);
+                  auto shell_j = load_shell(basis, global_j);
 
                   double local_sum = 0;
                   for (int local_g = 0; local_g < num_points; ++local_g) {
@@ -278,10 +274,13 @@ DeviceView2DLeft compute_exact_exchange_sparse(
 // and reused across all alpha. The orbital fold (which already evaluates each
 // phi_k exactly once) is left as-is. Cache footprint is
 //   tile_size * max_points_per_box * sizeof(double), independent of neighbors.
+template <typename Evaluator, typename PotEvaluator>
+  requires BasisEvaluatorWith<Evaluator, BasisDeriv::Value> &&
+           PotentialEvaluator<PotEvaluator>
 DeviceView2DLeft compute_exact_exchange_tiled(
     const ExecSpace space, const DeviceView2DLeft mo_orbitals,
-    const DeviceView1D mo_coeff, const STOBasisSet basis,
-    const STOBasisSet basis_aux, const FlatGrid grid, const NeighborList nl,
+    const DeviceView1D mo_coeff, const Evaluator basis,
+    const PotEvaluator basis_aux, const FlatGrid grid, const NeighborList nl,
     const DeviceView2DLeft half_inverse_X, const int tile_size = 32) {
 
   Kokkos::Profiling::pushRegion("Compute Exact Exchange Integral Tiled");
@@ -382,7 +381,7 @@ DeviceView2DLeft compute_exact_exchange_tiled(
             Kokkos::parallel_for(
                 Kokkos::TeamThreadRange(team_member, jlen), [=](const int lj) {
                   const int gj = nl.neighbors(start_neighbors + j0 + lj);
-                  const ShellParams shell = load_shell(basis, gj);
+                  const auto shell = load_shell(basis, gj);
                   const int base = lj * num_points;
                   for (int g = 0; g < num_points; ++g)
                     phi_cache(base + g) = basis_eval_fast(
@@ -399,16 +398,8 @@ DeviceView2DLeft compute_exact_exchange_tiled(
               Kokkos::parallel_for(
                   Kokkos::TeamVectorRange(team_member, num_points),
                   [=](const int g) {
-                    const double x =
-                        points_scratch(g)[0] - basis_aux.O(global_alpha)[0];
-                    const double y =
-                        points_scratch(g)[1] - basis_aux.O(global_alpha)[1];
-                    const double z =
-                        points_scratch(g)[2] - basis_aux.O(global_alpha)[2];
-                    const double r =
-                        dist(points_scratch(g), basis_aux.O(global_alpha));
                     potential_scratch_scaled(g) =
-                        sto_potential(basis_aux, global_alpha, x, y, z, r) *
+                        eval_aux_potential(basis_aux, global_alpha, points_scratch(g)) *
                         weights_scratch(g);
                   });
               team_member.team_barrier();
