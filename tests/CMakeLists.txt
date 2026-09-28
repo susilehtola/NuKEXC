@@ -18,6 +18,7 @@ add_executable(test_helium test_helium.cxx)
 add_executable(test_gto_basis test_gto_basis.cxx)
 add_executable(test_sto_contracted test_sto_contracted.cxx)
 add_executable(test_gto_eval test_gto_eval.cxx)
+add_executable(test_gto_overlap test_gto_overlap.cxx)
 
 add_executable(standalone standards.cxx standalone.cxx test_io.cxx)
 
@@ -45,6 +46,7 @@ set(ALL_TEST_TARGETS
     test_gto_basis
     test_sto_contracted
     test_gto_eval
+    test_gto_overlap
 
     standalone
 
@@ -74,5 +76,6 @@ add_test( NAME HELIUM_TEST COMMAND $<TARGET_FILE:test_helium> )
 add_test( NAME GTO_BASIS_TEST COMMAND $<TARGET_FILE:test_gto_basis> )
 add_test( NAME STO_CONTRACTED_TEST COMMAND $<TARGET_FILE:test_sto_contracted> )
 add_test( NAME GTO_EVAL_TEST COMMAND $<TARGET_FILE:test_gto_eval> )
+add_test( NAME GTO_OVERLAP_TEST COMMAND $<TARGET_FILE:test_gto_overlap> )
 # test_arborx was built but never registered, so nothing ran it.
 add_test( NAME ARBORX_TEST COMMAND $<TARGET_FILE:test_arborx> )
