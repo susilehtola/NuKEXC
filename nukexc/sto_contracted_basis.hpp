@@ -84,6 +84,7 @@
 
 #include <Kokkos_Core.hpp>
 
+#include "basis_evaluator.hpp"
 #include "nukexc_config.hpp"
 #include "nukexc_utils.hpp"
 #include "spherical_harmonics.hpp"
@@ -427,5 +428,59 @@ void contracted_basis_eval_with_grad(const STOContractedBasisSet &basis,
   gy = R * dSy + S * y * common;
   gz = R * dSz + S * z * common;
 }
+
+// ============================================================================
+//  BasisEvaluator adapter
+// ============================================================================
+//
+// One contracted function per block. The primitives of a contraction are
+// summed inside a single eval_block call, so the shared work is already
+// amortized without grouping functions together.
+
+class STOContractedEvaluator {
+public:
+  struct block_params {
+    ContractedShellParams sh;
+  };
+  static constexpr int max_block_size = 1;
+
+  STOContractedEvaluator() = default;
+  explicit STOContractedEvaluator(STOContractedBasisSet b) : b_(std::move(b)) {}
+
+  int nbf() const { return static_cast<int>(b_.nbf()); }
+  int nblock() const { return static_cast<int>(b_.nbf()); }
+  KOKKOS_INLINE_FUNCTION int block_first_bf(int i) const { return i; }
+  KOKKOS_INLINE_FUNCTION int block_size(int) const { return 1; }
+
+  Kokkos::View<Point *> centers() const { return b_.O; }
+  Kokkos::View<double *> radii() const { return b_.cutoff_radii; }
+
+  const STOContractedBasisSet &basis() const { return b_; }
+
+  KOKKOS_INLINE_FUNCTION block_params load_block(int i) const {
+    return block_params{load_contracted_shell(b_, i)};
+  }
+
+  template <BasisDeriv D>
+  KOKKOS_INLINE_FUNCTION void eval_block(const block_params &p, double x,
+                                         double y, double z, double *out,
+                                         int stride) const {
+    static_assert(D == BasisDeriv::Value || D == BasisDeriv::Gradient,
+                  "the contracted STO path implements values and gradients; "
+                  "higher orders are not yet derived for Slater functions");
+    if constexpr (D == BasisDeriv::Value) {
+      out[BF_VAL * stride] = contracted_basis_eval(b_, p.sh, x, y, z);
+    } else {
+      contracted_basis_eval_with_grad(b_, p.sh, x, y, z, out[BF_VAL * stride],
+                                      out[BF_DX * stride], out[BF_DY * stride],
+                                      out[BF_DZ * stride]);
+    }
+  }
+
+private:
+  STOContractedBasisSet b_;
+};
+
+static_assert(BasisEvaluator<STOContractedEvaluator>);
 
 } // namespace Nukexc

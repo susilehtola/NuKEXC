@@ -91,6 +91,7 @@
 
 #include "gto_basisset.hpp"
 #include "gto_shell.hpp"
+#include "basis_evaluator.hpp"
 #include "nukexc_config.hpp"
 #include "solid_harmonics_transform.hpp"
 
@@ -103,8 +104,9 @@ inline constexpr int GTO_MAX_CART = (GTO_MAX_L + 1) * (GTO_MAX_L + 2) / 2;
 /// Power tables run to l + 3 for the highest supported derivative order.
 inline constexpr int GTO_MAX_POW = GTO_MAX_L + 4;
 
-/// Which derivatives to evaluate.
-enum class GTODeriv { Value = 0, Gradient = 1, Hessian = 2, LaplGradient = 3 };
+/// Derivative order and component indices are the shared basis-evaluator
+/// vocabulary; these aliases keep the GTO-specific spellings working.
+using GTODeriv = BasisDeriv;
 
 // ============================================================================
 //  Device basis
@@ -146,9 +148,20 @@ struct GTOBasisDevice {
   Kokkos::View<int *> cart_nz;
   Kokkos::View<int *> cart_offset;
 
+  /// Blocks: one per (shell, contraction) pair, precomputed at upload. The
+  /// collocation path used to rebuild this list on every call, with a
+  /// device-to-host copy and two host-to-device copies each time.
+  Kokkos::View<int *> block_shell;
+  Kokkos::View<int *> block_ctr;
+  Kokkos::View<int *> block_first_bf;
+  Kokkos::View<int *> block_nfunc;
+  Kokkos::View<Point *> block_center;
+  Kokkos::View<double *> block_radius;
+
   int nshell = 0;
   int nbf = 0;
   int max_l = 0;
+  int nblock = 0;
 };
 
 /// Upload a host basis set to the device.
@@ -249,6 +262,36 @@ inline GTOBasisDevice make_gto_device_basis(const GTOBasisSet<double> &host) {
       hO(h_O.data(), h_O.size());
   Kokkos::deep_copy(dev.O, hO);
 
+  // Block tables: one entry per (shell, contraction).
+  {
+    std::vector<int> bs, bc, bf, bn;
+    std::vector<Point> bcen;
+    std::vector<double> brad;
+    for (int s = 0; s < nsh; ++s) {
+      const auto &sh = host.shell(s);
+      const int nfunc = sh.ncomp();
+      for (int k = 0; k < sh.nctr(); ++k) {
+        bs.push_back(s);
+        bc.push_back(k);
+        bf.push_back(h_bo[s] + k * nfunc);
+        bn.push_back(nfunc);
+        bcen.push_back(h_O[s]);
+        brad.push_back(h_cut[s]);
+      }
+    }
+    dev.block_shell = up_i("block_shell", bs);
+    dev.block_ctr = up_i("block_ctr", bc);
+    dev.block_first_bf = up_i("block_first_bf", bf);
+    dev.block_nfunc = up_i("block_nfunc", bn);
+    dev.block_radius = up_d("block_radius", brad);
+    dev.block_center = Kokkos::View<Point *>("block_center", bcen.size());
+    Kokkos::View<const Point *, HostSpace,
+                 Kokkos::MemoryTraits<Kokkos::Unmanaged>>
+        hbc(bcen.data(), bcen.size());
+    Kokkos::deep_copy(dev.block_center, hbc);
+    dev.nblock = static_cast<int>(bs.size());
+  }
+
   dev.nshell = nsh;
   dev.nbf = host.nbf();
   dev.max_l = max_l;
@@ -290,24 +333,14 @@ double gto_der3(const double *x, int l, double zeta) {
 //  Shell evaluation
 // ============================================================================
 
-/// Number of output components carried by a derivative order:
-/// value (1), gradient (+3), Hessian (+6 unique), gradient of the
-/// Laplacian (+3).
 KOKKOS_INLINE_FUNCTION
-constexpr int gto_ncomp(GTODeriv d) {
-  return d == GTODeriv::Value          ? 1
-         : d == GTODeriv::Gradient     ? 4
-         : d == GTODeriv::Hessian      ? 10
-                                       : 13;
-}
+constexpr int gto_ncomp(GTODeriv d) { return basis_ncomp(d); }
 
-/// Component indices within the output block.
-enum : int {
-  GTO_VAL = 0,
-  GTO_DX = 1, GTO_DY = 2, GTO_DZ = 3,
-  GTO_DXX = 4, GTO_DXY = 5, GTO_DXZ = 6, GTO_DYY = 7, GTO_DYZ = 8, GTO_DZZ = 9,
-  GTO_LGX = 10, GTO_LGY = 11, GTO_LGZ = 12
-};
+inline constexpr int GTO_VAL = BF_VAL;
+inline constexpr int GTO_DX = BF_DX, GTO_DY = BF_DY, GTO_DZ = BF_DZ;
+inline constexpr int GTO_DXX = BF_DXX, GTO_DXY = BF_DXY, GTO_DXZ = BF_DXZ;
+inline constexpr int GTO_DYY = BF_DYY, GTO_DYZ = BF_DYZ, GTO_DZZ = BF_DZZ;
+inline constexpr int GTO_LGX = BF_LGX, GTO_LGY = BF_LGY, GTO_LGZ = BF_LGZ;
 
 /**
  *  @brief Evaluate one contraction of one shell at one point.
@@ -436,84 +469,64 @@ gto_eval_contraction(const GTOBasisDevice &b, int ishell, int ictr, double px,
 //  Collocation
 // ============================================================================
 
-/**
- *  @brief Fill collocation matrices for a whole basis over a batch of points.
- *
- *  `comp` must have extent (gto_ncomp(Deriv), nbf, npts): component, basis
- *  function, point. Component 0 is the value; see the GTO_* indices above.
- *
- *  One thread per (shell, contraction, point). Splitting the contractions
- *  across threads keeps the per-thread Cartesian buffer at cart_size(l)
- *  rather than cart_size(l) * nctr, at the cost of re-evaluating the shell's
- *  primitive exponentials once per contraction.
- */
+// ============================================================================
+//  BasisEvaluator adapter
+// ============================================================================
+//
+// One contraction of one shell per block, so all 2l+1 spherical components
+// come out of a single pass over the primitives and one Cartesian-to-spherical
+// transform. Splitting the contractions across blocks keeps the per-thread
+// Cartesian buffer at cart_size(l) rather than cart_size(l) * nctr, at the
+// cost of re-evaluating the shell's primitive exponentials once per
+// contraction.
+
+class GTOEvaluator {
+public:
+  struct block_params {
+    int ishell;
+    int ictr;
+  };
+  static constexpr int max_block_size = GTO_MAX_CART;
+
+  GTOEvaluator() = default;
+  explicit GTOEvaluator(GTOBasisDevice b) : b_(std::move(b)) {}
+
+  int nbf() const { return b_.nbf; }
+  int nblock() const { return b_.nblock; }
+  KOKKOS_INLINE_FUNCTION int block_first_bf(int i) const {
+    return b_.block_first_bf(i);
+  }
+  KOKKOS_INLINE_FUNCTION int block_size(int i) const {
+    return b_.block_nfunc(i);
+  }
+
+  Kokkos::View<Point *> centers() const { return b_.block_center; }
+  Kokkos::View<double *> radii() const { return b_.block_radius; }
+
+  const GTOBasisDevice &basis() const { return b_; }
+
+  KOKKOS_INLINE_FUNCTION block_params load_block(int i) const {
+    return block_params{b_.block_shell(i), b_.block_ctr(i)};
+  }
+
+  template <BasisDeriv D>
+  KOKKOS_INLINE_FUNCTION void eval_block(const block_params &p, double x,
+                                         double y, double z, double *out,
+                                         int stride) const {
+    gto_eval_contraction<D>(b_, p.ishell, p.ictr, x, y, z, out, stride);
+  }
+
+private:
+  GTOBasisDevice b_;
+};
+
+static_assert(BasisEvaluator<GTOEvaluator>);
+
+/// Convenience wrapper: collocation for a GTO basis through the generic path.
 template <GTODeriv Deriv, typename PointsView, typename CompView>
 void fill_collocation_gto(ExecSpace space, const GTOBasisDevice &b,
                           PointsView points, CompView comp) {
-  constexpr int NC = gto_ncomp(Deriv);
-  const int npts = static_cast<int>(points.extent(0));
-  if (b.nshell == 0 || npts == 0)
-    return;
-
-  if (static_cast<int>(comp.extent(0)) != NC ||
-      static_cast<int>(comp.extent(1)) != b.nbf ||
-      static_cast<int>(comp.extent(2)) != npts)
-    throw std::invalid_argument(
-        "fill_collocation_gto: output must be (ncomp, nbf, npts)");
-
-  // Flatten (shell, contraction) so every thread has equal-shaped work.
-  auto nctr = b.nctr;
-  auto bf_offset = b.bf_offset;
-  auto l_v = b.l;
-  auto sph = b.spherical;
-
-  const int nsh = b.nshell;
-  Kokkos::View<int *> task_shell("task_shell", 0), task_ctr("task_ctr", 0);
-  {
-    auto nctr_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, nctr);
-    int ntask = 0;
-    for (int s = 0; s < nsh; ++s)
-      ntask += nctr_h(s);
-    std::vector<int> hs(ntask), hc(ntask);
-    int t = 0;
-    for (int s = 0; s < nsh; ++s)
-      for (int k = 0; k < nctr_h(s); ++k, ++t) {
-        hs[t] = s;
-        hc[t] = k;
-      }
-    task_shell = Kokkos::View<int *>("task_shell", ntask);
-    task_ctr = Kokkos::View<int *>("task_ctr", ntask);
-    Kokkos::View<const int *, HostSpace,
-                 Kokkos::MemoryTraits<Kokkos::Unmanaged>>
-        vs(hs.data(), ntask), vc(hc.data(), ntask);
-    Kokkos::deep_copy(task_shell, vs);
-    Kokkos::deep_copy(task_ctr, vc);
-  }
-  const int ntask = static_cast<int>(task_shell.extent(0));
-
-  Kokkos::parallel_for(
-      "fill_collocation_gto",
-      Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>(space, {0, 0},
-                                                        {ntask, npts}),
-      KOKKOS_LAMBDA(const int t, const int g) {
-        const int s = task_shell(t);
-        const int k = task_ctr(t);
-        const int l = l_v(s);
-        const int ncomp_out = sph(s) ? (2 * l + 1) : ((l + 1) * (l + 2) / 2);
-        const int bf0 = bf_offset(s) + k * ncomp_out;
-
-        // Worst-case scratch for one contraction: every component of the
-        // largest supported shell. The value-only case needs 36 doubles; the
-        // Laplacian-gradient case needs 13x that, which is where per-l
-        // specialization would pay off on a GPU.
-        double local[NC * GTO_MAX_CART];
-        gto_eval_contraction<Deriv>(b, s, k, points(g)[0], points(g)[1],
-                                    points(g)[2], local, GTO_MAX_CART);
-
-        for (int c = 0; c < NC; ++c)
-          for (int i = 0; i < ncomp_out; ++i)
-            comp(c, bf0 + i, g) = local[c * GTO_MAX_CART + i];
-      });
+  fill_collocation<Deriv>(space, GTOEvaluator(b), points, comp);
 }
 
 } // namespace Nukexc
