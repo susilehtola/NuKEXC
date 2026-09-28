@@ -15,6 +15,7 @@ add_executable(test_potential test_potential.cxx)
 add_executable(test_density test_density.cxx)
 add_executable(test_libxc test_libxc.cxx)
 add_executable(test_helium test_helium.cxx)
+add_executable(test_gto_basis test_gto_basis.cxx)
 
 add_executable(standalone standards.cxx standalone.cxx test_io.cxx)
 
@@ -39,6 +40,7 @@ set(ALL_TEST_TARGETS
     test_density
     test_libxc
     test_helium
+    test_gto_basis
 
     standalone
 
@@ -65,3 +67,4 @@ add_test( NAME POTENTIAL_TEST COMMAND $<TARGET_FILE:test_potential> )
 add_test( NAME DENSITY_TEST COMMAND $<TARGET_FILE:test_density> )
 add_test( NAME LIBXC_TEST COMMAND $<TARGET_FILE:test_libxc> )
 add_test( NAME HELIUM_TEST COMMAND $<TARGET_FILE:test_helium> )
+add_test( NAME GTO_BASIS_TEST COMMAND $<TARGET_FILE:test_gto_basis> )
