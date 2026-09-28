@@ -16,6 +16,7 @@ add_executable(test_density test_density.cxx)
 add_executable(test_libxc test_libxc.cxx)
 add_executable(test_helium test_helium.cxx)
 add_executable(test_gto_basis test_gto_basis.cxx)
+add_executable(test_sto_contracted test_sto_contracted.cxx)
 
 add_executable(standalone standards.cxx standalone.cxx test_io.cxx)
 
@@ -41,6 +42,7 @@ set(ALL_TEST_TARGETS
     test_libxc
     test_helium
     test_gto_basis
+    test_sto_contracted
 
     standalone
 
@@ -68,5 +70,6 @@ add_test( NAME DENSITY_TEST COMMAND $<TARGET_FILE:test_density> )
 add_test( NAME LIBXC_TEST COMMAND $<TARGET_FILE:test_libxc> )
 add_test( NAME HELIUM_TEST COMMAND $<TARGET_FILE:test_helium> )
 add_test( NAME GTO_BASIS_TEST COMMAND $<TARGET_FILE:test_gto_basis> )
+add_test( NAME STO_CONTRACTED_TEST COMMAND $<TARGET_FILE:test_sto_contracted> )
 # test_arborx was built but never registered, so nothing ran it.
 add_test( NAME ARBORX_TEST COMMAND $<TARGET_FILE:test_arborx> )
