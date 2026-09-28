@@ -122,4 +122,34 @@ void sto_potential_collocation_scaled(const ExecSpace space,
             sto_potential(n, l, m, x, y, z, r, zeta) * grid.weights(g);
       });
 }
+// ============================================================================
+//  PotentialEvaluator adapter
+// ============================================================================
+//
+// Lives here rather than in stobasis.hpp so that the XC path, which has no
+// use for the Coulomb potential, does not have to pull in the gamma-function
+// machinery. Inherits the basis-function side unchanged and adds the
+// potential.
+
+class STOPotentialEvaluator : public STOPrimitiveEvaluator {
+public:
+  using STOPrimitiveEvaluator::STOPrimitiveEvaluator;
+
+  /// Electrostatic potential of the block's single basis function, at an
+  /// ABSOLUTE point. The evaluator subtracts the center itself, matching
+  /// eval_block, which is why callers no longer compute dx/dy/dz/r by hand.
+  KOKKOS_INLINE_FUNCTION void
+  eval_potential_block(const block_params &p, double x, double y, double z,
+                       double *out, int stride) const {
+    (void)stride;
+    const double dx = x - p.O[0];
+    const double dy = y - p.O[1];
+    const double dz = z - p.O[2];
+    const double r = Kokkos::sqrt(dx * dx + dy * dy + dz * dz);
+    out[0] = sto_potential(p.n, p.l, p.m, dx, dy, dz, r, p.zeta);
+  }
+};
+
+static_assert(PotentialEvaluator<STOPotentialEvaluator>);
+
 } // namespace Nukexc

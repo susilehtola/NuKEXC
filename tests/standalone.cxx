@@ -445,11 +445,11 @@ int main(int argc, char *argv[]) {
     if (is_tiled) {
       TIME_SCOPE(startup_timing, "Auxiliary Coulomb overlap (tiled)");
       aux_overlap_sym =
-          coulomb_overlap_integral_tiled(space, basis_aux, grid, nl_aux, tile);
+          coulomb_overlap_integral_tiled(space, STOPotentialEvaluator(basis_aux), grid, nl_aux, tile);
     } else if (is_sparse) {
       TIME_SCOPE(startup_timing, "Auxiliary Coulomb overlap (sparse)");
       aux_overlap_sym =
-          coulomb_overlap_integral_sparse(space, basis_aux, grid, nl_aux);
+          coulomb_overlap_integral_sparse(space, STOPotentialEvaluator(basis_aux), grid, nl_aux);
     } else {
       TIME_SCOPE(startup_timing, "Auxiliary Coulomb overlap (dense GEMM)");
       KokkosBlas::gemm(space, "N", "T", 1.0, basis_aux_collocation,
@@ -631,11 +631,10 @@ int main(int argc, char *argv[]) {
         TIME_SCOPE(fock_timing, "Coulomb (J) build");
         DeviceView2DLeft J;
         if (is_tiled) {
-          J = compute_coulomb_tiled(space, k_C_tot, k_occ_tot, basis, basis_aux,
+          J = compute_coulomb_tiled(space, k_C_tot, k_occ_tot, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux),
                                     grid, nl, half_inverse_X, tile);
         } else if (is_sparse) {
-          J = compute_coulomb_sparse(space, k_C_tot, k_occ_tot, basis,
-                                     basis_aux, grid, nl, half_inverse_X);
+          J = compute_coulomb_sparse(space, k_C_tot, k_occ_tot, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl, half_inverse_X);
         } else {
           J = compute_coulomb(space, k_C_tot, k_occ_tot, basis_collocation,
                               basis_aux_collocation,
@@ -664,12 +663,10 @@ int main(int argc, char *argv[]) {
         {
           TIME_SCOPE(fock_timing, "  K alpha");
           if (is_tiled) {
-            K_alpha = compute_exact_exchange_tiled(
-                space, k_C_alpha, k_occ_alpha, basis, basis_aux, grid, nl,
+            K_alpha = compute_exact_exchange_tiled(space, k_C_alpha, k_occ_alpha, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl,
                 half_inverse_X, tile);
           } else if (is_sparse) {
-            K_alpha = compute_exact_exchange_sparse(
-                space, k_C_alpha, k_occ_alpha, basis, basis_aux, grid, nl,
+            K_alpha = compute_exact_exchange_sparse(space, k_C_alpha, k_occ_alpha, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl,
                 half_inverse_X);
           } else {
             K_alpha = compute_exact_exchange(
@@ -681,12 +678,10 @@ int main(int argc, char *argv[]) {
         {
           TIME_SCOPE(fock_timing, "  K beta");
           if (is_tiled) {
-            K_beta = compute_exact_exchange_tiled(space, k_C_beta, k_occ_beta,
-                                                  basis, basis_aux, grid, nl,
+            K_beta = compute_exact_exchange_tiled(space, k_C_beta, k_occ_beta, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl,
                                                   half_inverse_X, tile);
           } else if (is_sparse) {
-            K_beta = compute_exact_exchange_sparse(space, k_C_beta, k_occ_beta,
-                                                   basis, basis_aux, grid, nl,
+            K_beta = compute_exact_exchange_sparse(space, k_C_beta, k_occ_beta, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl,
                                                    half_inverse_X);
           } else {
             K_beta = compute_exact_exchange(
@@ -750,12 +745,10 @@ int main(int argc, char *argv[]) {
           {
             TIME_SCOPE(fock_timing, "  K alpha");
             if (is_tiled) {
-              K_alpha = compute_exact_exchange_tiled(
-                  space, k_C_alpha, k_occ_alpha, basis, basis_aux, grid, nl,
+              K_alpha = compute_exact_exchange_tiled(space, k_C_alpha, k_occ_alpha, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl,
                   half_inverse_X, tile);
             } else if (is_sparse) {
-              K_alpha = compute_exact_exchange_sparse(
-                  space, k_C_alpha, k_occ_alpha, basis, basis_aux, grid, nl,
+              K_alpha = compute_exact_exchange_sparse(space, k_C_alpha, k_occ_alpha, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl,
                   half_inverse_X);
             } else {
               K_alpha = compute_exact_exchange(
@@ -767,12 +760,10 @@ int main(int argc, char *argv[]) {
           {
             TIME_SCOPE(fock_timing, "  K beta");
             if (is_tiled) {
-              K_beta = compute_exact_exchange_tiled(space, k_C_beta, k_occ_beta,
-                                                    basis, basis_aux, grid, nl,
+              K_beta = compute_exact_exchange_tiled(space, k_C_beta, k_occ_beta, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl,
                                                     half_inverse_X, tile);
             } else if (is_sparse) {
-              K_beta = compute_exact_exchange_sparse(
-                  space, k_C_beta, k_occ_beta, basis, basis_aux, grid, nl,
+              K_beta = compute_exact_exchange_sparse(space, k_C_beta, k_occ_beta, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl,
                   half_inverse_X);
             } else {
               K_beta = compute_exact_exchange(
