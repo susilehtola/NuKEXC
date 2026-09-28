@@ -34,6 +34,7 @@
  */
 #pragma once
 #include "nukexc/grid.hpp"
+#include "basis_evaluator.hpp"
 #include "nukexc_config.hpp"
 #include "octree.hpp"
 #include "stobasis.hpp"
@@ -52,7 +53,9 @@
 
 namespace Nukexc {
 
-DeviceView1D compute_density(const STOBasisSet basis, const FlatGrid grid,
+template <typename Evaluator>
+  requires BasisEvaluatorWith<Evaluator, BasisDeriv::Value>
+DeviceView1D compute_density(const Evaluator basis, const FlatGrid grid,
                              const DeviceView2DLeft mo_orbitals,
                              const DeviceView1D mo_coeff) {
 
@@ -61,8 +64,16 @@ DeviceView1D compute_density(const STOBasisSet basis, const FlatGrid grid,
   const int N_quad = grid.quad_points.extent(0);
   const int N_occ = mo_orbitals.extent(1);
 
-  DeviceView2DLeft collocation_values("Basis collocation", N_bf, N_quad);
-  fill_collocation(space, basis, grid.quad_points, collocation_values);
+  Kokkos::View<double ***> comp("Basis collocation", 1, N_bf, N_quad);
+  fill_collocation<BasisDeriv::Value>(space, basis, grid.quad_points, comp);
+  DeviceView2DLeft collocation_values("Basis collocation 2D", N_bf, N_quad);
+  Kokkos::parallel_for(
+      "flatten collocation",
+      Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0},
+                                                        {N_bf, N_quad}),
+      KOKKOS_LAMBDA(const int i, const int g) {
+        collocation_values(i, g) = comp(0, i, g);
+      });
 
   DeviceView1D density("density", N_quad);
   DeviceView2D intermediate_matrix("intermediate", N_occ, N_quad);
@@ -94,7 +105,9 @@ DeviceView1D compute_density(const STOBasisSet basis, const FlatGrid grid,
   return density;
 };
 
-DeviceView1D compute_density_sparse(const STOBasisSet basis,
+template <typename Evaluator>
+  requires BasisEvaluatorWith<Evaluator, BasisDeriv::Value>
+DeviceView1D compute_density_sparse(const Evaluator basis,
                                     const FlatGrid grid, const NeighborList nl,
                                     const DeviceView2DLeft mo_orbitals,
                                     const DeviceView1D mo_coeff) {
@@ -133,11 +146,19 @@ DeviceView1D compute_density_sparse(const STOBasisSet basis,
               for (int global_i = 0; global_i < N_occ; ++global_i) {
                 double psi_i = 0.0;
                 for (int local_j = 0; local_j < num_neighbors; ++local_j) {
-                  const int global_j = nl.neighbors(start_neighbors + local_j);
-                  const ShellParams sh_j = load_shell(basis, global_j);
-                  const double phi_j =
-                      basis_eval_fast(sh_j, point_g[0], point_g[1], point_g[2]);
-                  psi_i += mo_orbitals(global_j, global_i) * phi_j;
+                  // Neighbour-list entries are BLOCKS. For an STO a block is
+                  // one function, so this is the same work as before; for a
+                  // GTO it is one contraction, whose functions all share the
+                  // single evaluation below.
+                  const int blk = nl.neighbors(start_neighbors + local_j);
+                  double phi[Evaluator::max_block_size];
+                  basis.template eval_block<BasisDeriv::Value>(
+                      basis.load_block(blk), point_g[0], point_g[1],
+                      point_g[2], phi, 1);
+                  const int bf0 = basis.block_first_bf(blk);
+                  const int nfun = basis.block_size(blk);
+                  for (int t = 0; t < nfun; ++t)
+                    psi_i += mo_orbitals(bf0 + t, global_i) * phi[t];
                 }
                 density(global_g) += mo_coeff(global_i) * psi_i * psi_i;
               }
@@ -258,8 +279,10 @@ void compute_density_and_sigma(const DeviceView2DLeft collocation_values,
 // gz_rho are accumulated into, so they must be zero on entry; sigma is
 // overwritten. Each grid point belongs to exactly one box, so a given
 // global_g has a single writer thread.
+template <typename Evaluator>
+  requires BasisEvaluatorWith<Evaluator, BasisDeriv::Gradient>
 void compute_density_and_sigma_sparse(
-    const STOBasisSet basis, const FlatGrid grid, const NeighborList nl,
+    const Evaluator basis, const FlatGrid grid, const NeighborList nl,
     const DeviceView2DLeft mo_orbitals, const DeviceView1D mo_coeff,
     DeviceView1D rho, DeviceView1D gx_rho, DeviceView1D gy_rho,
     DeviceView1D gz_rho, DeviceView1D sigma) {
@@ -299,19 +322,21 @@ void compute_density_and_sigma_sparse(
                 double psi_gy_i = 0.0;
                 double psi_gz_i = 0.0;
                 for (int local_j = 0; local_j < num_neighbors; ++local_j) {
-                  const int global_j = nl.neighbors(start_neighbors + local_j);
-                  const ScratchBasisParams sh_j{
-                      basis.zeta(global_j), basis.norm(global_j),
-                      basis.O(global_j),    basis.n(global_j),
-                      basis.l(global_j),    basis.m(global_j)};
-                  double phi_j, phi_gx_j, phi_gy_j, phi_gz_j;
-                  basis_eval_with_grad(sh_j, point_g, phi_j, phi_gx_j, phi_gy_j,
-                                       phi_gz_j);
-                  const double c_ji = mo_orbitals(global_j, global_i);
-                  psi_i += c_ji * phi_j;
-                  psi_gx_i += c_ji * phi_gx_j;
-                  psi_gy_i += c_ji * phi_gy_j;
-                  psi_gz_i += c_ji * phi_gz_j;
+                  const int blk = nl.neighbors(start_neighbors + local_j);
+                  constexpr int MBS = Evaluator::max_block_size;
+                  double buf[basis_ncomp(BasisDeriv::Gradient) * MBS];
+                  basis.template eval_block<BasisDeriv::Gradient>(
+                      basis.load_block(blk), point_g[0], point_g[1],
+                      point_g[2], buf, MBS);
+                  const int bf0 = basis.block_first_bf(blk);
+                  const int nfun = basis.block_size(blk);
+                  for (int t = 0; t < nfun; ++t) {
+                    const double c_ji = mo_orbitals(bf0 + t, global_i);
+                    psi_i += c_ji * buf[BF_VAL * MBS + t];
+                    psi_gx_i += c_ji * buf[BF_DX * MBS + t];
+                    psi_gy_i += c_ji * buf[BF_DY * MBS + t];
+                    psi_gz_i += c_ji * buf[BF_DZ * MBS + t];
+                  }
                 }
                 rho(global_g) += mo_coeff(global_i) * psi_i * psi_i;
                 gx_rho(global_g) += 2.0 * mo_coeff(global_i) * psi_gx_i * psi_i;

@@ -38,6 +38,7 @@
 #include <ArborX.hpp>
 
 #include "grid.hpp"
+#include "nukexc/basis_evaluator.hpp"
 #include "nukexc/stobasis.hpp"
 #include "nukexc_config.hpp"
 
@@ -314,7 +315,14 @@ struct NeighborInsertCallback {
   }
 };
 
-void build_neighbor_list(const STOBasisSet basis,
+// The neighbour list is over BLOCKS, not individual basis functions: a block
+// is the evaluator's unit of work (one function for an STO, one contraction of
+// one shell for a GTO) and carries a single center and cutoff radius. Screening
+// per block rather than per function is both cheaper and the right granularity,
+// since every function of a GTO shell shares the same support.
+template <typename Evaluator>
+  requires BasisEvaluator<Evaluator>
+void build_neighbor_list(const Evaluator &basis,
                          const Kokkos::View<Box *, ExecSpace> &bounding_boxes,
                          const int max_points_per_box, const int total_points,
                          NeighborList &neighbor_list,
@@ -322,8 +330,8 @@ void build_neighbor_list(const STOBasisSet basis,
                          const std::string &histogram_stem =
                              "neighbor_histogram") {
 
-  auto basis_origins = basis.O;
-  auto cutoff_radii = basis.cutoff_radii;
+  auto basis_origins = basis.centers();
+  auto cutoff_radii = basis.radii();
 
   const int N = basis_origins.extent(0);
   const int num_boxes = bounding_boxes.extent(0);

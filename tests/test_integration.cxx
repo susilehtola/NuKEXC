@@ -104,7 +104,7 @@ TEST_CASE("Compute core Hamiltonian with screening",
 
   // Create NeighborList, by screening bounding boxes
   NeighborList nl;
-  build_neighbor_list(basis, bounding_boxes, max_points_per_box, total_points,
+  build_neighbor_list(STOPrimitiveEvaluator(basis), bounding_boxes, max_points_per_box, total_points,
                       nl);
 
   // Compute screened Hamiltonian
@@ -154,7 +154,7 @@ TEST_CASE("Compute core Hamiltonian with screening (basis on the fly)",
 
   // Create NeighborList, by screening bounding boxes
   NeighborList nl;
-  build_neighbor_list(basis, bounding_boxes, max_points_per_box, total_points,
+  build_neighbor_list(STOPrimitiveEvaluator(basis), bounding_boxes, max_points_per_box, total_points,
                       nl);
 
   // Compute screened Hamiltonian
@@ -204,7 +204,7 @@ TEST_CASE("Compute core Hamiltonian with screening (basis tiled)",
 
   // Create NeighborList, by screening bounding boxes
   NeighborList nl;
-  build_neighbor_list(basis, bounding_boxes, max_points_per_box, total_points,
+  build_neighbor_list(STOPrimitiveEvaluator(basis), bounding_boxes, max_points_per_box, total_points,
                       nl);
 
   // Compute screened Hamiltonian
@@ -266,7 +266,7 @@ TEST_CASE("Compute core Hamiltonian with screening (basis sparse)",
 
   // Create NeighborList, by screening bounding boxes
   NeighborList nl;
-  build_neighbor_list(basis, bounding_boxes, max_points_per_box, total_points,
+  build_neighbor_list(STOPrimitiveEvaluator(basis), bounding_boxes, max_points_per_box, total_points,
                       nl);
 
   // Compute screened Hamiltonian

@@ -57,6 +57,8 @@
 #include <stdexcept>
 #include <xc.h>
 
+#include "basis_evaluator.hpp"
+
 namespace Nukexc {
 
 struct XC_result {
@@ -260,8 +262,18 @@ compute_lsda(const DeviceView2DLeft collocation_values,
   return XC_result_polarized{xc_energy, V_alpha, V_beta};
 }
 
+// NOTE ON THE BLOCK-PAIR ACCUMULATOR
+// A block pair contributes an (n_i x n_j) outer product summed over the
+// batch's points, so the accumulator is inherently max_block_size^2 per
+// thread. For an STO that is one double and this compiles to exactly the
+// pre-template code. For a GTO it is cart_size(l_max)^2, which is correct but
+// not a shape to run in anger -- Phase 4 replaces these kernels wholesale with
+// libxckernel's pack -> GEMM -> scatter form, where the same contraction is a
+// dense block multiply instead of per-pair atomics.
+template <typename Evaluator>
+  requires BasisEvaluatorWith<Evaluator, BasisDeriv::Value>
 XC_result_polarized
-compute_lsda_sparse(const STOBasisSet basis, const FlatGrid grid,
+compute_lsda_sparse(const Evaluator basis, const FlatGrid grid,
                     const NeighborList nl, const DeviceView2DLeft mo_alpha,
                     const DeviceView1D occ_alpha,
                     const DeviceView2DLeft mo_beta, const DeviceView1D occ_beta,
@@ -379,24 +391,40 @@ compute_lsda_sparse(const STOBasisSet basis, const FlatGrid grid,
               Kokkos::TeamThreadMDRange(team_member, num_neighbors,
                                         num_neighbors),
               [=](const int local_i, const int local_j) {
-                const int global_i = nl.neighbors(start_neighbors + local_i);
-                const int global_j = nl.neighbors(start_neighbors + local_j);
-                const ShellParams sh_i = load_shell(basis, global_i);
-                const ShellParams sh_j = load_shell(basis, global_j);
-                double V_local = 0;
+                constexpr int MBS = Evaluator::max_block_size;
+                const int bi = nl.neighbors(start_neighbors + local_i);
+                const int bj = nl.neighbors(start_neighbors + local_j);
+                const auto pi = basis.load_block(bi);
+                const auto pj = basis.load_block(bj);
+                const int ni = basis.block_size(bi);
+                const int nj = basis.block_size(bj);
+
+                double acc[MBS * MBS];
+                for (int t = 0; t < ni * nj; ++t)
+                  acc[t] = 0.0;
+
+                double phi_i[MBS], phi_j[MBS];
                 for (int local_g = 0; local_g < num_points; ++local_g) {
-
-                  const double phi_i = basis_eval_fast(
-                      sh_i, points_scratch(local_g)[0],
-                      points_scratch(local_g)[1], points_scratch(local_g)[2]);
-                  const double phi_j = basis_eval_fast(
-                      sh_j, points_scratch(local_g)[0],
-                      points_scratch(local_g)[1], points_scratch(local_g)[2]);
-
-                  V_local += weights_scratch(local_g) *
-                             (0.5 * phi_j * phi_i * vrho_cache(local_g));
+                  const double px = points_scratch(local_g)[0];
+                  const double py = points_scratch(local_g)[1];
+                  const double pz = points_scratch(local_g)[2];
+                  basis.template eval_block<BasisDeriv::Value>(pi, px, py, pz,
+                                                               phi_i, 1);
+                  basis.template eval_block<BasisDeriv::Value>(pj, px, py, pz,
+                                                               phi_j, 1);
+                  const double wv =
+                      weights_scratch(local_g) * 0.5 * vrho_cache(local_g);
+                  for (int ti = 0; ti < ni; ++ti)
+                    for (int tj = 0; tj < nj; ++tj)
+                      acc[ti * nj + tj] += wv * phi_j[tj] * phi_i[ti];
                 }
-                Kokkos::atomic_add(&V(global_i, global_j), V_local);
+
+                const int bf_i = basis.block_first_bf(bi);
+                const int bf_j = basis.block_first_bf(bj);
+                for (int ti = 0; ti < ni; ++ti)
+                  for (int tj = 0; tj < nj; ++tj)
+                    Kokkos::atomic_add(&V(bf_i + ti, bf_j + tj),
+                                       acc[ti * nj + tj]);
               });
         });
     Kokkos::parallel_for(
@@ -725,8 +753,10 @@ compute_gga_lsda(const DeviceView2DLeft collocation_values,
   return XC_result_polarized{xc_energy, V_alpha, V_beta};
 }
 
+template <typename Evaluator>
+  requires BasisEvaluatorWith<Evaluator, BasisDeriv::Gradient>
 XC_result_polarized
-compute_gga_lsda_sparse(const STOBasisSet basis, const FlatGrid grid,
+compute_gga_lsda_sparse(const Evaluator basis, const FlatGrid grid,
                         const NeighborList nl, const DeviceView2DLeft mo_alpha,
                         const DeviceView1D occ_alpha,
                         const DeviceView2DLeft mo_beta,
@@ -916,36 +946,50 @@ compute_gga_lsda_sparse(const STOBasisSet basis, const FlatGrid grid,
               Kokkos::TeamThreadMDRange(team_member, num_neighbors,
                                         num_neighbors),
               [=](const int local_i, const int local_j) {
-                const int global_i = nl.neighbors(start_neighbors + local_i);
-                const int global_j = nl.neighbors(start_neighbors + local_j);
-                double phi_i, phi_j, gx_i, gy_i, gz_i;
-                double x, y, z;
-                const ShellParams sh_i = load_shell(basis, global_i);
-                const ShellParams sh_j = load_shell(basis, global_j);
+                constexpr int MBS = Evaluator::max_block_size;
+                constexpr int NCG = basis_ncomp(BasisDeriv::Gradient);
+                const int bi = nl.neighbors(start_neighbors + local_i);
+                const int bj = nl.neighbors(start_neighbors + local_j);
+                const auto pi = basis.load_block(bi);
+                const auto pj = basis.load_block(bj);
+                const int ni = basis.block_size(bi);
+                const int nj = basis.block_size(bj);
 
-                double V_local = 0;
+                double acc[MBS * MBS];
+                for (int t = 0; t < ni * nj; ++t)
+                  acc[t] = 0.0;
+
+                double bi_buf[NCG * MBS], phi_j[MBS];
                 for (int local_g = 0; local_g < num_points; ++local_g) {
-                  x = points_scratch(local_g)[0];
-                  y = points_scratch(local_g)[1];
-                  z = points_scratch(local_g)[2];
+                  const double px = points_scratch(local_g)[0];
+                  const double py = points_scratch(local_g)[1];
+                  const double pz = points_scratch(local_g)[2];
+                  // block i needs value and gradient, block j only the value
+                  basis.template eval_block<BasisDeriv::Gradient>(
+                      pi, px, py, pz, bi_buf, MBS);
+                  basis.template eval_block<BasisDeriv::Value>(pj, px, py, pz,
+                                                               phi_j, 1);
 
-                  phi_i = basis_eval_fast(sh_i, points_scratch(local_g)[0],
-                                          points_scratch(local_g)[1],
-                                          points_scratch(local_g)[2]);
-                  phi_j = basis_eval_fast(sh_j, points_scratch(local_g)[0],
-                                          points_scratch(local_g)[1],
-                                          points_scratch(local_g)[2]);
-
-                  basis_eval_grad(basis, global_i, x, y, z, gx_i, gy_i, gz_i);
-
-                  const double grad_dot = vx_cache(local_g) * gx_i +
-                                          vy_cache(local_g) * gy_i +
-                                          vz_cache(local_g) * gz_i;
-
-                  V_local += weights_scratch(local_g) * phi_j *
-                             (0.5 * phi_i * vrho_cache(local_g) + grad_dot);
+                  const double w = weights_scratch(local_g);
+                  for (int ti = 0; ti < ni; ++ti) {
+                    const double grad_dot =
+                        vx_cache(local_g) * bi_buf[BF_DX * MBS + ti] +
+                        vy_cache(local_g) * bi_buf[BF_DY * MBS + ti] +
+                        vz_cache(local_g) * bi_buf[BF_DZ * MBS + ti];
+                    const double ci = 0.5 * bi_buf[BF_VAL * MBS + ti] *
+                                          vrho_cache(local_g) +
+                                      grad_dot;
+                    for (int tj = 0; tj < nj; ++tj)
+                      acc[ti * nj + tj] += w * phi_j[tj] * ci;
+                  }
                 }
-                Kokkos::atomic_add(&V(global_i, global_j), V_local);
+
+                const int bf_i = basis.block_first_bf(bi);
+                const int bf_j = basis.block_first_bf(bj);
+                for (int ti = 0; ti < ni; ++ti)
+                  for (int tj = 0; tj < nj; ++tj)
+                    Kokkos::atomic_add(&V(bf_i + ti, bf_j + tj),
+                                       acc[ti * nj + tj]);
               });
         });
 
@@ -981,7 +1025,8 @@ compute_gga_lsda_sparse(const STOBasisSet basis, const FlatGrid grid,
 // in density.hpp. Kept as the starting point for whoever adds mGGA support
 // next.
 // TODO:: This function has not been tested and probably contains bugs
-XC_result compute_mgga(const STOBasisSet basis, const FlatGrid grid,
+template <typename Evaluator>
+XC_result compute_mgga(const Evaluator basis, const FlatGrid grid,
                        const DeviceView2DLeft mo_orbitals,
                        const DeviceView1D mo_coeff, const xc_func_type func) {
   ExecSpace space;

@@ -666,10 +666,10 @@ TEST_CASE("compute_coulomb sparse -- hydrogen 1s self-repulsion",
   int max_points_per_box = 32;
   auto bb = create_bounding_boxes(grid, max_points_per_box);
   NeighborList nl;
-  build_neighbor_list(basis, bb, max_points_per_box, grid.quad_points.extent(0),
+  build_neighbor_list(STOPrimitiveEvaluator(basis), bb, max_points_per_box, grid.quad_points.extent(0),
                       nl);
   NeighborList nl_aux;
-  build_neighbor_list(basis_aux, bb, max_points_per_box,
+  build_neighbor_list(STOPrimitiveEvaluator(basis_aux), bb, max_points_per_box,
                       grid.quad_points.extent(0), nl_aux);
 
   // Compute (A|B)
@@ -793,10 +793,10 @@ TEST_CASE("compute_exchange sparse -- hydrogen 1s self-exchange",
   int max_points_per_box = 32;
   auto bb = create_bounding_boxes(grid, max_points_per_box);
   NeighborList nl;
-  build_neighbor_list(basis, bb, max_points_per_box, grid.quad_points.extent(0),
+  build_neighbor_list(STOPrimitiveEvaluator(basis), bb, max_points_per_box, grid.quad_points.extent(0),
                       nl);
   NeighborList nl_aux;
-  build_neighbor_list(basis_aux, bb, max_points_per_box,
+  build_neighbor_list(STOPrimitiveEvaluator(basis_aux), bb, max_points_per_box,
                       grid.quad_points.extent(0), nl_aux);
 
   // Compute (A|B)
@@ -939,9 +939,9 @@ TEST_CASE("compute_coulomb_tiled -- hydrogen 1s self-repulsion",
   int max_points_per_box = 32;
   auto bb = create_bounding_boxes(grid, max_points_per_box);
   NeighborList nl, nl_aux;
-  build_neighbor_list(basis, bb, max_points_per_box, grid.quad_points.extent(0),
+  build_neighbor_list(STOPrimitiveEvaluator(basis), bb, max_points_per_box, grid.quad_points.extent(0),
                       nl);
-  build_neighbor_list(basis_aux, bb, max_points_per_box,
+  build_neighbor_list(STOPrimitiveEvaluator(basis_aux), bb, max_points_per_box,
                       grid.quad_points.extent(0), nl_aux);
   auto aux_overlap_sym =
       coulomb_overlap_integral_sparse(space, basis_aux, grid, nl_aux);
@@ -979,9 +979,9 @@ TEST_CASE("compute_exact_exchange_tiled -- hydrogen 1s self-exchange",
   int max_points_per_box = 32;
   auto bb = create_bounding_boxes(grid, max_points_per_box);
   NeighborList nl, nl_aux;
-  build_neighbor_list(basis, bb, max_points_per_box, grid.quad_points.extent(0),
+  build_neighbor_list(STOPrimitiveEvaluator(basis), bb, max_points_per_box, grid.quad_points.extent(0),
                       nl);
-  build_neighbor_list(basis_aux, bb, max_points_per_box,
+  build_neighbor_list(STOPrimitiveEvaluator(basis_aux), bb, max_points_per_box,
                       grid.quad_points.extent(0), nl_aux);
   auto aux_overlap_sym =
       coulomb_overlap_integral_sparse(space, basis_aux, grid, nl_aux);
@@ -1031,9 +1031,9 @@ TEST_CASE("tiled Coulomb/exchange match sparse (multi-tile, tile=1)",
   int max_points_per_box = 32;
   auto bb = create_bounding_boxes(grid, max_points_per_box);
   NeighborList nl, nl_aux;
-  build_neighbor_list(basis, bb, max_points_per_box, grid.quad_points.extent(0),
+  build_neighbor_list(STOPrimitiveEvaluator(basis), bb, max_points_per_box, grid.quad_points.extent(0),
                       nl);
-  build_neighbor_list(basis_aux, bb, max_points_per_box,
+  build_neighbor_list(STOPrimitiveEvaluator(basis_aux), bb, max_points_per_box,
                       grid.quad_points.extent(0), nl_aux);
   auto aux_overlap_sym =
       coulomb_overlap_integral_sparse(space, basis_aux, grid, nl_aux);
