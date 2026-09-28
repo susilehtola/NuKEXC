@@ -57,12 +57,28 @@ endif()
 # Note this file must be include()d from the top-level CMakeLists before any
 # add_subdirectory() that builds Armadillo users -- subdirectories take their
 # copy of this variable at add_subdirectory() time.
+#
+# The standard C system directories are exempt. A distribution package puts
+# Armadillo straight into /usr/include, and forcing -I/usr/include there is
+# actively harmful: it hoists /usr/include ahead of the C++ library headers,
+# so the `#include_next <stdlib.h>` in /usr/include/c++/NN/cstdlib skips the
+# directory it was meant to land in and the build dies with
+# "fatal error: stdlib.h: No such file or directory" in every translation
+# unit. Those directories are on the default search path by definition, so
+# the workaround is never needed for them anyway.
+set(_nxc_system_inc_dirs /usr/include /usr/local/include)
+
 foreach(_arma_inc IN LISTS ARMADILLO_INCLUDE_DIRS)
-  if(_arma_inc IN_LIST CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES)
+  if(_arma_inc IN_LIST _nxc_system_inc_dirs)
+    message(STATUS "  ${_arma_inc} is a standard system include dir "
+                   "-- leaving the implicit list alone")
+  elseif(_arma_inc IN_LIST CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES)
     list(REMOVE_ITEM CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES "${_arma_inc}")
     message(STATUS "  forcing -I${_arma_inc} "
                    "(suppressed as an implicit compiler include dir)")
   endif()
 endforeach()
+
+unset(_nxc_system_inc_dirs)
 
 target_link_libraries(libnukexc INTERFACE armadillo)
