@@ -45,6 +45,7 @@
 #include "molecule.hpp"
 #include "nukexc_config.hpp"
 #include "nukexc_utils.hpp"
+#include "basis_evaluator.hpp"
 #include "spherical_harmonics.hpp"
 
 namespace Nukexc {
@@ -585,5 +586,59 @@ void basis_eval_with_grad(const ScratchBasisParams &basis, const Point &p,
   grady = R_pre * dS_dy + S_val * (dy * common_R);
   gradz = R_pre * dS_dz + S_val * (dz * common_R);
 }
+
+// ============================================================================
+//  BasisEvaluator adapter
+// ============================================================================
+//
+// One basis function per block: each primitive STO is independent, so there
+// is no shared work to amortize across a block.
+
+class STOPrimitiveEvaluator {
+public:
+  using block_params = ScratchBasisParams;
+  static constexpr int max_block_size = 1;
+
+  STOPrimitiveEvaluator() = default;
+  explicit STOPrimitiveEvaluator(STOBasisSet b) : b_(std::move(b)) {}
+
+  int nbf() const { return static_cast<int>(b_.nbf()); }
+  int nblock() const { return static_cast<int>(b_.nbf()); }
+  KOKKOS_INLINE_FUNCTION int block_first_bf(int i) const { return i; }
+  KOKKOS_INLINE_FUNCTION int block_size(int) const { return 1; }
+
+  Kokkos::View<Point *> centers() const { return b_.O; }
+  Kokkos::View<double *> radii() const { return b_.cutoff_radii; }
+
+  const STOBasisSet &basis() const { return b_; }
+
+  KOKKOS_INLINE_FUNCTION block_params load_block(int i) const {
+    return ScratchBasisParams{b_.zeta(i), b_.norm(i), b_.O(i),
+                              b_.n(i),    b_.l(i),    b_.m(i)};
+  }
+
+  template <BasisDeriv D>
+  KOKKOS_INLINE_FUNCTION void eval_block(const block_params &p, double x,
+                                         double y, double z, double *out,
+                                         int stride) const {
+    static_assert(D == BasisDeriv::Value || D == BasisDeriv::Gradient,
+                  "the primitive STO path implements values and gradients; "
+                  "higher orders are not yet derived for Slater functions");
+    if constexpr (D == BasisDeriv::Value) {
+      const ShellParams sh{p.l,    p.m,    p.n - p.l - 1, p.zeta,
+                           p.norm, p.O[0], p.O[1],        p.O[2]};
+      out[BF_VAL * stride] = basis_eval_fast(sh, x, y, z);
+    } else {
+      const Point pt{x, y, z};
+      basis_eval_with_grad(p, pt, out[BF_VAL * stride], out[BF_DX * stride],
+                           out[BF_DY * stride], out[BF_DZ * stride]);
+    }
+  }
+
+private:
+  STOBasisSet b_;
+};
+
+static_assert(BasisEvaluator<STOPrimitiveEvaluator>);
 
 } // namespace Nukexc
