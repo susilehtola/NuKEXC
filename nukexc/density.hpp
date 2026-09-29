@@ -160,6 +160,85 @@ DeviceView1D compute_density_sparse(const Evaluator basis,
   return density;
 };
 
+// ============================================================================
+//  Density-matrix formulation
+// ============================================================================
+//
+// rho(r) = sum_uv P_uv chi_u(r) chi_v(r)
+//
+// The MO route below costs O(N_occ N_bf N_pts); this one costs
+// O(N_bf^2 N_pts). Which is cheaper depends on the occupied fraction, but
+// asymptotics are not the reason to prefer this one. Blum et al. (Comput.
+// Phys. Commun. 180 (2009) 2175, Eqs. 27-28) make the point that a batch's
+// non-zero basis count is bounded while N_occ grows with system size, so the
+// MO route is the one that degrades. More immediately for NuKEXC: the density
+// matrix is what SCF hosts actually hand over, it is what fractional and
+// ensemble occupations require, and |P| magnitudes are the standard input to
+// shell-pair screening, which the MO route cannot provide at all.
+//
+// The contraction is one GEMM (X = P Phi) plus a column-wise dot product.
+
+/// rho from a density matrix and a precomputed collocation block.
+inline DeviceView1D compute_density_dm(const DeviceView2DLeft collocation_values,
+                                       const DeviceView2DLeft P) {
+  ExecSpace space;
+  const int N_bf = collocation_values.extent(0);
+  const int N_quad = collocation_values.extent(1);
+
+  DeviceView1D density("density", N_quad);
+  DeviceView2DLeft X("P phi", N_bf, N_quad);
+
+  KokkosBlas::gemm(space, "N", "N", 1.0, P, collocation_values, 0.0, X);
+
+  Kokkos::parallel_for(
+      "Contract density matrix", Kokkos::RangePolicy<ExecSpace>(space, 0, N_quad),
+      KOKKOS_LAMBDA(const int g) {
+        double acc = 0.0;
+        for (int mu = 0; mu < N_bf; ++mu)
+          acc += collocation_values(mu, g) * X(mu, g);
+        density(g) = acc;
+      });
+
+  return density;
+}
+
+/// rho, its gradient and sigma from a density matrix.
+///
+/// With P symmetric, grad rho = 2 sum_u grad chi_u (P chi)_u, so the same
+/// X = P Phi serves all four outputs and only one GEMM is needed.
+inline void compute_density_and_sigma_dm(
+    const DeviceView2DLeft collocation_values,
+    const DeviceView2DLeft collocation_gx, const DeviceView2DLeft collocation_gy,
+    const DeviceView2DLeft collocation_gz, const DeviceView2DLeft P,
+    DeviceView1D rho, DeviceView1D gx_rho, DeviceView1D gy_rho,
+    DeviceView1D gz_rho, DeviceView1D sigma) {
+  ExecSpace space;
+  const int N_bf = collocation_values.extent(0);
+  const int N_quad = collocation_values.extent(1);
+
+  DeviceView2DLeft X("P phi", N_bf, N_quad);
+  KokkosBlas::gemm(space, "N", "N", 1.0, P, collocation_values, 0.0, X);
+
+  Kokkos::parallel_for(
+      "Contract density matrix with gradient",
+      Kokkos::RangePolicy<ExecSpace>(space, 0, N_quad),
+      KOKKOS_LAMBDA(const int g) {
+        double r = 0.0, dx = 0.0, dy = 0.0, dz = 0.0;
+        for (int mu = 0; mu < N_bf; ++mu) {
+          const double x = X(mu, g);
+          r += collocation_values(mu, g) * x;
+          dx += collocation_gx(mu, g) * x;
+          dy += collocation_gy(mu, g) * x;
+          dz += collocation_gz(mu, g) * x;
+        }
+        rho(g) = r;
+        gx_rho(g) = 2.0 * dx;
+        gy_rho(g) = 2.0 * dy;
+        gz_rho(g) = 2.0 * dz;
+        sigma(g) = 4.0 * (dx * dx + dy * dy + dz * dz);
+      });
+}
+
 DeviceView1D compute_density(const DeviceView2DLeft collocation_values,
                              const DeviceView2DLeft mo_orbitals,
                              const DeviceView1D mo_coeff) {

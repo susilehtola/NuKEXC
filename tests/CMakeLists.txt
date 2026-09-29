@@ -21,6 +21,7 @@ add_executable(test_gto_eval test_gto_eval.cxx)
 add_executable(test_gto_overlap test_gto_overlap.cxx)
 add_executable(test_basis_evaluator test_basis_evaluator.cxx)
 add_executable(test_erkale_overlap test_erkale_overlap.cxx)
+add_executable(test_host_interface test_host_interface.cxx)
 
 add_executable(standalone standards.cxx standalone.cxx test_io.cxx)
 
@@ -53,6 +54,7 @@ set(ALL_TEST_TARGETS
     test_gto_overlap
     test_basis_evaluator
     test_erkale_overlap
+    test_host_interface
 
     standalone
 
@@ -85,5 +87,6 @@ add_test( NAME GTO_EVAL_TEST COMMAND $<TARGET_FILE:test_gto_eval> )
 add_test( NAME GTO_OVERLAP_TEST COMMAND $<TARGET_FILE:test_gto_overlap> )
 add_test( NAME BASIS_EVALUATOR_TEST COMMAND $<TARGET_FILE:test_basis_evaluator> )
 add_test( NAME ERKALE_OVERLAP_TEST COMMAND $<TARGET_FILE:test_erkale_overlap> )
+add_test( NAME HOST_INTERFACE_TEST COMMAND $<TARGET_FILE:test_host_interface> )
 # test_arborx was built but never registered, so nothing ran it.
 add_test( NAME ARBORX_TEST COMMAND $<TARGET_FILE:test_arborx> )
