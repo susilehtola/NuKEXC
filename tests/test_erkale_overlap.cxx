@@ -37,6 +37,7 @@
 #include <nukexc/grid.hpp>
 #include <nukexc/gto_basisset.hpp>
 #include <nukexc/gto_eval.hpp>
+#include <nukexc/density.hpp>
 #include <nukexc/molecule.hpp>
 
 using namespace Nukexc;
@@ -116,6 +117,7 @@ Reference load_reference(const std::string &path) {
 }
 
 const char *kRef = "reference/water_ccpvdz_erkale.ref";
+const char *kRef631 = "reference/water_631gdp_erkale.ref";
 
 } // namespace
 
@@ -209,6 +211,89 @@ TEST_CASE("Quadrature overlap reproduces ERKALE's analytic overlap",
   // Quadrature error, not a convention mismatch: a wrong phase, ordering or
   // normalization would show up at O(1), not at this level.
   REQUIRE(worst < 1e-6);
+}
+
+TEST_CASE("Water density integrates to the electron count",
+          "[erkale][parity][grid][density]") {
+  // 6-31G(d,p) -- the polarized 6-31G family; ERKALE's basis library has no
+  // bare 6-31G*, and 6-31G(d,p) is a superset of it.
+  //
+  // No SCF is needed to make this a real test. For ANY set of S-orthonormal
+  // vectors c_i, the density rho = sum_i occ_i |sum_mu c_mu,i phi_mu|^2
+  // integrates exactly to sum_i occ_i, because
+  //
+  //     integral rho = sum_i occ_i c_i^T S c_i = sum_i occ_i.
+  //
+  // So orthonormalizing arbitrary vectors against ERKALE's overlap gives an
+  // exactly known target, and any deviation is quadrature error in NuKEXC's
+  // grid, collocation and density contraction -- which is precisely what this
+  // is meant to measure.
+  const auto ref = load_reference(kRef631);
+  const int nbf = ref.nbf;
+  REQUIRE(nbf == 24);
+
+  const int nocc = 5; // water has 10 electrons
+  const double occ = 2.0;
+
+  // Modified Gram-Schmidt in the S metric, on a deterministic starting set.
+  std::vector<std::vector<double>> C(nocc, std::vector<double>(nbf, 0.0));
+  auto Sdot = [&](const std::vector<double> &a, const std::vector<double> &b) {
+    double acc = 0.0;
+    for (int i = 0; i < nbf; ++i)
+      for (int j = 0; j < nbf; ++j)
+        acc += a[i] * ref.overlap[static_cast<size_t>(i) * nbf + j] * b[j];
+    return acc;
+  };
+  for (int k = 0; k < nocc; ++k) {
+    for (int i = 0; i < nbf; ++i)
+      C[k][i] = std::sin(0.7 * (k + 1) * (i + 1)) + 0.3 * std::cos(0.11 * i);
+    for (int m = 0; m < k; ++m) {
+      const double proj = Sdot(C[m], C[k]);
+      for (int i = 0; i < nbf; ++i)
+        C[k][i] -= proj * C[m][i];
+    }
+    const double nrm = std::sqrt(Sdot(C[k], C[k]));
+    REQUIRE(nrm > 1e-8);
+    for (int i = 0; i < nbf; ++i)
+      C[k][i] /= nrm;
+  }
+  // confirm the starting point really is orthonormal in the S metric
+  for (int a = 0; a < nocc; ++a)
+    for (int b = 0; b < nocc; ++b) {
+      INFO("orbital pair " << a << "," << b);
+      REQUIRE_THAT(Sdot(C[a], C[b]),
+                   Catch::Matchers::WithinAbs(a == b ? 1.0 : 0.0, 1e-10));
+    }
+
+  DeviceView2DLeft mo("mo", nbf, nocc);
+  auto mo_h = Kokkos::create_mirror_view(mo);
+  for (int i = 0; i < nbf; ++i)
+    for (int k = 0; k < nocc; ++k)
+      mo_h(i, k) = C[k][i];
+  Kokkos::deep_copy(mo, mo_h);
+
+  DeviceView1D occv("occ", nocc);
+  Kokkos::deep_copy(occv, occ);
+
+  Molecule mol;
+  read_xyz("reference/water.xyz", mol);
+  FlatGrid grid = make_flat_grid<ta_type, ll_type>(mol, 120, 41);
+
+  // Through the generic evaluator path, so this exercises the concept too.
+  const GTOEvaluator ev(make_gto_device_basis(ref.basis));
+  DeviceView1D rho = compute_density(ev, grid, mo, occv);
+  Kokkos::fence();
+
+  double nel = 0.0;
+  auto w = grid.weights;
+  const int npts = static_cast<int>(grid.quad_points.extent(0));
+  Kokkos::parallel_reduce(
+      "integrate rho", Kokkos::RangePolicy<ExecSpace>(0, npts),
+      KOKKOS_LAMBDA(const int g, double &acc) { acc += w(g) * rho(g); }, nel);
+
+  INFO("integrated density " << nel << " vs exact " << occ * nocc
+                             << ", deviation " << std::abs(nel - occ * nocc));
+  REQUIRE_THAT(nel, Catch::Matchers::WithinAbs(occ * nocc, 1e-6));
 }
 
 int main(int argc, char *argv[]) {

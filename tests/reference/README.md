@@ -18,6 +18,7 @@ is otherwise the easiest way to make such a comparison meaningless.
 |---|---|---|
 | `water.xyz` | water geometry, Ångström | both sides |
 | `water_ccpvdz_erkale.ref` | cc-pVDZ basis + analytic overlap | `tests/test_erkale_overlap.cxx` |
+| `water_631gdp_erkale.ref` | 6-31G(d,p) basis + analytic overlap | `tests/test_erkale_overlap.cxx` |
 
 `water.xyz` is a copy of `input/water.xyz` with the leading blank line removed:
 NuKEXC's `read_xyz` tolerates it, ERKALE's `load_xyz` asserts.
@@ -26,8 +27,10 @@ NuKEXC's `read_xyz` tolerates it, ERKALE's `load_xyz` asserts.
 
 - **ERKALE** commit `ea638a54` ("emd: normalize accessors, underscore members"),
   built in `/home/work/erkale/build-verify` (OpenMP, `liberkale_omp.a`).
-- **Basis** `/home/work/erkale/basis/cc-pVDZ.gbs`, loaded with
-  `BasisSetLibrary::load_gaussian94`.
+- **Bases** `/home/work/erkale/basis/cc-pVDZ.gbs` and
+  `/home/work/erkale/basis/6-31G(d,p).gbs`, loaded with
+  `BasisSetLibrary::load_gaussian94`. ERKALE's library has no bare `6-31G*`;
+  `6-31G(d,p)` is a superset of it.
 - **Defaults** as constructed by `settings.add_scf_settings()`; in particular
   ERKALE's OptLM default, under which s and p shells are stored Cartesian and
   d and higher spherical. The `shell` records in the file record the
@@ -58,6 +61,8 @@ g++ -std=c++17 -O2 -fopenmp -o erk_dump \
 
 ./erk_dump tests/reference/water.xyz $E/basis/cc-pVDZ.gbs \
            tests/reference/water_ccpvdz_erkale.ref
+./erk_dump tests/reference/water.xyz "$E/basis/6-31G(d,p).gbs" \
+           tests/reference/water_631gdp_erkale.ref
 ```
 
 Two things that are easy to trip over when relinking: ERKALE's library code
@@ -97,3 +102,11 @@ oxygen s shell (9 primitives, 2 contractions):
 - full 24×24 **quadrature** overlap on a (120, L=41) Treutler–Ahlrichs /
   Lebedev grid matches to **2.6e-8**, which is grid error. A wrong phase,
   ordering or normalization would show up at O(1), not here.
+
+Water / 6-31G(d,p), 12 shells, 24 functions:
+
+- the **density integrates to the electron count** to **1.0e-8**. No SCF is
+  needed to make that a real test: for any S-orthonormal set of vectors,
+  ∫ρ = Σᵢ occᵢ cᵢᵀ S cᵢ = Σᵢ occᵢ exactly, so orthonormalizing arbitrary
+  vectors against ERKALE's overlap gives an exactly known target and the
+  deviation is purely NuKEXC's quadrature.
