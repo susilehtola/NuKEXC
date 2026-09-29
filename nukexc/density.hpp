@@ -64,16 +64,8 @@ DeviceView1D compute_density(const Evaluator basis, const FlatGrid grid,
   const int N_quad = grid.quad_points.extent(0);
   const int N_occ = mo_orbitals.extent(1);
 
-  Kokkos::View<double ***> comp("Basis collocation", 1, N_bf, N_quad);
-  fill_collocation<BasisDeriv::Value>(space, basis, grid.quad_points, comp);
-  DeviceView2DLeft collocation_values("Basis collocation 2D", N_bf, N_quad);
-  Kokkos::parallel_for(
-      "flatten collocation",
-      Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0},
-                                                        {N_bf, N_quad}),
-      KOKKOS_LAMBDA(const int i, const int g) {
-        collocation_values(i, g) = comp(0, i, g);
-      });
+  DeviceView2DLeft collocation_values("Basis collocation", N_bf, N_quad);
+  fill_collocation_values(space, basis, grid.quad_points, collocation_values);
 
   DeviceView1D density("density", N_quad);
   DeviceView2D intermediate_matrix("intermediate", N_occ, N_quad);

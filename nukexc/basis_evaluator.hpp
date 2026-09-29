@@ -247,6 +247,19 @@ KOKKOS_INLINE_FUNCTION double basis_eval_fast(const SingleBfHandle<E> &h,
   return out[0];
 }
 
+template <typename E>
+KOKKOS_INLINE_FUNCTION void
+basis_eval_with_grad(const SingleBfHandle<E> &h, const Point &pt, double &val,
+                     double &gx, double &gy, double &gz) {
+  double out[basis_ncomp(BasisDeriv::Gradient)];
+  h.ev->template eval_block<BasisDeriv::Gradient>(h.p, pt[0], pt[1], pt[2],
+                                                  out, 1);
+  val = out[BF_VAL];
+  gx = out[BF_DX];
+  gy = out[BF_DY];
+  gz = out[BF_DZ];
+}
+
 // ============================================================================
 //  Generic collocation
 // ============================================================================
@@ -294,6 +307,39 @@ void fill_collocation(ExecSpace space, const Evaluator &basis,
         for (int c = 0; c < NC; ++c)
           for (int i = 0; i < n; ++i)
             comp(c, bf0 + i, g) = local[c * MBS + i];
+      });
+}
+
+/**
+ *  @brief Value-only collocation into a 2D (nbf, npts) matrix.
+ *
+ *  The shape the dense GEMM paths want. Separate from the component-major
+ *  fill_collocation so those callers neither allocate a rank-3 view nor copy
+ *  a slice out of one.
+ */
+template <typename Evaluator, typename PointsView, typename ValuesView>
+  requires BasisEvaluatorWith<Evaluator, BasisDeriv::Value>
+void fill_collocation_values(ExecSpace space, const Evaluator &basis,
+                             PointsView points, ValuesView values) {
+  const int npts = static_cast<int>(points.extent(0));
+  const int nblk = basis.nblock();
+  if (nblk == 0 || npts == 0)
+    return;
+
+  constexpr int MBS = Evaluator::max_block_size;
+  Kokkos::parallel_for(
+      "fill_collocation_values",
+      Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>(space, {0, 0},
+                                                        {nblk, npts}),
+      KOKKOS_LAMBDA(const int ib, const int g) {
+        double local[MBS];
+        basis.template eval_block<BasisDeriv::Value>(
+            basis.load_block(ib), points(g)[0], points(g)[1], points(g)[2],
+            local, 1);
+        const int bf0 = basis.block_first_bf(ib);
+        const int n = basis.block_size(ib);
+        for (int i = 0; i < n; ++i)
+          values(bf0 + i, g) = local[i];
       });
 }
 

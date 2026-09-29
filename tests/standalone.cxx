@@ -470,10 +470,10 @@ int main(int argc, char *argv[]) {
     }
 
     // ---- Core Hamiltonian ---------------------------------------------------
-    decltype(compute_core_hamiltonian(basis, grid)) hcore;
+    decltype(compute_core_hamiltonian(STOPrimitiveEvaluator(basis), grid)) hcore;
     {
       TIME_SCOPE(startup_timing, "Core Hamiltonian (T + V_ne + S)");
-      hcore = compute_core_hamiltonian(basis, grid);
+      hcore = compute_core_hamiltonian(STOPrimitiveEvaluator(basis), grid);
     }
 
     // ---- SAP guess Hamiltonian ---------------------------------------------
@@ -484,7 +484,7 @@ int main(int argc, char *argv[]) {
     arma::mat h_sap;
     if (cfg.guess == "sap") {
       TIME_SCOPE(startup_timing, "SAP guess Hamiltonian (T + V_SAP)");
-      auto hsap = compute_core_hamiltonian(basis, grid, /*use_SAP=*/true,
+      auto hsap = compute_core_hamiltonian(STOPrimitiveEvaluator(basis), grid, /*use_SAP=*/true,
                                            cfg.sap_dir);
       h_sap = kokkos_to_arma(hsap.hamiltonian);
     }

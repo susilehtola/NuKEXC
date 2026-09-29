@@ -161,7 +161,7 @@ TEST_CASE("H2+ bonding MO density -- integrates to one electron",
       {1, 0, 0, 1.0, R, 0., 0.},  // 1s on atom B
   });
 
-  CoreHamiltonianResult result = compute_core_hamiltonian(basis, grid);
+  CoreHamiltonianResult result = compute_core_hamiltonian(STOPrimitiveEvaluator(basis), grid);
   DeviceView2DLeft S = result.overlap;
 
   auto S_h = Kokkos::create_mirror_view(S);
@@ -216,7 +216,7 @@ TEST_CASE("H2+ QZ4P lowest MO density -- integrates to one electron",
   int n_basis = basis.nbf();
 
   CoreHamiltonianResult hamiltonian;
-  hamiltonian = compute_core_hamiltonian(basis, grid);
+  hamiltonian = compute_core_hamiltonian(STOPrimitiveEvaluator(basis), grid);
 
   // Solve the core-Hamiltonian eigenproblem to get the occupied MO.
   Nukexc::Diagonalizer diagonalizer(n_basis);
