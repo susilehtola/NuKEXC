@@ -42,10 +42,17 @@
 // What an SCF program calls. Density matrices in, exchange-correlation energy
 // and Fock contribution out:
 //
-//     restricted    eval_fxc(P)      -> {Exc, Nel, Vxc}
-//     unrestricted  eval_fxc(Pa, Pb) -> {Exc, Nel, Vxc_a, Vxc_b}
+//     restricted    eval_vxc(P)      -> {Exc, Nel, Vxc}
+//     unrestricted  eval_vxc(Pa, Pb) -> {Exc, Nel, Vxc_a, Vxc_b}
 //
-// matching ERKALE's DFTGrid::eval_Fxc so the call sites translate directly.
+// These correspond to ERKALE's DFTGrid::eval_Fxc, so its call sites translate
+// directly, but the NAME follows libxckernel and the wider literature rather
+// than ERKALE: this is the order-1 quantity, the XC Fock matrix, which is
+// `vxc`. ERKALE's capital-F `Fxc` reads as "Fock" and is unambiguous in
+// context, but lowercase `fxc` means the SECOND derivative everywhere else --
+// GauXC, PySCF, the response literature, and libxckernel's own order
+// indexing. The name fxc is therefore reserved here for order 2, which
+// arrives with the response kernels in Phase 5.
 //
 // The interface is plain host pointers, not Kokkos Views and not Armadillo
 // matrices: a caller should not have to adopt NuKEXC's memory model, or
@@ -122,11 +129,11 @@ namespace detail {
 inline DeviceView2DLeft upload_matrix(const HostMatrixView &m, int n,
                                       const char *what) {
   if (!m.data)
-    throw std::invalid_argument(std::string("eval_fxc: ") + what +
+    throw std::invalid_argument(std::string("eval_vxc: ") + what +
                                 " data pointer is null");
   const int ld = m.ld > 0 ? m.ld : n;
   if (ld < n)
-    throw std::invalid_argument(std::string("eval_fxc: ") + what +
+    throw std::invalid_argument(std::string("eval_vxc: ") + what +
                                 " leading dimension " + std::to_string(ld) +
                                 " is smaller than the matrix order " +
                                 std::to_string(n));
@@ -147,11 +154,11 @@ inline void accumulate_matrix(const DeviceView2DLeft &src,
                               const HostMatrixRef &dst, int n,
                               const char *what) {
   if (!dst.data)
-    throw std::invalid_argument(std::string("eval_fxc: ") + what +
+    throw std::invalid_argument(std::string("eval_vxc: ") + what +
                                 " output pointer is null");
   const int ld = dst.ld > 0 ? dst.ld : n;
   if (ld < n)
-    throw std::invalid_argument(std::string("eval_fxc: ") + what +
+    throw std::invalid_argument(std::string("eval_vxc: ") + what +
                                 " leading dimension is smaller than the "
                                 "matrix order");
 
@@ -215,7 +222,7 @@ double compute_nel(const Evaluator &basis, const FlatGrid &grid,
  */
 template <typename Evaluator>
   requires BasisEvaluatorWith<Evaluator, BasisDeriv::Gradient>
-XCOutput eval_fxc(const Evaluator &basis, const FlatGrid &grid,
+XCOutput eval_vxc(const Evaluator &basis, const FlatGrid &grid,
                   const HostMatrixView &P, const HostMatrixRef &Vxc,
                   const xc_func_type &func,
                   const XCThresholds &thr = XCThresholds{}) {
@@ -228,11 +235,11 @@ XCOutput eval_fxc(const Evaluator &basis, const FlatGrid &grid,
                    func.info->family == XC_FAMILY_HYB_GGA;
   if (func.info->family != XC_FAMILY_LDA && !gga)
     throw std::runtime_error(
-        "eval_fxc: only LDA and GGA families are wired up on the "
+        "eval_vxc: only LDA and GGA families are wired up on the "
         "density-matrix path so far");
   if (func.nspin != XC_UNPOLARIZED)
     throw std::runtime_error(
-        "eval_fxc(P) needs an XC_UNPOLARIZED functional; use the "
+        "eval_vxc(P) needs an XC_UNPOLARIZED functional; use the "
         "(Pa, Pb) overload for XC_POLARIZED");
 
   const auto Pd = detail::upload_matrix(P, n, "P");

@@ -251,7 +251,7 @@ TEST_CASE("The density-matrix path agrees with the MO path",
   REQUIRE(worst < 1e-10 * std::max(1.0, peak));
 }
 
-TEST_CASE("eval_fxc returns a symmetric potential and a sane energy",
+TEST_CASE("eval_vxc returns a symmetric potential and a sane energy",
           "[host][xc]") {
   Fixture f;
   const STOPrimitiveEvaluator ev(f.basis);
@@ -266,7 +266,7 @@ TEST_CASE("eval_fxc returns a symmetric potential and a sane energy",
   HostMatrixView P{orb.P.data(), nbf, MatrixLayout::ColumnMajor};
   HostMatrixRef Vxc{V.data(), nbf, MatrixLayout::ColumnMajor};
 
-  const XCOutput out = eval_fxc(ev, f.grid, P, Vxc, func);
+  const XCOutput out = eval_vxc(ev, f.grid, P, Vxc, func);
 
   INFO("Exc = " << out.Exc << ", Nel = " << out.Nel
                 << ", non-finite points = " << out.nan_points);
@@ -286,7 +286,7 @@ TEST_CASE("eval_fxc returns a symmetric potential and a sane energy",
   // Vxc accumulates rather than overwrites, as ERKALE's H does.
   std::vector<double> V2(V);
   HostMatrixRef Vxc2{V2.data(), nbf, MatrixLayout::ColumnMajor};
-  eval_fxc(ev, f.grid, P, Vxc2, func);
+  eval_vxc(ev, f.grid, P, Vxc2, func);
   for (int i = 0; i < nbf * nbf; ++i) {
     INFO("element " << i);
     REQUIRE_THAT(V2[i], Catch::Matchers::WithinRel(2.0 * V[i], 1e-10) ||
@@ -296,7 +296,7 @@ TEST_CASE("eval_fxc returns a symmetric potential and a sane energy",
   xc_func_end(&func);
 }
 
-TEST_CASE("eval_fxc rejects a mismatched functional", "[host][xc]") {
+TEST_CASE("eval_vxc rejects a mismatched functional", "[host][xc]") {
   Fixture f;
   const STOPrimitiveEvaluator ev(f.basis);
   const int nbf = ev.nbf();
@@ -307,7 +307,7 @@ TEST_CASE("eval_fxc rejects a mismatched functional", "[host][xc]") {
 
   xc_func_type pol;
   REQUIRE(xc_func_init(&pol, XC_LDA_X, XC_POLARIZED) == 0);
-  REQUIRE_THROWS_AS(eval_fxc(ev, f.grid, Pv, Vr, pol), std::runtime_error);
+  REQUIRE_THROWS_AS(eval_vxc(ev, f.grid, Pv, Vr, pol), std::runtime_error);
   xc_func_end(&pol);
 }
 
