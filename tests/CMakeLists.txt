@@ -20,6 +20,7 @@ add_executable(test_sto_contracted test_sto_contracted.cxx)
 add_executable(test_gto_eval test_gto_eval.cxx)
 add_executable(test_gto_overlap test_gto_overlap.cxx)
 add_executable(test_basis_evaluator test_basis_evaluator.cxx)
+add_executable(test_erkale_overlap test_erkale_overlap.cxx)
 
 add_executable(standalone standards.cxx standalone.cxx test_io.cxx)
 add_executable(minimal_example standards.cxx minimal_example.cxx)
@@ -27,7 +28,9 @@ add_executable(minimal_example standards.cxx minimal_example.cxx)
 add_custom_target(copy_test_inputs
     COMMAND  ${CMAKE_COMMAND} -E copy_directory
             "${CMAKE_SOURCE_DIR}/input" "${CMAKE_CURRENT_BINARY_DIR}/input"
-    COMMENT "Ensuring input directory is available in the build folder"
+    COMMAND  ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/reference" "${CMAKE_CURRENT_BINARY_DIR}/reference"
+    COMMENT "Ensuring input and reference directories are available in the build folder"
     )
 
 # Create a list of all your test targets
@@ -50,6 +53,7 @@ set(ALL_TEST_TARGETS
     test_gto_eval
     test_gto_overlap
     test_basis_evaluator
+    test_erkale_overlap
 
     standalone
     minimal_example
@@ -82,5 +86,6 @@ add_test( NAME STO_CONTRACTED_TEST COMMAND $<TARGET_FILE:test_sto_contracted> )
 add_test( NAME GTO_EVAL_TEST COMMAND $<TARGET_FILE:test_gto_eval> )
 add_test( NAME GTO_OVERLAP_TEST COMMAND $<TARGET_FILE:test_gto_overlap> )
 add_test( NAME BASIS_EVALUATOR_TEST COMMAND $<TARGET_FILE:test_basis_evaluator> )
+add_test( NAME ERKALE_OVERLAP_TEST COMMAND $<TARGET_FILE:test_erkale_overlap> )
 # test_arborx was built but never registered, so nothing ran it.
 add_test( NAME ARBORX_TEST COMMAND $<TARGET_FILE:test_arborx> )
