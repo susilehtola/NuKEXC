@@ -188,7 +188,7 @@ TEST_CASE("H2+ Core Hamiltonian radial convergence", "[convergence][radial]") {
     const size_t npts = grid.quad_points.extent(0);
 
     // Compute the core Hamiltonian
-    CoreHamiltonianResult coreH = compute_core_hamiltonian(basis, grid);
+    CoreHamiltonianResult coreH = compute_core_hamiltonian(STOPrimitiveEvaluator(basis), grid);
 
     // Initialize the mo_coeff and mo_energies
     // Diagonalise the Hamiltonian
@@ -215,7 +215,7 @@ TEST_CASE("H2+ Core Hamiltonian radial convergence", "[convergence][radial]") {
     const size_t npts = grid.quad_points.extent(0);
 
     // Compute the core Hamiltonian
-    CoreHamiltonianResult coreH = compute_core_hamiltonian(basis, grid);
+    CoreHamiltonianResult coreH = compute_core_hamiltonian(STOPrimitiveEvaluator(basis), grid);
 
     // Initialize the mo_coeff and mo_energies
 
@@ -282,7 +282,7 @@ TEST_CASE("H2+ Core Hamiltonian angular convergence",
     const size_t npts = grid.quad_points.extent(0);
 
     // Compute the core Hamiltonian
-    CoreHamiltonianResult coreH = compute_core_hamiltonian(basis, grid);
+    CoreHamiltonianResult coreH = compute_core_hamiltonian(STOPrimitiveEvaluator(basis), grid);
 
     // Initialize the mo_coeff and mo_energies
 
@@ -314,7 +314,7 @@ TEST_CASE("H2+ Core Hamiltonian angular convergence",
     const size_t npts = grid.quad_points.extent(0);
 
     // Compute the core Hamiltonian
-    CoreHamiltonianResult coreH = compute_core_hamiltonian(basis, grid);
+    CoreHamiltonianResult coreH = compute_core_hamiltonian(STOPrimitiveEvaluator(basis), grid);
 
 
     // Diagonalise the Hamiltonian

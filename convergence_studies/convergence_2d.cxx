@@ -113,7 +113,7 @@ static double gs_energy(const STOBasisSet &basis, const Molecule &mol,
   auto grid = make_flat_grid<radial_type, ll_type>(mol, nrad, nang_order);
   npts_out = grid.quad_points.extent(0);
 
-  CoreHamiltonianResult coreH = compute_core_hamiltonian(basis, grid);
+  CoreHamiltonianResult coreH = compute_core_hamiltonian(STOPrimitiveEvaluator(basis), grid);
 
   Diagonalizer diagonalizer(basis.nbf());
   auto X = diagonalizer.compute_transformation(coreH.overlap);

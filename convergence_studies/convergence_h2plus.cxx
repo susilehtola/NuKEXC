@@ -116,7 +116,7 @@ static STOBasisSet make_h2_basis() {
 // Compute S_AB for a given flat grid, return the off-diagonal element.
 static double compute_S_AB(const Molecule &mol, STOBasisSet &basis,
                            const FlatGrid &grid) {
-  auto S = overlap_integral(basis, grid.quad_points, grid.weights);
+  auto S = overlap_integral(STOPrimitiveEvaluator(basis), grid.quad_points, grid.weights);
   auto S_h = Kokkos::create_mirror_view(S);
   Kokkos::deep_copy(S_h, S);
   return S_h(0, 1);
@@ -332,7 +332,7 @@ TEST_CASE("H2+ diagonal normalization convergence", "[convergence][diagonal]") {
 
   for (size_t nrad : nrad_sweep) {
     auto grid = make_flat_grid<ta_type, ll_type>(mol, nrad, nang_order_fixed);
-    auto S = overlap_integral(basis, grid.quad_points, grid.weights);
+    auto S = overlap_integral(STOPrimitiveEvaluator(basis), grid.quad_points, grid.weights);
     auto S_h = Kokkos::create_mirror_view(S);
     Kokkos::deep_copy(S_h, S);
 

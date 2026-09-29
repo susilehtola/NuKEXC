@@ -97,7 +97,7 @@ TEST_CASE("hydrogen 1s -- normalization, eigenvalues, virial",
   auto grid = make_flat_grid<bk_type, ll_type>(mol, 100, 40);
   STOBasisSet basis = make_manual_basis({{1, 0, 0, 1.0, 0., 0., 0.}}); // 1s
 
-  CoreHamiltonianResult result = compute_core_hamiltonian(basis, grid);
+  CoreHamiltonianResult result = compute_core_hamiltonian(STOPrimitiveEvaluator(basis), grid);
   DeviceView2DLeft S = result.overlap;
   DeviceView2DLeft T = result.kinetic;
   DeviceView2DLeft V = result.nuclear;
@@ -171,7 +171,7 @@ TEST_CASE("single-center 1s + 2p -- orthogonality, degeneracy, exact values",
                std::vector<unsigned>{1u});
   auto grid = make_flat_grid<bk_type, ll_type>(mol, 200, 40);
 
-  CoreHamiltonianResult result = compute_core_hamiltonian(basis, grid);
+  CoreHamiltonianResult result = compute_core_hamiltonian(STOPrimitiveEvaluator(basis), grid);
   DeviceView2DLeft S = result.overlap;
   DeviceView2DLeft T = result.kinetic;
   DeviceView2DLeft V = result.nuclear;
@@ -342,7 +342,7 @@ TEST_CASE("H2+ overlap matrix -- symmetry and analytical off-diagonal",
       {1, 0, 0, 1.0, R, 0., 0.},  // 1s on atom B
   });
 
-  CoreHamiltonianResult result = compute_core_hamiltonian(basis, grid);
+  CoreHamiltonianResult result = compute_core_hamiltonian(STOPrimitiveEvaluator(basis), grid);
   DeviceView2DLeft S = result.overlap;
   DeviceView2DLeft T = result.kinetic;
   DeviceView2DLeft V = result.nuclear;
@@ -404,7 +404,7 @@ TEST_CASE("H2+ Energies", "[h2_plus][energies]") {
 
   // Build the basis explicitly so the zeta value is unambiguous.
   STOBasisSet basis = test::load_adf_basis(mol, "input/zorabasis/QZ4P");
-  CoreHamiltonianResult result = compute_core_hamiltonian(basis, grid);
+  CoreHamiltonianResult result = compute_core_hamiltonian(STOPrimitiveEvaluator(basis), grid);
   DeviceView2DLeft S = result.overlap;
   DeviceView2DLeft T = result.kinetic;
   DeviceView2DLeft V = result.nuclear;
@@ -506,7 +506,7 @@ TEST_CASE("H2+ Energies Fused Hamiltonian",
   int n_basis = basis.nbf();
 
   CoreHamiltonianResult hamiltonian;
-  hamiltonian = compute_core_hamiltonian(basis, grid);
+  hamiltonian = compute_core_hamiltonian(STOPrimitiveEvaluator(basis), grid);
 
   // 1. Prepare Batched Views on Device
   auto S_h = Kokkos::create_mirror_view(hamiltonian.overlap);

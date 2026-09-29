@@ -35,6 +35,7 @@
 
 #pragma once
 #include "nukexc/grid.hpp"
+#include "basis_evaluator.hpp"
 #include "nukexc_config.hpp"
 #include "octree.hpp"
 #include "sap.hpp"
@@ -59,8 +60,10 @@ namespace Nukexc {
 // constant
 const size_t CHUNK_SIZE = 50000;
 
+template <typename Evaluator>
+  requires BasisEvaluatorWith<Evaluator, BasisDeriv::Value>
 DeviceView2DLeft
-overlap_integral(STOBasisSet &basis, Kokkos::View<Point *> quadrature_points,
+overlap_integral(const Evaluator &basis, Kokkos::View<Point *> quadrature_points,
                  Kokkos::View<double *, ExecSpace> quadrature_weights) {
 
   int N = basis.nbf();
@@ -95,7 +98,7 @@ overlap_integral(STOBasisSet &basis, Kokkos::View<Point *> quadrature_points,
 
     // Collocation on space_cur — can overlap with GEMM still running
     // on space_prev from the last iteration
-    fill_collocation(space_cur, basis, batch_pts, col_view); // no alloc
+    fill_collocation_values(space_cur, basis, batch_pts, col_view);
 
     Kokkos::parallel_for(
         "Scale",
@@ -130,7 +133,9 @@ struct CoreHamiltonianResult {
 // i.e. the SAP guess Fock matrix. `overlap` and `kinetic` are unaffected.
 // sap_dir overrides the potential directory; empty falls back to
 // NUKEXC_SAP_DIR and then to the in-tree default.
-CoreHamiltonianResult compute_core_hamiltonian(const STOBasisSet &basis,
+template <typename Evaluator>
+  requires BasisEvaluatorWith<Evaluator, BasisDeriv::Gradient>
+CoreHamiltonianResult compute_core_hamiltonian(const Evaluator &basis,
                                                const FlatGrid &grid,
                                                const bool use_SAP = false,
                                                const std::string &sap_dir = "") {
@@ -215,9 +220,7 @@ CoreHamiltonianResult compute_core_hamiltonian(const STOBasisSet &basis,
 
           Kokkos::parallel_for(
               Kokkos::TeamVectorRange(team_member, N), [=](const int i) {
-                ScratchBasisParams basis_i{basis.zeta(i), basis.norm(i),
-                                           basis.O(i),    basis.n(i),
-                                           basis.l(i),    basis.m(i)};
+                const auto basis_i = load_shell(basis, i);
                 basis_eval_with_grad(basis_i, local_pt, overlap_view(i, g),
                                      Gx_view(i, g), Gy_view(i, g),
                                      Gz_view(i, g));
@@ -317,8 +320,10 @@ struct CoreHamiltonianReducer {
   }
 };
 
+template <typename Evaluator>
+  requires BasisEvaluatorWith<Evaluator, BasisDeriv::Gradient>
 CoreHamiltonianResult compute_core_hamiltonian_screened(
-    const STOBasisSet &basis, const FlatGrid &grid, const NeighborList &nl) {
+    const Evaluator &basis, const FlatGrid &grid, const NeighborList &nl) {
 
   int N = basis.nbf();
   auto Z = grid.Z;
@@ -363,15 +368,9 @@ CoreHamiltonianResult compute_core_hamiltonian_screened(
               if (global_i < global_j)
                 return;
 
-              ScratchBasisParams local_basis_i{
-                  basis.zeta(global_i), basis.norm(global_i),
-                  basis.O(global_i),    basis.n(global_i),
-                  basis.l(global_i),    basis.m(global_i)};
+              const auto local_basis_i = load_shell(basis, global_i);
 
-              ScratchBasisParams local_basis_j{
-                  basis.zeta(global_j), basis.norm(global_j),
-                  basis.O(global_j),    basis.n(global_j),
-                  basis.l(global_j),    basis.m(global_j)};
+              const auto local_basis_j = load_shell(basis, global_j);
 
               double total_s = 0.0;
               double total_t = 0.0;
@@ -437,8 +436,10 @@ CoreHamiltonianResult compute_core_hamiltonian_screened(
   return result;
 }
 
+template <typename Evaluator>
+  requires BasisEvaluatorWith<Evaluator, BasisDeriv::Gradient>
 CoreHamiltonianResult compute_core_hamiltonian_screened_scratch(
-    const STOBasisSet &basis, const FlatGrid &grid, const NeighborList &nl) {
+    const Evaluator &basis, const FlatGrid &grid, const NeighborList &nl) {
   int N = basis.nbf();
   auto Z = grid.Z;
   auto atom_centers = grid.atom_centers;
@@ -456,7 +457,7 @@ CoreHamiltonianResult compute_core_hamiltonian_screened_scratch(
   // Define helpers for scratch space access
   typedef ExecSpace::scratch_memory_space ScratchSpace;
 
-  typedef Kokkos::View<ScratchBasisParams *, ScratchSpace,
+  typedef Kokkos::View<SingleBfHandle<Evaluator> *, ScratchSpace,
                        Kokkos::MemoryTraits<Kokkos::Unmanaged>>
       shared_view_basis;
 
@@ -527,15 +528,9 @@ CoreHamiltonianResult compute_core_hamiltonian_screened_scratch(
               if (global_i < global_j)
                 return;
 
-              ScratchBasisParams local_basis_i{
-                  basis.zeta(global_i), basis.norm(global_i),
-                  basis.O(global_i),    basis.n(global_i),
-                  basis.l(global_i),    basis.m(global_i)};
+              const auto local_basis_i = load_shell(basis, global_i);
 
-              ScratchBasisParams local_basis_j{
-                  basis.zeta(global_j), basis.norm(global_j),
-                  basis.O(global_j),    basis.n(global_j),
-                  basis.l(global_j),    basis.m(global_j)};
+              const auto local_basis_j = load_shell(basis, global_j);
 
               double total_s = 0.0;
               double total_t = 0.0;
@@ -600,9 +595,11 @@ CoreHamiltonianResult compute_core_hamiltonian_screened_scratch(
   return result;
 }
 
-template <int MAX_NEIGHBORS_TILE = 8, int MAX_POINTS_PER_TILE = 8>
+template <typename Evaluator, int MAX_NEIGHBORS_TILE = 8,
+          int MAX_POINTS_PER_TILE = 8>
+  requires BasisEvaluatorWith<Evaluator, BasisDeriv::Gradient>
 CoreHamiltonianResult compute_core_hamiltonian_screened_tiled(
-    const STOBasisSet &basis, const FlatGrid &grid, const NeighborList &nl) {
+    const Evaluator &basis, const FlatGrid &grid, const NeighborList &nl) {
 
   int N = basis.nbf();
   auto Z = grid.Z;
@@ -806,10 +803,7 @@ CoreHamiltonianResult compute_core_hamiltonian_screened_tiled(
                         nl.neighbors(start_neighbors +
                                      tile_i * MAX_NEIGHBORS_TILE + local_i);
 
-                    ScratchBasisParams p{
-                        basis.zeta(global_i), basis.norm(global_i),
-                        basis.O(global_i),    basis.n(global_i),
-                        basis.l(global_i),    basis.m(global_i)};
+                    const auto p = load_shell(basis, global_i);
                     Kokkos::parallel_for(
                         Kokkos::ThreadVectorRange(team_member, num_pts),
                         [=](const int local_g) {
@@ -838,10 +832,7 @@ CoreHamiltonianResult compute_core_hamiltonian_screened_tiled(
                     const int global_j =
                         nl.neighbors(start_neighbors +
                                      tile_j * MAX_NEIGHBORS_TILE + local_j);
-                    ScratchBasisParams p{
-                        basis.zeta(global_j), basis.norm(global_j),
-                        basis.O(global_j),    basis.n(global_j),
-                        basis.l(global_j),    basis.m(global_j)};
+                    const auto p = load_shell(basis, global_j);
                     Kokkos::parallel_for(
                         Kokkos::ThreadVectorRange(team_member, num_pts),
                         [=](const int local_g) {
@@ -957,8 +948,10 @@ CoreHamiltonianResult compute_core_hamiltonian_screened_tiled(
   return result;
 }
 
+template <typename Evaluator>
+  requires BasisEvaluatorWith<Evaluator, BasisDeriv::Gradient>
 CoreHamiltonianResult compute_core_hamiltonian_screened_sparse(
-    const STOBasisSet &basis, const FlatGrid &grid, const NeighborList &nl) {
+    const Evaluator &basis, const FlatGrid &grid, const NeighborList &nl) {
   int N = basis.nbf();
   auto Z = grid.Z;
   auto atom_centers = grid.atom_centers;
@@ -990,7 +983,7 @@ CoreHamiltonianResult compute_core_hamiltonian_screened_sparse(
   // Define helpers for scratch space access
   typedef ExecSpace::scratch_memory_space ScratchSpace;
 
-  typedef Kokkos::View<ScratchBasisParams *, ScratchSpace,
+  typedef Kokkos::View<SingleBfHandle<Evaluator> *, ScratchSpace,
                        Kokkos::MemoryTraits<Kokkos::Unmanaged>>
       shared_view_basis;
 
@@ -1072,10 +1065,7 @@ CoreHamiltonianResult compute_core_hamiltonian_screened_sparse(
             Kokkos::TeamThreadRange(team_member, num_neighbors),
             [=](const int local_i) {
               const int global_i = nl.neighbors(start_neighbors + local_i);
-              ScratchBasisParams local_basis_i{
-                  basis.zeta(global_i), basis.norm(global_i),
-                  basis.O(global_i),    basis.n(global_i),
-                  basis.l(global_i),    basis.m(global_i)};
+              const auto local_basis_i = load_shell(basis, global_i);
 
               Kokkos::parallel_for(
                   Kokkos::ThreadVectorRange(team_member, num_points),

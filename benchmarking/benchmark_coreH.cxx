@@ -202,7 +202,7 @@ void run_benchmark_fused(const Config &cfg) {
     double t_grid = grid_timer.seconds();
 
     core_hamiltonian_timer.reset();
-    auto hcore = compute_core_hamiltonian(basis, grid);
+    auto hcore = compute_core_hamiltonian(STOPrimitiveEvaluator(basis), grid);
     double t_core_hamiltonian = core_hamiltonian_timer.seconds();
 
     const int N = hcore.overlap.extent(0);
@@ -241,7 +241,7 @@ void run_benchmark_screened(const Config &cfg) {
     double t_neighbors = nl_timer.seconds();
 
     core_hamiltonian_timer.reset();
-    auto hcore = compute_core_hamiltonian_screened(basis, grid, nl);
+    auto hcore = compute_core_hamiltonian_screened(STOPrimitiveEvaluator(basis), grid, nl);
 
     double t_core_hamiltonian = core_hamiltonian_timer.seconds();
 
@@ -280,7 +280,7 @@ void run_benchmark_scratch(const Config &cfg) {
     double t_neighbors = nl_timer.seconds();
 
     core_hamiltonian_timer.reset();
-    auto hcore = compute_core_hamiltonian_screened_scratch(basis, grid, nl);
+    auto hcore = compute_core_hamiltonian_screened_scratch(STOPrimitiveEvaluator(basis), grid, nl);
 
     double t_core_hamiltonian = core_hamiltonian_timer.seconds();
 
@@ -319,7 +319,7 @@ void run_benchmark_tiled(const Config &cfg) {
     double t_neighbors = nl_timer.seconds();
 
     core_hamiltonian_timer.reset();
-    auto hcore = compute_core_hamiltonian_screened_tiled(basis, grid, nl);
+    auto hcore = compute_core_hamiltonian_screened_tiled(STOPrimitiveEvaluator(basis), grid, nl);
 
     double t_core_hamiltonian = core_hamiltonian_timer.seconds();
 
@@ -358,7 +358,7 @@ void run_benchmark_sparse(const Config &cfg) {
     double t_neighbors = nl_timer.seconds();
 
     core_hamiltonian_timer.reset();
-    auto hcore = compute_core_hamiltonian_screened_sparse(basis, grid, nl);
+    auto hcore = compute_core_hamiltonian_screened_sparse(STOPrimitiveEvaluator(basis), grid, nl);
 
     double t_core_hamiltonian = core_hamiltonian_timer.seconds();
 

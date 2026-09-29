@@ -72,7 +72,7 @@ TEST_CASE("H20", "[h20_weights]") {
   FlatGrid grid = make_flat_grid<ta_type, ll_type>(mol);
 
   DeviceView2DLeft S =
-      overlap_integral(stobasis, grid.quad_points, grid.weights);
+      overlap_integral(STOPrimitiveEvaluator(stobasis), grid.quad_points, grid.weights);
 
   auto S_h = Kokkos::create_mirror_view(S);
   Kokkos::deep_copy(S_h, S);
@@ -93,7 +93,7 @@ TEST_CASE("Compute core Hamiltonian with screening",
   FlatGrid grid_ref = make_flat_grid<radial_type, angular_type>(mol, 50, 30);
 
   // Unscreened reference
-  CoreHamiltonianResult Hcore_ref = compute_core_hamiltonian(basis, grid_ref);
+  CoreHamiltonianResult Hcore_ref = compute_core_hamiltonian(STOPrimitiveEvaluator(basis), grid_ref);
 
   // Create bounding boxes for screening
   const int total_points = grid.quad_points.extent(0);
@@ -109,7 +109,7 @@ TEST_CASE("Compute core Hamiltonian with screening",
 
   // Compute screened Hamiltonian
   CoreHamiltonianResult Hcore_scr =
-      compute_core_hamiltonian_screened_scratch(basis, grid, nl);
+      compute_core_hamiltonian_screened_scratch(STOPrimitiveEvaluator(basis), grid, nl);
 
   int N = basis.nbf();
   auto S_ref = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{},
@@ -143,7 +143,7 @@ TEST_CASE("Compute core Hamiltonian with screening (basis on the fly)",
   FlatGrid grid_ref = make_flat_grid<radial_type, angular_type>(mol, 50, 30);
 
   // Unscreened reference
-  CoreHamiltonianResult Hcore_ref = compute_core_hamiltonian(basis, grid_ref);
+  CoreHamiltonianResult Hcore_ref = compute_core_hamiltonian(STOPrimitiveEvaluator(basis), grid_ref);
 
   // Create bounding boxes for screening
   const int total_points = grid.quad_points.extent(0);
@@ -159,7 +159,7 @@ TEST_CASE("Compute core Hamiltonian with screening (basis on the fly)",
 
   // Compute screened Hamiltonian
   CoreHamiltonianResult Hcore_scr =
-      compute_core_hamiltonian_screened(basis, grid, nl);
+      compute_core_hamiltonian_screened(STOPrimitiveEvaluator(basis), grid, nl);
 
   int N = basis.nbf();
   auto S_ref = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{},
@@ -193,7 +193,7 @@ TEST_CASE("Compute core Hamiltonian with screening (basis tiled)",
   FlatGrid grid_ref = make_flat_grid<radial_type, angular_type>(mol, 50, 30);
 
   // Unscreened reference
-  CoreHamiltonianResult Hcore_ref = compute_core_hamiltonian(basis, grid_ref);
+  CoreHamiltonianResult Hcore_ref = compute_core_hamiltonian(STOPrimitiveEvaluator(basis), grid_ref);
 
   // Create bounding boxes for screening
   const int total_points = grid.quad_points.extent(0);
@@ -209,7 +209,7 @@ TEST_CASE("Compute core Hamiltonian with screening (basis tiled)",
 
   // Compute screened Hamiltonian
   CoreHamiltonianResult Hcore_scr =
-      compute_core_hamiltonian_screened_tiled(basis, grid, nl);
+      compute_core_hamiltonian_screened_tiled(STOPrimitiveEvaluator(basis), grid, nl);
 
   int N = basis.nbf();
   auto S_ref = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{},
@@ -255,7 +255,7 @@ TEST_CASE("Compute core Hamiltonian with screening (basis sparse)",
   FlatGrid grid_ref = make_flat_grid<radial_type, angular_type>(mol, 50, 30);
 
   // Unscreened reference
-  CoreHamiltonianResult Hcore_ref = compute_core_hamiltonian(basis, grid_ref);
+  CoreHamiltonianResult Hcore_ref = compute_core_hamiltonian(STOPrimitiveEvaluator(basis), grid_ref);
 
   // Create bounding boxes for screening
   const int total_points = grid.quad_points.extent(0);
@@ -271,7 +271,7 @@ TEST_CASE("Compute core Hamiltonian with screening (basis sparse)",
 
   // Compute screened Hamiltonian
   CoreHamiltonianResult Hcore_scr =
-      compute_core_hamiltonian_screened_sparse(basis, grid, nl);
+      compute_core_hamiltonian_screened_sparse(STOPrimitiveEvaluator(basis), grid, nl);
 
   int N = basis.nbf();
   auto S_ref = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{},

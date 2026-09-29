@@ -117,7 +117,7 @@ run_uhf_scf_energy(ExecSpace &space, const Molecule &mol,
       compute_half_inverse(aux_overlap_sym, lin_dep_threshold);
 
   // ---- Core Hamiltonian, overlap and orthogonaliser X = S^{-1/2} -----------
-  auto hcore = compute_core_hamiltonian(basis, grid);
+  auto hcore = compute_core_hamiltonian(STOPrimitiveEvaluator(basis), grid);
   Diagonalizer diag(N_bf);
   DeviceView2DLeft X =
       diag.compute_transformation(hcore.overlap, lin_dep_threshold);

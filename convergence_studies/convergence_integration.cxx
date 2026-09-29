@@ -144,9 +144,9 @@ CoreHamiltonianResult compute_reference(const Config cfg, size_t nrad,
     NeighborList nl;
     build_neighbor_list(STOPrimitiveEvaluator(stobasis), bb, cfg.max_points_per_box,
                         grid.quad_points.extent(0), nl);
-    core = compute_core_hamiltonian_screened(stobasis, grid, nl);
+    core = compute_core_hamiltonian_screened(STOPrimitiveEvaluator(stobasis), grid, nl);
   } else {
-    core = compute_core_hamiltonian(stobasis, grid);
+    core = compute_core_hamiltonian(STOPrimitiveEvaluator(stobasis), grid);
   }
   return core;
 }
@@ -168,7 +168,7 @@ void convergence_analysis(const Config &cfg,
 
   int N = stobasis.nbf();
 
-  CoreHamiltonianResult core = compute_core_hamiltonian(stobasis, grid);
+  CoreHamiltonianResult core = compute_core_hamiltonian(STOPrimitiveEvaluator(stobasis), grid);
 
   double max_error_overlap_diag = 0.0;
   double max_error_overlap = 0.0;
