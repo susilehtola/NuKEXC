@@ -101,6 +101,27 @@
 
 namespace Nukexc {
 
+// NAMING
+// ------
+// NuKEXC follows libxckernel's vocabulary, not ERKALE's, because libxckernel
+// is what supplies the XC kernels from Phase 4 onward and its operand names
+// are the actual interface between the two.
+//
+// Derivative ORDER indexes the functional derivative, as in libxckernel's
+// xck_<family>_<spin>_o<order>:
+//
+//     o0   XC energy
+//     o1   XC Fock matrix          <- "vxc" in GauXC/PySCF and the literature
+//     o2+  response contraction    <- "fxc" is order 2, and only order 2
+//
+// ERKALE spells the order-1 quantity `Fxc` (capital F for Fock). That reads
+// unambiguously in ERKALE but collides badly in lowercase C++, where `fxc`
+// means the second derivative everywhere else. So the order-1 host entry
+// point here is eval_vxc, and the name fxc is reserved for order 2.
+//
+// The component layout below is likewise chosen to match libxckernel's
+// operands: see collocation_operands().
+
 /// Which derivatives an evaluation should produce.
 enum class BasisDeriv { Value = 0, Gradient = 1, Hessian = 2, LaplGradient = 3 };
 
@@ -115,21 +136,27 @@ constexpr int basis_ncomp(BasisDeriv d) {
 }
 
 /// Component indices within an eval_block output buffer.
-enum : int {
-  BF_VAL = 0,
-  BF_DX = 1,
-  BF_DY = 2,
-  BF_DZ = 3,
-  BF_DXX = 4,
-  BF_DXY = 5,
-  BF_DXZ = 6,
-  BF_DYY = 7,
-  BF_DYZ = 8,
-  BF_DZZ = 9,
-  BF_LGX = 10,
-  BF_LGY = 11,
-  BF_LGZ = 12
-};
+///
+/// The ordering is libxckernel's: components BF_DX..BF_DZ form its `dchi`
+/// operand and BF_DXX..BF_DZZ its `hess_chi`, which it documents as packed
+/// xx,xy,xz,yy,yz,zz. A rank-3 (ncomp, nbf, ng) collocation array therefore
+/// yields every operand as a contiguous slice -- see collocation_operands().
+/// Plain ints rather than an enum: Kokkos::subview rejects an unscoped enum
+/// as an integral index, and these are used exactly that way to slice out the
+/// libxckernel operands.
+inline constexpr int BF_VAL = 0;
+inline constexpr int BF_DX = 1;
+inline constexpr int BF_DY = 2;
+inline constexpr int BF_DZ = 3;
+inline constexpr int BF_DXX = 4;
+inline constexpr int BF_DXY = 5;
+inline constexpr int BF_DXZ = 6;
+inline constexpr int BF_DYY = 7;
+inline constexpr int BF_DYZ = 8;
+inline constexpr int BF_DZZ = 9;
+inline constexpr int BF_LGX = 10;
+inline constexpr int BF_LGY = 11;
+inline constexpr int BF_LGZ = 12;
 
 /**
  *  @brief What density, collocation and the integral kernels require of a
@@ -341,6 +368,58 @@ void fill_collocation_values(ExecSpace space, const Evaluator &basis,
         for (int i = 0; i < n; ++i)
           values(bf0 + i, g) = local[i];
       });
+}
+
+/**
+ *  @brief libxckernel's collocation operands, as views onto a (ncomp, nbf, ng)
+ *         array produced by fill_collocation.
+ *
+ *  Named exactly as the generated kernels' manifests name them, so a call site
+ *  reads the same as the manifest it is satisfying:
+ *
+ *      chi       (nbf, ng)
+ *      dchi      (3, nbf, ng)     packed x, y, z
+ *      hess_chi  (6, nbf, ng)     packed xx, xy, xz, yy, yz, zz
+ *
+ *  These are subviews, not copies: the layout was chosen so no repacking is
+ *  needed between NuKEXC's evaluator and libxckernel's kernels.
+ */
+template <typename CompView> struct CollocationOperands {
+  using value_type = typename CompView::non_const_value_type;
+  using memory_space = typename CompView::memory_space;
+  // Subviews of a rank-3 array are strided, not contiguous in the Kokkos
+  // type sense, even though each operand's own data is.
+  using chi_type =
+      Kokkos::View<value_type **, Kokkos::LayoutStride, memory_space>;
+  using block_type =
+      Kokkos::View<value_type ***, Kokkos::LayoutStride, memory_space>;
+
+  chi_type chi;
+  block_type dchi;
+  block_type hess_chi;
+  bool has_dchi = false;
+  bool has_hess_chi = false;
+};
+
+/// Build the operand views for a collocation array of the given order.
+template <BasisDeriv D, typename CompView>
+CollocationOperands<CompView> collocation_operands(const CompView &comp) {
+  constexpr bool has_d = D >= BasisDeriv::Gradient;
+  constexpr bool has_h = D >= BasisDeriv::Hessian;
+
+  CollocationOperands<CompView> op;
+  op.chi = Kokkos::subview(comp, BF_VAL, Kokkos::ALL(), Kokkos::ALL());
+  // A degenerate range keeps the type uniform when an operand is absent; the
+  // has_* flags say whether it means anything.
+  op.dchi = Kokkos::subview(
+      comp, Kokkos::pair<int, int>{BF_DX, has_d ? BF_DZ + 1 : BF_DX},
+      Kokkos::ALL(), Kokkos::ALL());
+  op.hess_chi = Kokkos::subview(
+      comp, Kokkos::pair<int, int>{BF_DXX, has_h ? BF_DZZ + 1 : BF_DXX},
+      Kokkos::ALL(), Kokkos::ALL());
+  op.has_dchi = has_d;
+  op.has_hess_chi = has_h;
+  return op;
 }
 
 } // namespace Nukexc

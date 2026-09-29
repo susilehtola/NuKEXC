@@ -247,6 +247,63 @@ TEST_CASE("The generic path reproduces each basis's native evaluation",
   }
 }
 
+TEST_CASE("Collocation operands match libxckernel's shapes and packing",
+          "[concept][libxckernel]") {
+  // Phases 4-5 hand these arrays straight to generated kernels, which declare
+  // them in their manifests as
+  //     chi       (nbf, ng)
+  //     dchi      (3, nbf, ng)
+  //     hess_chi  (6, nbf, ng)  packed xx, xy, xz, yy, yz, zz
+  // The (ncomp, nbf, ng) layout was chosen so these are contiguous slices
+  // rather than repacked copies. That is only true if the component ordering
+  // agrees, so check it rather than assert it in a comment.
+  const auto ev = make_gto();
+  auto pts = make_points(kPoints);
+  const int nbf = ev.nbf(), ng = static_cast<int>(kPoints.size());
+
+  constexpr int NC = basis_ncomp(BasisDeriv::Hessian);
+  Kokkos::View<double ***> comp("comp", NC, nbf, ng);
+  fill_collocation<BasisDeriv::Hessian>(ExecSpace{}, ev, pts, comp);
+  Kokkos::fence();
+
+  const auto op = collocation_operands<BasisDeriv::Hessian>(comp);
+  REQUIRE(op.has_dchi);
+  REQUIRE(op.has_hess_chi);
+
+  REQUIRE(static_cast<int>(op.chi.extent(0)) == nbf);
+  REQUIRE(static_cast<int>(op.chi.extent(1)) == ng);
+  REQUIRE(static_cast<int>(op.dchi.extent(0)) == 3);
+  REQUIRE(static_cast<int>(op.dchi.extent(1)) == nbf);
+  REQUIRE(static_cast<int>(op.dchi.extent(2)) == ng);
+  REQUIRE(static_cast<int>(op.hess_chi.extent(0)) == 6);
+  REQUIRE(static_cast<int>(op.hess_chi.extent(1)) == nbf);
+  REQUIRE(static_cast<int>(op.hess_chi.extent(2)) == ng);
+
+  // The views must alias the same data, in the packing libxckernel expects.
+  auto h = Kokkos::create_mirror_view_and_copy(HostSpace{}, comp);
+  Kokkos::View<double **, HostSpace> chi_h("chi_h", nbf, ng);
+  Kokkos::deep_copy(chi_h, op.chi);
+  Kokkos::View<double ***, HostSpace> d_h("d_h", 3, nbf, ng), he_h("he_h", 6, nbf, ng);
+  Kokkos::deep_copy(d_h, op.dchi);
+  Kokkos::deep_copy(he_h, op.hess_chi);
+
+  for (int u = 0; u < nbf; ++u)
+    for (int g = 0; g < ng; ++g) {
+      INFO("bf " << u << " point " << g);
+      REQUIRE(chi_h(u, g) == h(BF_VAL, u, g));
+      REQUIRE(d_h(0, u, g) == h(BF_DX, u, g));
+      REQUIRE(d_h(1, u, g) == h(BF_DY, u, g));
+      REQUIRE(d_h(2, u, g) == h(BF_DZ, u, g));
+      // xx, xy, xz, yy, yz, zz
+      REQUIRE(he_h(0, u, g) == h(BF_DXX, u, g));
+      REQUIRE(he_h(1, u, g) == h(BF_DXY, u, g));
+      REQUIRE(he_h(2, u, g) == h(BF_DXZ, u, g));
+      REQUIRE(he_h(3, u, g) == h(BF_DYY, u, g));
+      REQUIRE(he_h(4, u, g) == h(BF_DYZ, u, g));
+      REQUIRE(he_h(5, u, g) == h(BF_DZZ, u, g));
+    }
+}
+
 int main(int argc, char *argv[]) {
   Kokkos::initialize(argc, argv);
   int result = 0;
