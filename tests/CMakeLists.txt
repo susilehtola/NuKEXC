@@ -25,6 +25,7 @@ add_executable(test_host_interface test_host_interface.cxx)
 add_executable(test_koster_radial test_koster_radial.cxx)
 add_executable(test_partition_schemes test_partition_schemes.cxx)
 add_executable(test_lobatto_angular test_lobatto_angular.cxx)
+add_executable(test_fixed_grid test_fixed_grid.cxx)
 
 add_executable(standalone standards.cxx standalone.cxx test_io.cxx)
 
@@ -61,6 +62,7 @@ set(ALL_TEST_TARGETS
     test_koster_radial
     test_partition_schemes
     test_lobatto_angular
+    test_fixed_grid
 
     standalone
 
@@ -97,5 +99,6 @@ add_test( NAME HOST_INTERFACE_TEST COMMAND $<TARGET_FILE:test_host_interface> )
 add_test( NAME KOSTER_RADIAL_TEST COMMAND $<TARGET_FILE:test_koster_radial> )
 add_test( NAME PARTITION_SCHEMES_TEST COMMAND $<TARGET_FILE:test_partition_schemes> )
 add_test( NAME LOBATTO_ANGULAR_TEST COMMAND $<TARGET_FILE:test_lobatto_angular> )
+add_test( NAME FIXED_GRID_TEST COMMAND $<TARGET_FILE:test_fixed_grid> )
 # test_arborx was built but never registered, so nothing ran it.
 add_test( NAME ARBORX_TEST COMMAND $<TARGET_FILE:test_arborx> )

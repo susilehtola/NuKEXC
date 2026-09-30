@@ -107,6 +107,22 @@ need `1 - x` are unaffected.
 A narrower alternative is to give `RadialTransformQuadrature` an optional
 `radial_transform_complement(1-x)` hook that transforms opt into.
 
+### It is measurable in molecular integrals, not just in the radial grid
+
+Integrating a sum of normalized Slater densities on a water grid, the
+diffuse case does not converge -- it hits a non-monotonic floor:
+
+| nrad | lmax | error (ζ = 0.8) |
+|---|---|---|
+| 99 | 59 | 1.6e-09 |
+| 99 | 71 | 8.7e-11 |
+| 99 | 83 | 5.2e-09 |
+| 150 | 95 | 3.0e-09 |
+
+A diffuse density weights the outermost radial points most heavily, which
+is exactly where the cancellation lives. Compact densities (ζ = 3) converge
+smoothly to ~5e-11 over the same range.
+
 ### Note
 
 ERKALE computes the same expression the same way, so this is not a
