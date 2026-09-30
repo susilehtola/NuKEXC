@@ -20,6 +20,7 @@ is otherwise the easiest way to make such a comparison meaningless.
 | `water_ccpvdz_erkale.ref` | cc-pVDZ basis + analytic overlap | `tests/test_erkale_overlap.cxx` |
 | `water_631gdp_erkale.ref` | 6-31G(d,p) basis + analytic overlap | `tests/test_erkale_overlap.cxx` |
 | `radial_chebyshev_{25,50,75}.ref` | ERKALE radial grids, weights excluding r² | `tests/test_koster_radial.cxx` |
+| `becke_erkale_cellfn.ref` | ERKALE's f_s(mu, a=0.7), 2001 samples | `tests/test_partition_schemes.cxx` |
 | `integratorxx-upstream.md` | two IntegratorXX issues found here, to be filed | — |
 
 `water.xyz` is a copy of `input/water.xyz` with the leading blank line removed:
