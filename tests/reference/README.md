@@ -19,6 +19,8 @@ is otherwise the easiest way to make such a comparison meaningless.
 | `water.xyz` | water geometry, Ångström | both sides |
 | `water_ccpvdz_erkale.ref` | cc-pVDZ basis + analytic overlap | `tests/test_erkale_overlap.cxx` |
 | `water_631gdp_erkale.ref` | 6-31G(d,p) basis + analytic overlap | `tests/test_erkale_overlap.cxx` |
+| `radial_chebyshev_{25,50,75}.ref` | ERKALE radial grids, weights excluding r² | `tests/test_koster_radial.cxx` |
+| `integratorxx-upstream.md` | two IntegratorXX issues found here, to be filed | — |
 
 `water.xyz` is a copy of `input/water.xyz` with the leading blank line removed:
 NuKEXC's `read_xyz` tolerates it, ERKALE's `load_xyz` asserts.
@@ -42,6 +44,10 @@ NuKEXC's `read_xyz` tolerates it, ERKALE's `load_xyz` asserts.
 
 `erkale_dump_basis_overlap.cpp` is **not** part of the NuKEXC build — it links
 against ERKALE and is run by hand.
+
+The radial reference comes from a second, smaller dumper built the same way
+against `chebyshev.h`, calling `radial_chebyshev(n, r, w)` for
+n = 25, 50, 75.
 
 ```sh
 E=/home/work/erkale
