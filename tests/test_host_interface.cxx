@@ -311,6 +311,134 @@ TEST_CASE("eval_vxc rejects a mismatched functional", "[host][xc]") {
   xc_func_end(&pol);
 }
 
+TEST_CASE("Unrestricted with equal spins reproduces the restricted result",
+          "[host][xc][polarized]") {
+  // The sharpest consistency check available: Pa = Pb = P/2 is the
+  // spin-restricted limit, so a POLARIZED functional evaluated there must
+  // return exactly what the UNPOLARIZED one returns for P -- same Exc, same
+  // Nel, and Vxc_a = Vxc_b = Vxc. The two go through entirely different code:
+  // interleaved (a,b) arrays and an opposite-spin sigma_ab term versus the
+  // single-channel path.
+  Fixture f;
+  const STOPrimitiveEvaluator ev(f.basis);
+  const int nbf = ev.nbf();
+  const auto S = quadrature_overlap(ev, f.grid);
+  const auto orb = make_orbitals(S, nbf, 5, 2.0);
+
+  std::vector<double> Phalf(orb.P);
+  for (double &v : Phalf)
+    v *= 0.5;
+
+  const int ids[2] = {XC_LDA_X, XC_GGA_X_PBE};
+  for (int id : ids) {
+    INFO("functional id " << id);
+
+    xc_func_type fr, fp;
+    REQUIRE(xc_func_init(&fr, id, XC_UNPOLARIZED) == 0);
+    REQUIRE(xc_func_init(&fp, id, XC_POLARIZED) == 0);
+
+    std::vector<double> Vr(static_cast<size_t>(nbf) * nbf, 0.0);
+    std::vector<double> Va(static_cast<size_t>(nbf) * nbf, 0.0);
+    std::vector<double> Vb(static_cast<size_t>(nbf) * nbf, 0.0);
+
+    HostMatrixView P{orb.P.data(), nbf, MatrixLayout::ColumnMajor};
+    HostMatrixView Ph{Phalf.data(), nbf, MatrixLayout::ColumnMajor};
+    HostMatrixRef Rr{Vr.data(), nbf, MatrixLayout::ColumnMajor};
+    HostMatrixRef Ra{Va.data(), nbf, MatrixLayout::ColumnMajor};
+    HostMatrixRef Rb{Vb.data(), nbf, MatrixLayout::ColumnMajor};
+
+    const XCOutput r = eval_vxc(ev, f.grid, P, Rr, fr);
+    const XCOutputPolarized u = eval_vxc(ev, f.grid, Ph, Ph, Ra, Rb, fp);
+
+    INFO("restricted Exc " << r.Exc << " vs unrestricted " << u.Exc);
+    REQUIRE_THAT(u.Exc, Catch::Matchers::WithinRel(r.Exc, 1e-11));
+    REQUIRE_THAT(u.Nel, Catch::Matchers::WithinRel(r.Nel, 1e-12));
+    REQUIRE_THAT(u.Nel_alpha, Catch::Matchers::WithinRel(0.5 * r.Nel, 1e-12));
+    REQUIRE_THAT(u.Nel_beta, Catch::Matchers::WithinRel(0.5 * r.Nel, 1e-12));
+    REQUIRE(u.nan_points == 0);
+
+    double worst_ab = 0.0, worst_r = 0.0, scale = 0.0;
+    for (size_t k = 0; k < Vr.size(); ++k) {
+      worst_ab = std::max(worst_ab, std::abs(Va[k] - Vb[k]));
+      worst_r = std::max(worst_r, std::abs(Va[k] - Vr[k]));
+      scale = std::max(scale, std::abs(Vr[k]));
+    }
+    INFO("|Va-Vb| " << worst_ab << ", |Va-Vr| " << worst_r
+                    << ", scale " << scale);
+    REQUIRE(worst_ab < 1e-12 * std::max(1.0, scale));
+    REQUIRE(worst_r < 1e-10 * std::max(1.0, scale));
+
+    xc_func_end(&fr);
+    xc_func_end(&fp);
+  }
+}
+
+TEST_CASE("eval_diag_vxc matches the diagonal of the full matrix",
+          "[host][xc][diag]") {
+  // The adaptive grid only ever looks at max_u |Delta F_uu|, so the diagonal
+  // path skips the GEMM. It must still agree with the matrix it is standing
+  // in for.
+  Fixture f;
+  const STOPrimitiveEvaluator ev(f.basis);
+  const int nbf = ev.nbf();
+  const auto S = quadrature_overlap(ev, f.grid);
+  const auto orb = make_orbitals(S, nbf, 5, 2.0);
+
+  const int ids[2] = {XC_LDA_X, XC_GGA_X_PBE};
+  for (int id : ids) {
+    INFO("functional id " << id);
+    xc_func_type func;
+    REQUIRE(xc_func_init(&func, id, XC_UNPOLARIZED) == 0);
+
+    std::vector<double> V(static_cast<size_t>(nbf) * nbf, 0.0);
+    std::vector<double> d(nbf, 0.0);
+    HostMatrixView P{orb.P.data(), nbf, MatrixLayout::ColumnMajor};
+    HostMatrixRef R{V.data(), nbf, MatrixLayout::ColumnMajor};
+
+    const XCOutput full = eval_vxc(ev, f.grid, P, R, func);
+    const XCOutput diag = eval_diag_vxc(ev, f.grid, P, d.data(), func);
+
+    REQUIRE_THAT(diag.Exc, Catch::Matchers::WithinRel(full.Exc, 1e-12));
+    REQUIRE_THAT(diag.Nel, Catch::Matchers::WithinRel(full.Nel, 1e-12));
+
+    double worst = 0.0, scale = 0.0;
+    for (int i = 0; i < nbf; ++i) {
+      const double ref = V[static_cast<size_t>(i) + static_cast<size_t>(i) * nbf];
+      worst = std::max(worst, std::abs(d[i] - ref));
+      scale = std::max(scale, std::abs(ref));
+    }
+    INFO("worst diagonal difference " << worst << ", scale " << scale);
+    REQUIRE(worst < 1e-11 * std::max(1.0, scale));
+
+    // accumulates, like the matrix form
+    std::vector<double> d2(d);
+    eval_diag_vxc(ev, f.grid, P, d2.data(), func);
+    for (int i = 0; i < nbf; ++i)
+      REQUIRE_THAT(d2[i], Catch::Matchers::WithinRel(2.0 * d[i], 1e-10) ||
+                              Catch::Matchers::WithinAbs(0.0, 1e-14));
+
+    xc_func_end(&func);
+  }
+}
+
+TEST_CASE("Unrestricted rejects a mismatched functional", "[host][xc]") {
+  Fixture f;
+  const STOPrimitiveEvaluator ev(f.basis);
+  const int nbf = ev.nbf();
+  std::vector<double> P(static_cast<size_t>(nbf) * nbf, 0.0),
+      Va(static_cast<size_t>(nbf) * nbf, 0.0),
+      Vb(static_cast<size_t>(nbf) * nbf, 0.0);
+  HostMatrixView Pv{P.data(), nbf, MatrixLayout::ColumnMajor};
+  HostMatrixRef Ra{Va.data(), nbf, MatrixLayout::ColumnMajor};
+  HostMatrixRef Rb{Vb.data(), nbf, MatrixLayout::ColumnMajor};
+
+  xc_func_type unpol;
+  REQUIRE(xc_func_init(&unpol, XC_LDA_X, XC_UNPOLARIZED) == 0);
+  REQUIRE_THROWS_AS(eval_vxc(ev, f.grid, Pv, Pv, Ra, Rb, unpol),
+                    std::runtime_error);
+  xc_func_end(&unpol);
+}
+
 int main(int argc, char *argv[]) {
   Kokkos::initialize(argc, argv);
   int result = 0;
