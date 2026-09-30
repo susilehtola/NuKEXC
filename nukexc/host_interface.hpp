@@ -790,4 +790,188 @@ XCOutput eval_diag_vxc(const Evaluator &basis, const FlatGrid &grid,
   return out;
 }
 
+/// Complex orbital coefficients in split real/imaginary storage.
+///
+/// C_im may be null for real orbitals, which is then handled without the
+/// extra GEMMs rather than by multiplying zeros.
+struct OrbitalsView {
+  const double *C_re = nullptr;
+  const double *C_im = nullptr; ///< null for real orbitals
+  int ld = 0;
+  MatrixLayout layout = MatrixLayout::ColumnMajor;
+  int norb = 0;
+};
+
+/// Per-orbital XC results, one entry per orbital.
+struct OrbitalXCOutput {
+  std::vector<double> Exc;
+  std::vector<double> Nel;
+  long nan_points = 0;
+};
+
+/**
+ *  @brief XC energy and Fock contribution for EACH orbital separately.
+ *
+ *  This is the Perdew-Zunger self-interaction correction path, corresponding
+ *  to ERKALE's
+ *      DFTGrid::eval_Fxc(int x, int c, const arma::cx_mat& C,
+ *                        std::vector<arma::mat>& H,
+ *                        std::vector<double>& Exc,
+ *                        std::vector<double>& Nel, bool fock)
+ *
+ *  Each orbital is treated as its own spin-polarized system with
+ *  rho_alpha = |psi_i|^2 and rho_beta = 0, which is what PZ-SIC prescribes,
+ *  so the functional must be XC_POLARIZED.
+ *
+ *  The whole point of a dedicated entry point rather than a loop over
+ *  eval_vxc is that the collocation is built ONCE and reused across all
+ *  orbitals. That is the dominant cost, and PZ-SIC needs N_occ Fock builds.
+ *
+ *  No complex arithmetic appears: with real basis functions rho_i is real
+ *  and the resulting potential is real symmetric, so split Re/Im storage and
+ *  real GEMMs suffice. See the note in density.hpp.
+ *
+ *  @param Vxc one accumulated-into matrix per orbital, or empty to compute
+ *             energies only (ERKALE's `fock` flag).
+ */
+template <typename Evaluator>
+  requires BasisEvaluatorWith<Evaluator, BasisDeriv::Gradient>
+OrbitalXCOutput eval_vxc_orbitals(const Evaluator &basis, const FlatGrid &grid,
+                                  const OrbitalsView &orbitals,
+                                  const std::vector<HostMatrixRef> &Vxc,
+                                  const xc_func_type &func,
+                                  const XCThresholds &thr = XCThresholds{}) {
+  const int n = basis.nbf();
+  const int npts = static_cast<int>(grid.quad_points.extent(0));
+  const int norb = orbitals.norb;
+  if (n == 0 || npts == 0 || norb == 0)
+    return OrbitalXCOutput{};
+  if (!orbitals.C_re)
+    throw std::invalid_argument("eval_vxc_orbitals: C_re is null");
+  if (!Vxc.empty() && static_cast<int>(Vxc.size()) != norb)
+    throw std::invalid_argument(
+        "eval_vxc_orbitals: expected one output matrix per orbital, or none");
+
+  const bool gga = detail::require_family(func, XC_POLARIZED,
+                                          "eval_vxc_orbitals");
+
+  // Upload coefficients, normalizing the layout.
+  const int ld = orbitals.ld > 0 ? orbitals.ld : n;
+  auto upload_coeff = [&](const double *src, const char *what) {
+    DeviceView2DLeft d(what, n, norb);
+    auto h = Kokkos::create_mirror_view(d);
+    if (src) {
+      const bool row = orbitals.layout == MatrixLayout::RowMajor;
+      for (int u = 0; u < n; ++u)
+        for (int i = 0; i < norb; ++i)
+          h(u, i) = row ? src[static_cast<size_t>(u) * ld + i]
+                        : src[static_cast<size_t>(u) +
+                              static_cast<size_t>(i) * ld];
+    } else {
+      Kokkos::deep_copy(h, 0.0);
+    }
+    Kokkos::deep_copy(d, h);
+    return d;
+  };
+  const auto Cre = upload_coeff(orbitals.C_re, "C_re");
+  const auto Cim = upload_coeff(orbitals.C_im, "C_im");
+
+  const auto c = detail::build_collocation(basis, grid, gga);
+
+  DeviceView2D rho("rho_i", norb, npts), gx("gx_i", norb, npts),
+      gy("gy_i", norb, npts), gz("gz_i", norb, npts),
+      sigma("sigma_i", norb, npts);
+  if (gga)
+    compute_orbital_densities_and_sigma(c.chi, c.dchi_x, c.dchi_y, c.dchi_z,
+                                        Cre, Cim, rho, gx, gy, gz, sigma);
+  else
+    rho = compute_orbital_densities(c.chi, Cre, Cim);
+  Kokkos::fence();
+
+  auto rho_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, rho);
+  auto sig_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, sigma);
+
+  OrbitalXCOutput out;
+  out.Exc.assign(norb, 0.0);
+  out.Nel.assign(norb, 0.0);
+
+  auto w_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, grid.weights);
+
+  for (int i = 0; i < norb; ++i) {
+    // PZ-SIC: each orbital is its own fully polarized system,
+    // rho_alpha = |psi_i|^2, rho_beta = 0.
+    std::vector<double> ri(npts);
+    for (int g = 0; g < npts; ++g)
+      ri[g] = rho_h(i, g);
+
+    double nel = 0.0;
+    for (int g = 0; g < npts; ++g)
+      nel += w_h(g) * ri[g];
+    out.Nel[i] = nel;
+
+    const auto idx = detail::significant_points(ri, thr.density);
+    const int nin = static_cast<int>(idx.size());
+
+    std::vector<double> exc(npts, 0.0), vra(npts, 0.0), vsaa(npts, 0.0);
+    if (nin) {
+      std::vector<double> rin(2 * nin, 0.0), sin_(gga ? 3 * nin : 0, 0.0);
+      for (int k = 0; k < nin; ++k) {
+        rin[2 * k] = ri[idx[k]]; // beta channel stays zero
+        if (gga)
+          sin_[3 * k] = sig_h(i, idx[k]); // sigma_ab and sigma_bb vanish
+      }
+      std::vector<double> e(nin), vr(2 * nin), vs(gga ? 3 * nin : 0);
+      if (gga)
+        xc_gga_exc_vxc(&func, nin, rin.data(), sin_.data(), e.data(),
+                       vr.data(), vs.data());
+      else
+        xc_lda_exc_vxc(&func, nin, rin.data(), e.data(), vr.data());
+
+      for (int k = 0; k < nin; ++k) {
+        const bool ok = std::isfinite(e[k]) && std::isfinite(vr[2 * k]) &&
+                        (!gga || std::isfinite(vs[3 * k]));
+        if (!ok) {
+          ++out.nan_points;
+          continue;
+        }
+        exc[idx[k]] = e[k];
+        vra[idx[k]] = vr[2 * k];
+        if (gga)
+          vsaa[idx[k]] = vs[3 * k];
+      }
+    }
+
+    for (int g = 0; g < npts; ++g)
+      out.Exc[i] += w_h(g) * ri[g] * exc[g];
+
+    if (Vxc.empty())
+      continue;
+
+    const auto vra_d = detail::to_device(vra, "vrho_i");
+    const auto vsaa_d = detail::to_device(vsaa, "vsigma_i");
+
+    DeviceView2DLeft Z("Z", n, npts);
+    auto wv = grid.weights;
+    auto chi = c.chi, dx = c.dchi_x, dy = c.dchi_y, dz = c.dchi_z;
+    const bool is_gga = gga;
+    const int iorb = i;
+    Kokkos::parallel_for(
+        "Z matrix (orbital)",
+        Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {n, npts}),
+        KOKKOS_LAMBDA(const int u, const int g) {
+          double z = 0.5 * chi(u, g) * vra_d(g);
+          if (is_gga)
+            z += 2.0 * vsaa_d(g) *
+                 (gx(iorb, g) * dx(u, g) + gy(iorb, g) * dy(u, g) +
+                  gz(iorb, g) * dz(u, g));
+          Z(u, g) = wv(g) * z;
+        });
+
+    detail::accumulate_matrix(detail::symmetrized_gemm(c.chi, Z, n), Vxc[i], n,
+                              "Vxc[i]");
+  }
+
+  return out;
+}
+
 } // namespace Nukexc

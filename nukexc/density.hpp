@@ -161,6 +161,42 @@ DeviceView1D compute_density_sparse(const Evaluator basis,
 };
 
 // ============================================================================
+//  Which contraction to use
+// ============================================================================
+//
+// Both routes are kept, because neither dominates:
+//
+//   Orbital        O(N_occ * nbf * npts)
+//   DensityMatrix  O(nbf^2 * npts)
+//
+// The orbital route wins whenever N_occ is small against the basis size,
+// which for a decent basis is the common case. The density-matrix route is
+// the one that admits fractional and ensemble occupations, supplies the |P|
+// magnitudes that shell-pair screening needs, and -- per Blum et al.
+// (Eqs. 27-28) -- wins asymptotically once batching is in place, because the
+// right comparison there is N_occ against the BATCH's non-zero basis count
+// n_be rather than the total nbf. n_be is bounded while N_occ grows with
+// system size.
+//
+// Auto therefore compares against nbf today and should compare against n_be
+// once the kernels are batch-local; the crossover it picks is deliberately
+// conservative rather than tuned, since the real decision belongs per batch.
+enum class DensityPath {
+  Orbital,       ///< contract through the occupied coefficients
+  DensityMatrix, ///< contract through P
+  Auto           ///< pick from the occupied fraction
+};
+
+/// Resolve Auto. Exposed so a caller can see what would be chosen.
+inline DensityPath resolve_density_path(DensityPath p, int n_occ, int nbf) {
+  if (p != DensityPath::Auto)
+    return p;
+  // The orbital route moves N_occ columns, the matrix route nbf. Prefer the
+  // orbital route with a margin, since it also avoids forming P.
+  return (2 * n_occ < nbf) ? DensityPath::Orbital : DensityPath::DensityMatrix;
+}
+
+// ============================================================================
 //  Density-matrix formulation
 // ============================================================================
 //
@@ -506,4 +542,96 @@ void compute_density_and_sigma_and_tau(
         tau(g) = 0.5 * sum_tau;
       });
 };
-}; // namespace Nukexc
+// ============================================================================
+//  Complex orbitals, in split real/imaginary storage
+// ============================================================================
+//
+// Needed by Perdew-Zunger self-interaction correction, which wants the
+// density of each orbital separately.
+//
+// For REAL basis functions no complex arithmetic is required, even though the
+// orbitals are complex. The per-orbital density matrix P^i_uv = conj(c_ui)
+// c_vi is Hermitian, but rho_i is real, so only its real part contributes:
+//
+//   rho_i = sum_uv Re(conj(c_ui) c_vi) chi_u chi_v
+//         = (Re psi_i)^2 + (Im psi_i)^2
+//
+// with Re psi_i = sum_u Re(c_ui) chi_u and likewise for the imaginary part.
+// Two real GEMMs, and the resulting potential matrix is real symmetric. This
+// is the split Re/Im layout libxckernel recommends, and it is why the PZ-SIC
+// path does not require templating the library on a complex scalar --
+// complex BASIS functions (GIAO, Bloch) and the paramagnetic current of the
+// gauge-corrected meta-GGAs do, and those are separate work.
+
+/// Per-orbital densities |psi_i|^2 for complex orbitals in split storage.
+///
+/// @param C_re, C_im  (nbf, norb) LayoutLeft coefficient blocks
+/// @returns (norb, npts) densities, one row per orbital
+inline DeviceView2D compute_orbital_densities(
+    const DeviceView2DLeft collocation_values, const DeviceView2DLeft C_re,
+    const DeviceView2DLeft C_im) {
+  ExecSpace space;
+  const int npts = collocation_values.extent(1);
+  const int norb = C_re.extent(1);
+
+  DeviceView2D psi_re("psi_re", norb, npts), psi_im("psi_im", norb, npts);
+  KokkosBlas::gemm(space, "T", "N", 1.0, C_re, collocation_values, 0.0, psi_re);
+  KokkosBlas::gemm(space, "T", "N", 1.0, C_im, collocation_values, 0.0, psi_im);
+
+  DeviceView2D rho("orbital densities", norb, npts);
+  Kokkos::parallel_for(
+      "orbital densities",
+      Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>(space, {0, 0},
+                                                        {norb, npts}),
+      KOKKOS_LAMBDA(const int i, const int g) {
+        rho(i, g) = psi_re(i, g) * psi_re(i, g) + psi_im(i, g) * psi_im(i, g);
+      });
+  return rho;
+}
+
+/// Per-orbital densities and their gradients.
+///
+/// grad rho_i = 2 [ Re psi_i grad(Re psi_i) + Im psi_i grad(Im psi_i) ]
+inline void compute_orbital_densities_and_sigma(
+    const DeviceView2DLeft collocation_values,
+    const DeviceView2DLeft collocation_gx, const DeviceView2DLeft collocation_gy,
+    const DeviceView2DLeft collocation_gz, const DeviceView2DLeft C_re,
+    const DeviceView2DLeft C_im, DeviceView2D rho, DeviceView2D gx_rho,
+    DeviceView2D gy_rho, DeviceView2D gz_rho, DeviceView2D sigma) {
+  ExecSpace space;
+  const int npts = collocation_values.extent(1);
+  const int norb = C_re.extent(1);
+
+  DeviceView2D pr("psi_re", norb, npts), pi_("psi_im", norb, npts);
+  DeviceView2D prx("prx", norb, npts), pry("pry", norb, npts),
+      prz("prz", norb, npts);
+  DeviceView2D pix("pix", norb, npts), piy("piy", norb, npts),
+      piz("piz", norb, npts);
+
+  KokkosBlas::gemm(space, "T", "N", 1.0, C_re, collocation_values, 0.0, pr);
+  KokkosBlas::gemm(space, "T", "N", 1.0, C_im, collocation_values, 0.0, pi_);
+  KokkosBlas::gemm(space, "T", "N", 1.0, C_re, collocation_gx, 0.0, prx);
+  KokkosBlas::gemm(space, "T", "N", 1.0, C_re, collocation_gy, 0.0, pry);
+  KokkosBlas::gemm(space, "T", "N", 1.0, C_re, collocation_gz, 0.0, prz);
+  KokkosBlas::gemm(space, "T", "N", 1.0, C_im, collocation_gx, 0.0, pix);
+  KokkosBlas::gemm(space, "T", "N", 1.0, C_im, collocation_gy, 0.0, piy);
+  KokkosBlas::gemm(space, "T", "N", 1.0, C_im, collocation_gz, 0.0, piz);
+
+  Kokkos::parallel_for(
+      "orbital densities and gradients",
+      Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>(space, {0, 0},
+                                                        {norb, npts}),
+      KOKKOS_LAMBDA(const int i, const int g) {
+        const double a = pr(i, g), b = pi_(i, g);
+        rho(i, g) = a * a + b * b;
+        const double dx = 2.0 * (a * prx(i, g) + b * pix(i, g));
+        const double dy = 2.0 * (a * pry(i, g) + b * piy(i, g));
+        const double dz = 2.0 * (a * prz(i, g) + b * piz(i, g));
+        gx_rho(i, g) = dx;
+        gy_rho(i, g) = dy;
+        gz_rho(i, g) = dz;
+        sigma(i, g) = dx * dx + dy * dy + dz * dz;
+      });
+}
+
+} // namespace Nukexc
