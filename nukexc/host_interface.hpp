@@ -183,6 +183,137 @@ inline double integrate(const DeviceView1D &f, const DeviceView1D &w) {
   return acc;
 }
 
+
+// ---------------------------------------------------------------------------
+//  Shared machinery for the restricted, unrestricted and diagonal paths
+// ---------------------------------------------------------------------------
+
+/// Collocation for an XC build: values always, gradients when the functional
+/// needs them.
+struct XCCollocation {
+  DeviceView2DLeft chi;
+  DeviceView2DLeft dchi_x, dchi_y, dchi_z;
+  bool gga = false;
+};
+
+template <typename Evaluator>
+XCCollocation build_collocation(const Evaluator &basis, const FlatGrid &grid,
+                                bool gga) {
+  const int n = basis.nbf();
+  const int npts = static_cast<int>(grid.quad_points.extent(0));
+
+  XCCollocation c;
+  c.gga = gga;
+  c.chi = DeviceView2DLeft("chi", n, npts);
+  if (!gga) {
+    fill_collocation_values(ExecSpace{}, basis, grid.quad_points, c.chi);
+    Kokkos::fence();
+    return c;
+  }
+
+  c.dchi_x = DeviceView2DLeft("dchi_x", n, npts);
+  c.dchi_y = DeviceView2DLeft("dchi_y", n, npts);
+  c.dchi_z = DeviceView2DLeft("dchi_z", n, npts);
+
+  Kokkos::View<double ***> comp("comp", basis_ncomp(BasisDeriv::Gradient), n,
+                                npts);
+  fill_collocation<BasisDeriv::Gradient>(ExecSpace{}, basis, grid.quad_points,
+                                         comp);
+  auto chi = c.chi, gx = c.dchi_x, gy = c.dchi_y, gz = c.dchi_z;
+  Kokkos::parallel_for(
+      "split gradient collocation",
+      Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {n, npts}),
+      KOKKOS_LAMBDA(const int i, const int g) {
+        chi(i, g) = comp(BF_VAL, i, g);
+        gx(i, g) = comp(BF_DX, i, g);
+        gy(i, g) = comp(BF_DY, i, g);
+        gz(i, g) = comp(BF_DZ, i, g);
+      });
+  Kokkos::fence();
+  return c;
+}
+
+/// Which spin case a functional was initialized for, checked once.
+inline bool require_family(const xc_func_type &func, int nspin,
+                           const char *who) {
+  const bool gga = func.info->family == XC_FAMILY_GGA ||
+                   func.info->family == XC_FAMILY_HYB_GGA;
+  if (func.info->family != XC_FAMILY_LDA && !gga)
+    throw std::runtime_error(
+        std::string(who) +
+        ": only LDA and GGA families are wired up on the density-matrix path "
+        "so far");
+  if (func.nspin != nspin)
+    throw std::runtime_error(
+        std::string(who) + ": functional was initialized for " +
+        (func.nspin == XC_POLARIZED ? "XC_POLARIZED" : "XC_UNPOLARIZED") +
+        " but this entry point needs the other one");
+  return gga;
+}
+
+/// Index of the points worth handing to libxc, i.e. those above the density
+/// threshold. Skipping the rest is both faster and avoids asking for exc at
+/// rho ~ 0.
+inline std::vector<int> significant_points(const std::vector<double> &rho_tot,
+                                           double thr) {
+  std::vector<int> idx;
+  idx.reserve(rho_tot.size());
+  for (size_t g = 0; g < rho_tot.size(); ++g)
+    if (rho_tot[g] > thr)
+      idx.push_back(static_cast<int>(g));
+  return idx;
+}
+
+/// Copy a host vector to the device.
+inline DeviceView1D to_device(const std::vector<double> &v, const char *name) {
+  DeviceView1D d(name, v.size());
+  Kokkos::deep_copy(
+      d, Kokkos::View<const double *, HostSpace,
+                      Kokkos::MemoryTraits<Kokkos::Unmanaged>>(v.data(),
+                                                               v.size()));
+  return d;
+}
+
+/// Copy a device vector to the host.
+inline std::vector<double> to_host(const DeviceView1D &d) {
+  auto h = Kokkos::create_mirror_view_and_copy(HostSpace{}, d);
+  return std::vector<double>(h.data(), h.data() + h.extent(0));
+}
+
+/// V = Phi Z^T + (Phi Z^T)^T, the symmetrized Fock contribution.
+inline DeviceView2DLeft symmetrized_gemm(const DeviceView2DLeft &chi,
+                                         const DeviceView2DLeft &Z, int n) {
+  DeviceView2DLeft V("V", n, n), Vsym("Vsym", n, n);
+  KokkosBlas::gemm(ExecSpace{}, "N", "T", 1.0, chi, Z, 0.0, V);
+  Kokkos::parallel_for(
+      "symmetrize",
+      Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {n, n}),
+      KOKKOS_LAMBDA(const int i, const int j) {
+        Vsym(i, j) = V(i, j) + V(j, i);
+      });
+  Kokkos::fence();
+  return Vsym;
+}
+
+/// diag(Phi Z^T + transpose)_i = 2 sum_g chi_i(g) Z_i(g), without forming
+/// the full matrix -- the point of the diagonal-only entry point.
+inline std::vector<double> symmetrized_diagonal(const DeviceView2DLeft &chi,
+                                                const DeviceView2DLeft &Z,
+                                                int n) {
+  DeviceView1D d("diag", n);
+  const int npts = static_cast<int>(chi.extent(1));
+  Kokkos::parallel_for(
+      "diagonal", Kokkos::RangePolicy<ExecSpace>(0, n),
+      KOKKOS_LAMBDA(const int i) {
+        double acc = 0.0;
+        for (int g = 0; g < npts; ++g)
+          acc += chi(i, g) * Z(i, g);
+        d(i) = 2.0 * acc;
+      });
+  Kokkos::fence();
+  return to_host(d);
+}
+
 } // namespace detail
 
 /**
@@ -373,6 +504,289 @@ XCOutput eval_vxc(const Evaluator &basis, const FlatGrid &grid,
   Kokkos::fence();
 
   detail::accumulate_matrix(Vsym, Vxc, n, "Vxc");
+  return out;
+}
+
+/// Unrestricted result: one Fock contribution per spin channel.
+struct XCOutputPolarized {
+  double Exc = 0.0;
+  double Nel = 0.0;      ///< total, both channels
+  double Nel_alpha = 0.0;
+  double Nel_beta = 0.0;
+  long nan_points = 0;
+};
+
+/**
+ *  @brief Unrestricted XC energy and Fock contributions from spin densities.
+ *
+ *  ERKALE's
+ *      DFTGrid::eval_Fxc(int x, int c, const arma::mat& Pa, const arma::mat& Pb,
+ *                        arma::mat& Ha, arma::mat& Hb, double& Exc, double& Nel)
+ *
+ *  Both Vxc_a and Vxc_b are accumulated into, matching that convention.
+ *
+ *  libxc's polarized layout is interleaved per point: rho as (a, b), sigma as
+ *  (aa, ab, bb), and likewise vrho and vsigma. The interleaving is done here
+ *  rather than pushed onto the caller.
+ */
+template <typename Evaluator>
+  requires BasisEvaluatorWith<Evaluator, BasisDeriv::Gradient>
+XCOutputPolarized eval_vxc(const Evaluator &basis, const FlatGrid &grid,
+                           const HostMatrixView &Pa, const HostMatrixView &Pb,
+                           const HostMatrixRef &Vxc_a,
+                           const HostMatrixRef &Vxc_b,
+                           const xc_func_type &func,
+                           const XCThresholds &thr = XCThresholds{}) {
+  const int n = basis.nbf();
+  const int npts = static_cast<int>(grid.quad_points.extent(0));
+  if (n == 0 || npts == 0)
+    return XCOutputPolarized{};
+
+  const bool gga = detail::require_family(func, XC_POLARIZED, "eval_vxc(Pa,Pb)");
+
+  const auto Pad = detail::upload_matrix(Pa, n, "Pa");
+  const auto Pbd = detail::upload_matrix(Pb, n, "Pb");
+  const auto c = detail::build_collocation(basis, grid, gga);
+
+  DeviceView1D ra("rho_a", npts), rb("rho_b", npts);
+  DeviceView1D gax("gax", npts), gay("gay", npts), gaz("gaz", npts);
+  DeviceView1D gbx("gbx", npts), gby("gby", npts), gbz("gbz", npts);
+  DeviceView1D saa("saa", npts), sbb("sbb", npts), sab("sab", npts);
+
+  if (gga) {
+    compute_density_and_sigma_dm(c.chi, c.dchi_x, c.dchi_y, c.dchi_z, Pad, ra,
+                                 gax, gay, gaz, saa);
+    compute_density_and_sigma_dm(c.chi, c.dchi_x, c.dchi_y, c.dchi_z, Pbd, rb,
+                                 gbx, gby, gbz, sbb);
+    Kokkos::parallel_for(
+        "sigma_ab", Kokkos::RangePolicy<ExecSpace>(0, npts),
+        KOKKOS_LAMBDA(const int g) {
+          sab(g) = gax(g) * gbx(g) + gay(g) * gby(g) + gaz(g) * gbz(g);
+        });
+  } else {
+    ra = compute_density_dm(c.chi, Pad);
+    rb = compute_density_dm(c.chi, Pbd);
+  }
+  Kokkos::fence();
+
+  XCOutputPolarized out;
+  out.Nel_alpha = detail::integrate(ra, grid.weights);
+  out.Nel_beta = detail::integrate(rb, grid.weights);
+  out.Nel = out.Nel_alpha + out.Nel_beta;
+
+  const auto ra_h = detail::to_host(ra), rb_h = detail::to_host(rb);
+  const auto saa_h = detail::to_host(saa), sab_h = detail::to_host(sab),
+             sbb_h = detail::to_host(sbb);
+
+  std::vector<double> rho_tot(npts);
+  for (int g = 0; g < npts; ++g)
+    rho_tot[g] = ra_h[g] + rb_h[g];
+  const auto idx = detail::significant_points(rho_tot, thr.density);
+  const int nin = static_cast<int>(idx.size());
+
+  std::vector<double> exc(npts, 0.0);
+  std::vector<double> vra(npts, 0.0), vrb(npts, 0.0);
+  std::vector<double> vsaa(npts, 0.0), vsab(npts, 0.0), vsbb(npts, 0.0);
+
+  if (nin) {
+    std::vector<double> rin(2 * nin), sin_(gga ? 3 * nin : 0);
+    for (int k = 0; k < nin; ++k) {
+      rin[2 * k] = ra_h[idx[k]];
+      rin[2 * k + 1] = rb_h[idx[k]];
+      if (gga) {
+        sin_[3 * k] = saa_h[idx[k]];
+        sin_[3 * k + 1] = sab_h[idx[k]];
+        sin_[3 * k + 2] = sbb_h[idx[k]];
+      }
+    }
+    std::vector<double> e(nin), vr(2 * nin), vs(gga ? 3 * nin : 0);
+    if (gga)
+      xc_gga_exc_vxc(&func, nin, rin.data(), sin_.data(), e.data(), vr.data(),
+                     vs.data());
+    else
+      xc_lda_exc_vxc(&func, nin, rin.data(), e.data(), vr.data());
+
+    for (int k = 0; k < nin; ++k) {
+      bool ok = std::isfinite(e[k]) && std::isfinite(vr[2 * k]) &&
+                std::isfinite(vr[2 * k + 1]);
+      if (gga)
+        ok = ok && std::isfinite(vs[3 * k]) && std::isfinite(vs[3 * k + 1]) &&
+             std::isfinite(vs[3 * k + 2]);
+      if (!ok) {
+        ++out.nan_points;
+        continue;
+      }
+      const int g = idx[k];
+      exc[g] = e[k];
+      vra[g] = vr[2 * k];
+      vrb[g] = vr[2 * k + 1];
+      if (gga) {
+        vsaa[g] = vs[3 * k];
+        vsab[g] = vs[3 * k + 1];
+        vsbb[g] = vs[3 * k + 2];
+      }
+    }
+  }
+
+  const auto exc_d = detail::to_device(exc, "exc");
+  {
+    DeviceView1D integrand("rho exc", npts);
+    Kokkos::parallel_for(
+        "rho exc", Kokkos::RangePolicy<ExecSpace>(0, npts),
+        KOKKOS_LAMBDA(const int g) {
+          integrand(g) = (ra(g) + rb(g)) * exc_d(g);
+        });
+    out.Exc = detail::integrate(integrand, grid.weights);
+  }
+
+  // Z_a,i = w [ 1/2 vrho_a chi_i
+  //             + (2 vsigma_aa grad rho_a + vsigma_ab grad rho_b) . grad chi_i ]
+  // and the mirror for beta.
+  auto build = [&](const DeviceView1D &vr_s, const DeviceView1D &vs_ss,
+                   const DeviceView1D &vs_os, const DeviceView1D &gsx,
+                   const DeviceView1D &gsy, const DeviceView1D &gsz,
+                   const DeviceView1D &gox, const DeviceView1D &goy,
+                   const DeviceView1D &goz) {
+    DeviceView2DLeft Z("Z", n, npts);
+    auto w = grid.weights;
+    auto chi = c.chi, dx = c.dchi_x, dy = c.dchi_y, dz = c.dchi_z;
+    const bool is_gga = gga;
+    Kokkos::parallel_for(
+        "Z matrix",
+        Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {n, npts}),
+        KOKKOS_LAMBDA(const int u, const int g) {
+          double z = 0.5 * chi(u, g) * vr_s(g);
+          if (is_gga) {
+            const double vx = 2.0 * vs_ss(g) * gsx(g) + vs_os(g) * gox(g);
+            const double vy = 2.0 * vs_ss(g) * gsy(g) + vs_os(g) * goy(g);
+            const double vz = 2.0 * vs_ss(g) * gsz(g) + vs_os(g) * goz(g);
+            z += vx * dx(u, g) + vy * dy(u, g) + vz * dz(u, g);
+          }
+          Z(u, g) = w(g) * z;
+        });
+    return Z;
+  };
+
+  const auto vra_d = detail::to_device(vra, "vrho_a");
+  const auto vrb_d = detail::to_device(vrb, "vrho_b");
+  const auto vsaa_d = detail::to_device(vsaa, "vsigma_aa");
+  const auto vsab_d = detail::to_device(vsab, "vsigma_ab");
+  const auto vsbb_d = detail::to_device(vsbb, "vsigma_bb");
+
+  const auto Za = build(vra_d, vsaa_d, vsab_d, gax, gay, gaz, gbx, gby, gbz);
+  const auto Zb = build(vrb_d, vsbb_d, vsab_d, gbx, gby, gbz, gax, gay, gaz);
+
+  detail::accumulate_matrix(detail::symmetrized_gemm(c.chi, Za, n), Vxc_a, n,
+                            "Vxc_a");
+  detail::accumulate_matrix(detail::symmetrized_gemm(c.chi, Zb, n), Vxc_b, n,
+                            "Vxc_b");
+  return out;
+}
+
+/**
+ *  @brief Diagonal of the restricted XC Fock contribution.
+ *
+ *  ERKALE's DFTGrid::eval_diag_Fxc, which the adaptive grid uses: the
+ *  convergence criterion looks at max_u |Delta F_uu|, so forming the full
+ *  matrix would be wasted work. This skips the GEMM entirely and contracts
+ *  only the diagonal, which is O(nbf * npts) rather than O(nbf^2 * npts).
+ *
+ *  @param diag accumulated into, length nbf.
+ */
+template <typename Evaluator>
+  requires BasisEvaluatorWith<Evaluator, BasisDeriv::Gradient>
+XCOutput eval_diag_vxc(const Evaluator &basis, const FlatGrid &grid,
+                       const HostMatrixView &P, double *diag,
+                       const xc_func_type &func,
+                       const XCThresholds &thr = XCThresholds{}) {
+  const int n = basis.nbf();
+  const int npts = static_cast<int>(grid.quad_points.extent(0));
+  if (!diag)
+    throw std::invalid_argument("eval_diag_vxc: diagonal pointer is null");
+  if (n == 0 || npts == 0)
+    return XCOutput{};
+
+  const bool gga = detail::require_family(func, XC_UNPOLARIZED,
+                                          "eval_diag_vxc");
+  const auto Pd = detail::upload_matrix(P, n, "P");
+  const auto c = detail::build_collocation(basis, grid, gga);
+
+  DeviceView1D rho("rho", npts), gx("gx", npts), gy("gy", npts),
+      gz("gz", npts), sigma("sigma", npts);
+  if (gga)
+    compute_density_and_sigma_dm(c.chi, c.dchi_x, c.dchi_y, c.dchi_z, Pd, rho,
+                                 gx, gy, gz, sigma);
+  else
+    rho = compute_density_dm(c.chi, Pd);
+  Kokkos::fence();
+
+  XCOutput out;
+  out.Nel = detail::integrate(rho, grid.weights);
+
+  const auto rho_h = detail::to_host(rho), sig_h = detail::to_host(sigma);
+  const auto idx = detail::significant_points(rho_h, thr.density);
+  const int nin = static_cast<int>(idx.size());
+
+  std::vector<double> exc(npts, 0.0), vrho(npts, 0.0), vsigma(npts, 0.0);
+  if (nin) {
+    std::vector<double> rin(nin), sin_(gga ? nin : 0);
+    for (int k = 0; k < nin; ++k) {
+      rin[k] = rho_h[idx[k]];
+      if (gga)
+        sin_[k] = sig_h[idx[k]];
+    }
+    std::vector<double> e(nin), vr(nin), vs(gga ? nin : 0);
+    if (gga)
+      xc_gga_exc_vxc(&func, nin, rin.data(), sin_.data(), e.data(), vr.data(),
+                     vs.data());
+    else
+      xc_lda_exc_vxc(&func, nin, rin.data(), e.data(), vr.data());
+    for (int k = 0; k < nin; ++k) {
+      const bool ok = std::isfinite(e[k]) && std::isfinite(vr[k]) &&
+                      (!gga || std::isfinite(vs[k]));
+      if (!ok) {
+        ++out.nan_points;
+        continue;
+      }
+      exc[idx[k]] = e[k];
+      vrho[idx[k]] = vr[k];
+      if (gga)
+        vsigma[idx[k]] = vs[k];
+    }
+  }
+
+  const auto exc_d = detail::to_device(exc, "exc");
+  {
+    DeviceView1D integrand("rho exc", npts);
+    Kokkos::parallel_for(
+        "rho exc", Kokkos::RangePolicy<ExecSpace>(0, npts),
+        KOKKOS_LAMBDA(const int g) { integrand(g) = rho(g) * exc_d(g); });
+    out.Exc = detail::integrate(integrand, grid.weights);
+  }
+
+  const auto vrho_d = detail::to_device(vrho, "vrho");
+  const auto vsig_d = detail::to_device(vsigma, "vsigma");
+
+  DeviceView2DLeft Z("Z", n, npts);
+  {
+    auto w = grid.weights;
+    auto chi = c.chi, dx = c.dchi_x, dy = c.dchi_y, dz = c.dchi_z;
+    const bool is_gga = gga;
+    Kokkos::parallel_for(
+        "Z matrix",
+        Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {n, npts}),
+        KOKKOS_LAMBDA(const int u, const int g) {
+          double z = 0.5 * chi(u, g) * vrho_d(g);
+          if (is_gga)
+            z += 2.0 * vsig_d(g) *
+                 (gx(g) * dx(u, g) + gy(g) * dy(u, g) + gz(g) * dz(u, g));
+          Z(u, g) = w(g) * z;
+        });
+  }
+
+  const auto d = detail::symmetrized_diagonal(c.chi, Z, n);
+  for (int i = 0; i < n; ++i)
+    diag[i] += d[static_cast<size_t>(i)];
   return out;
 }
 
