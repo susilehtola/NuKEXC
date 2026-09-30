@@ -439,6 +439,141 @@ TEST_CASE("Unrestricted rejects a mismatched functional", "[host][xc]") {
   xc_func_end(&unpol);
 }
 
+TEST_CASE("A complex orbital with zero imaginary part matches the real one",
+          "[host][pzsic][complex]") {
+  // The split Re/Im path must reduce to the real one when Im C = 0, and a
+  // global phase must leave everything invariant: rho_i = |psi_i|^2 cannot
+  // depend on it. The phase check is the one that would catch a Re/Im mixup,
+  // since it moves weight between the two blocks while fixing the answer.
+  Fixture f;
+  const STOPrimitiveEvaluator ev(f.basis);
+  const int nbf = ev.nbf();
+  const auto S = quadrature_overlap(ev, f.grid);
+  const auto orb = make_orbitals(S, nbf, 3, 1.0);
+
+  xc_func_type func;
+  REQUIRE(xc_func_init(&func, XC_LDA_X, XC_POLARIZED) == 0);
+
+  auto run = [&](const double *re, const double *im) {
+    OrbitalsView ov;
+    ov.C_re = re;
+    ov.C_im = im;
+    ov.ld = nbf;
+    ov.layout = MatrixLayout::ColumnMajor;
+    ov.norb = 3;
+    std::vector<std::vector<double>> V(
+        3, std::vector<double>(static_cast<size_t>(nbf) * nbf, 0.0));
+    std::vector<HostMatrixRef> refs;
+    for (auto &v : V)
+      refs.push_back(HostMatrixRef{v.data(), nbf, MatrixLayout::ColumnMajor});
+    auto out = eval_vxc_orbitals(ev, f.grid, ov, refs, func);
+    return std::make_pair(out, V);
+  };
+
+  // (a) purely real
+  const auto [real_out, real_V] = run(orb.C.data(), nullptr);
+  for (int i2 = 0; i2 < 3; ++i2) {
+    INFO("orbital " << i2);
+    REQUIRE_THAT(real_out.Nel[i2], Catch::Matchers::WithinAbs(1.0, 1e-8));
+    REQUIRE(real_out.Exc[i2] < 0.0);
+  }
+  REQUIRE(real_out.nan_points == 0);
+
+  // (b) same orbitals rotated by a global phase exp(i theta): C -> C cos,
+  //     C sin. |psi|^2 is unchanged, so every result must be.
+  const double th = 0.7;
+  std::vector<double> Cr(orb.C), Ci(orb.C);
+  for (auto &v : Cr)
+    v *= std::cos(th);
+  for (auto &v : Ci)
+    v *= std::sin(th);
+  const auto [phase_out, phase_V] = run(Cr.data(), Ci.data());
+
+  for (int i2 = 0; i2 < 3; ++i2) {
+    INFO("orbital " << i2);
+    REQUIRE_THAT(phase_out.Nel[i2],
+                 Catch::Matchers::WithinRel(real_out.Nel[i2], 1e-12));
+    REQUIRE_THAT(phase_out.Exc[i2],
+                 Catch::Matchers::WithinRel(real_out.Exc[i2], 1e-12));
+    double worst = 0.0, scale = 0.0;
+    for (size_t k = 0; k < real_V[i2].size(); ++k) {
+      worst = std::max(worst, std::abs(phase_V[i2][k] - real_V[i2][k]));
+      scale = std::max(scale, std::abs(real_V[i2][k]));
+    }
+    REQUIRE(worst < 1e-11 * std::max(1.0, scale));
+  }
+
+  xc_func_end(&func);
+}
+
+TEST_CASE("Per-orbital results match single-orbital evaluations",
+          "[host][pzsic]") {
+  // Evaluating three orbitals together must give exactly what evaluating
+  // each alone gives -- the shared collocation is an optimization, not a
+  // change of answer.
+  Fixture f;
+  const STOPrimitiveEvaluator ev(f.basis);
+  const int nbf = ev.nbf();
+  const auto S = quadrature_overlap(ev, f.grid);
+  const auto orb = make_orbitals(S, nbf, 3, 1.0);
+
+  xc_func_type func;
+  REQUIRE(xc_func_init(&func, XC_LDA_X, XC_POLARIZED) == 0);
+
+  OrbitalsView all;
+  all.C_re = orb.C.data();
+  all.ld = nbf;
+  all.norb = 3;
+  std::vector<std::vector<double>> V(
+      3, std::vector<double>(static_cast<size_t>(nbf) * nbf, 0.0));
+  std::vector<HostMatrixRef> refs;
+  for (auto &v : V)
+    refs.push_back(HostMatrixRef{v.data(), nbf, MatrixLayout::ColumnMajor});
+  const auto together = eval_vxc_orbitals(ev, f.grid, all, refs, func);
+
+  for (int k = 0; k < 3; ++k) {
+    OrbitalsView one;
+    one.C_re = orb.C.data() + static_cast<size_t>(k) * nbf;
+    one.ld = nbf;
+    one.norb = 1;
+    std::vector<double> Vk(static_cast<size_t>(nbf) * nbf, 0.0);
+    std::vector<HostMatrixRef> r1{
+        HostMatrixRef{Vk.data(), nbf, MatrixLayout::ColumnMajor}};
+    const auto alone = eval_vxc_orbitals(ev, f.grid, one, r1, func);
+
+    INFO("orbital " << k);
+    REQUIRE_THAT(alone.Exc[0],
+                 Catch::Matchers::WithinRel(together.Exc[k], 1e-13));
+    REQUIRE_THAT(alone.Nel[0],
+                 Catch::Matchers::WithinRel(together.Nel[k], 1e-13));
+    for (size_t m = 0; m < Vk.size(); ++m)
+      REQUIRE_THAT(Vk[m], Catch::Matchers::WithinRel(V[k][m], 1e-12) ||
+                              Catch::Matchers::WithinAbs(0.0, 1e-14));
+  }
+
+  // Energies-only mode must agree and skip the Fock builds.
+  const auto energies = eval_vxc_orbitals(ev, f.grid, all, {}, func);
+  for (int k = 0; k < 3; ++k)
+    REQUIRE_THAT(energies.Exc[k],
+                 Catch::Matchers::WithinRel(together.Exc[k], 1e-13));
+
+  xc_func_end(&func);
+}
+
+TEST_CASE("The density path selector picks sensibly", "[host][density]") {
+  // Auto should take the orbital route only when the occupied count is a
+  // clear minority of the basis.
+  REQUIRE(resolve_density_path(DensityPath::Auto, 5, 100) ==
+          DensityPath::Orbital);
+  REQUIRE(resolve_density_path(DensityPath::Auto, 60, 100) ==
+          DensityPath::DensityMatrix);
+  // Explicit choices are honoured.
+  REQUIRE(resolve_density_path(DensityPath::Orbital, 60, 100) ==
+          DensityPath::Orbital);
+  REQUIRE(resolve_density_path(DensityPath::DensityMatrix, 5, 100) ==
+          DensityPath::DensityMatrix);
+}
+
 int main(int argc, char *argv[]) {
   Kokkos::initialize(argc, argv);
   int result = 0;
