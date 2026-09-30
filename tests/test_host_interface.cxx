@@ -574,6 +574,105 @@ TEST_CASE("The density path selector picks sensibly", "[host][density]") {
           DensityPath::DensityMatrix);
 }
 
+TEST_CASE("Host-supplied derivatives reproduce the libxc-internal route",
+          "[host][seam]") {
+  // The two routes must be interchangeable, because the whole point of the
+  // seam is that choosing one is not a commitment: the host can evaluate the
+  // functional today and hand NuKEXC the arrays, and NuKEXC can take the
+  // call back over when libxc is device-resident, without the assembly or
+  // the answers changing.
+  Fixture f;
+  const STOPrimitiveEvaluator ev(f.basis);
+  const int nbf = ev.nbf();
+  const auto S = quadrature_overlap(ev, f.grid);
+  const auto orb = make_orbitals(S, nbf, 5, 2.0);
+  HostMatrixView P{orb.P.data(), nbf, MatrixLayout::ColumnMajor};
+
+  const int ids[2] = {XC_LDA_X, XC_GGA_X_PBE};
+  for (int id : ids) {
+    const bool gga = (id != XC_LDA_X);
+    INFO("functional id " << id << (gga ? " (GGA)" : " (LDA)"));
+
+    xc_func_type func;
+    REQUIRE(xc_func_init(&func, id, XC_UNPOLARIZED) == 0);
+
+    // Route A: NuKEXC calls libxc.
+    std::vector<double> Va(static_cast<size_t>(nbf) * nbf, 0.0);
+    HostMatrixRef Ra{Va.data(), nbf, MatrixLayout::ColumnMajor};
+    const XCOutput a = eval_vxc(ev, f.grid, P, Ra, func);
+
+    // Route B: the host evaluates the functional and passes arrays in.
+    XCSession<STOPrimitiveEvaluator> sess(ev, f.grid, gga);
+    sess.set_density(P);
+    const int npts = sess.npoints();
+    REQUIRE(static_cast<int>(sess.rho().size()) == npts);
+
+    std::vector<double> exc(npts), vrho(npts), vsigma(gga ? npts : 0);
+    if (gga)
+      xc_gga_exc_vxc(&func, npts, sess.rho().data(), sess.sigma().data(),
+                     exc.data(), vrho.data(), vsigma.data());
+    else
+      xc_lda_exc_vxc(&func, npts, sess.rho().data(), exc.data(), vrho.data());
+
+    std::vector<double> Vb(static_cast<size_t>(nbf) * nbf, 0.0);
+    HostMatrixRef Rb{Vb.data(), nbf, MatrixLayout::ColumnMajor};
+    XCDerivativesView dv{exc.data(), vrho.data(),
+                         gga ? vsigma.data() : nullptr};
+    const XCOutput b = sess.accumulate_vxc(dv, Rb);
+
+    // Route A screens points below the density threshold before calling
+    // libxc; route B here does not, so the agreement is to the size of that
+    // screened-out contribution rather than to round-off.
+    INFO("Exc A " << a.Exc << " B " << b.Exc);
+    REQUIRE_THAT(b.Exc, Catch::Matchers::WithinRel(a.Exc, 1e-9));
+    REQUIRE_THAT(b.Nel, Catch::Matchers::WithinRel(a.Nel, 1e-12));
+
+    double worst = 0.0, scale = 0.0;
+    for (size_t k = 0; k < Va.size(); ++k) {
+      worst = std::max(worst, std::abs(Va[k] - Vb[k]));
+      scale = std::max(scale, std::abs(Va[k]));
+    }
+    INFO("worst Vxc difference " << worst << ", scale " << scale);
+    REQUIRE(worst < 1e-9 * std::max(1.0, scale));
+
+    xc_func_end(&func);
+  }
+}
+
+TEST_CASE("A session reuses its collocation across densities", "[host][seam]") {
+  // The reason the session exists: one collocation, many densities. Results
+  // must not depend on how many times it has been reused.
+  Fixture f;
+  const STOPrimitiveEvaluator ev(f.basis);
+  const int nbf = ev.nbf();
+  const auto S = quadrature_overlap(ev, f.grid);
+  const auto o5 = make_orbitals(S, nbf, 5, 2.0);
+  const auto o3 = make_orbitals(S, nbf, 3, 2.0);
+
+  XCSession<STOPrimitiveEvaluator> sess(ev, f.grid, false);
+
+  sess.set_density(HostMatrixView{o5.P.data(), nbf, MatrixLayout::ColumnMajor});
+  REQUIRE_THAT(sess.nel(), Catch::Matchers::WithinAbs(10.0, 1e-8));
+
+  sess.set_density(HostMatrixView{o3.P.data(), nbf, MatrixLayout::ColumnMajor});
+  REQUIRE_THAT(sess.nel(), Catch::Matchers::WithinAbs(6.0, 1e-8));
+
+  // and back again -- no hysteresis
+  sess.set_density(HostMatrixView{o5.P.data(), nbf, MatrixLayout::ColumnMajor});
+  REQUIRE_THAT(sess.nel(), Catch::Matchers::WithinAbs(10.0, 1e-8));
+}
+
+TEST_CASE("A session refuses to assemble before a density is set",
+          "[host][seam]") {
+  Fixture f;
+  const STOPrimitiveEvaluator ev(f.basis);
+  XCSession<STOPrimitiveEvaluator> sess(ev, f.grid, false);
+  std::vector<double> junk(sess.npoints(), 0.0);
+  XCDerivativesView dv{junk.data(), junk.data(), nullptr};
+  HostMatrixRef none{};
+  REQUIRE_THROWS_AS(sess.accumulate_vxc(dv, none), std::logic_error);
+}
+
 int main(int argc, char *argv[]) {
   Kokkos::initialize(argc, argv);
   int result = 0;

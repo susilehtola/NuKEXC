@@ -974,4 +974,232 @@ OrbitalXCOutput eval_vxc_orbitals(const Evaluator &basis, const FlatGrid &grid,
   return out;
 }
 
+// ============================================================================
+//  Functional evaluation as a seam
+// ============================================================================
+//
+// Who evaluates the functional is deliberately not fixed.
+//
+//   * The HOST evaluates it and passes the derivative arrays in. No libxc in
+//     NuKEXC's interface, no exposure to its API changing, and the host keeps
+//     whatever functional handling it already has -- which for a code being
+//     ported is all of it.
+//
+//   * NuKEXC evaluates it. This is what device residency wants: once libxc
+//     exposes a GPU seam the arrays never leave the device, and the host
+//     round trip in the convenience overloads below -- currently the largest
+//     avoidable cost in the SCF loop -- disappears.
+//
+// Both drive the same assembly, so choosing one is not a commitment.
+//
+// The array route is inherently two-sided: the caller cannot produce vrho
+// without rho, and rho needs the collocation. XCSession holds that state so
+// the collocation and density are computed once rather than once per call.
+
+/// Functional derivatives at the grid points, in libxc's layouts -- which is
+/// what any caller already has, whoever computed them.
+///
+///   unpolarized   exc[npts], vrho[npts], vsigma[npts]
+///   polarized     exc[npts], vrho[2*npts] as (a,b),
+///                            vsigma[3*npts] as (aa,ab,bb)
+///
+/// vsigma is null for an LDA. exc is the energy density PER PARTICLE, so the
+/// energy is integral w rho exc.
+struct XCDerivativesView {
+  const double *exc = nullptr;
+  const double *vrho = nullptr;
+  const double *vsigma = nullptr;
+};
+
+/**
+ *  @brief Collocation and density held across a functional evaluation.
+ *
+ *  Usage, restricted:
+ *
+ *      XCSession s(basis, grid, needs_gradients);
+ *      s.set_density(P);
+ *      // caller evaluates the functional at s.rho() / s.sigma()
+ *      auto out = s.accumulate_vxc(derivatives, Vxc);
+ *
+ *  The collocation is built once in the constructor and reused, so a caller
+ *  sweeping several functionals over one density, or one functional over
+ *  several densities, pays for it once.
+ */
+template <typename Evaluator>
+  requires BasisEvaluatorWith<Evaluator, BasisDeriv::Gradient>
+class XCSession {
+public:
+  XCSession(const Evaluator &basis, const FlatGrid &grid, bool need_gradients)
+      : basis_(basis), grid_(grid), gga_(need_gradients),
+        n_(basis.nbf()),
+        npts_(static_cast<int>(grid.quad_points.extent(0))),
+        coll_(detail::build_collocation(basis, grid, need_gradients)) {}
+
+  int nbf() const { return n_; }
+  int npoints() const { return npts_; }
+  bool gradients() const { return gga_; }
+
+  /// Contract a density matrix onto the grid. Must precede accumulate_vxc.
+  void set_density(const HostMatrixView &P) {
+    const auto Pd = detail::upload_matrix(P, n_, "P");
+    rho_d_ = DeviceView1D("rho", npts_);
+    gx_ = DeviceView1D("gx", npts_);
+    gy_ = DeviceView1D("gy", npts_);
+    gz_ = DeviceView1D("gz", npts_);
+    sigma_d_ = DeviceView1D("sigma", npts_);
+    if (gga_)
+      compute_density_and_sigma_dm(coll_.chi, coll_.dchi_x, coll_.dchi_y,
+                                   coll_.dchi_z, Pd, rho_d_, gx_, gy_, gz_,
+                                   sigma_d_);
+    else
+      rho_d_ = compute_density_dm(coll_.chi, Pd);
+    Kokkos::fence();
+    rho_h_ = detail::to_host(rho_d_);
+    sigma_h_ = detail::to_host(sigma_d_);
+    has_density_ = true;
+  }
+
+  /// The ingredients the functional needs, on the host.
+  const std::vector<double> &rho() const { return rho_h_; }
+  const std::vector<double> &sigma() const { return sigma_h_; }
+  /// Grid weights, so the caller can integrate its own quantities.
+  const std::vector<double> &weights() const {
+    if (w_h_.empty())
+      w_h_ = detail::to_host(grid_.weights);
+    return w_h_;
+  }
+
+  /// Integrated electron count for the density currently set.
+  double nel() const {
+    require_density("nel");
+    return detail::integrate(rho_d_, grid_.weights);
+  }
+
+  /**
+   *  @brief Assemble Exc and the Fock contribution from supplied derivatives.
+   *
+   *  @param d    functional derivatives, length npoints()
+   *  @param Vxc  accumulated into; pass a null data pointer for energy only
+   */
+  XCOutput accumulate_vxc(const XCDerivativesView &d,
+                          const HostMatrixRef &Vxc) {
+    require_density("accumulate_vxc");
+    if (!d.exc || !d.vrho)
+      throw std::invalid_argument(
+          "accumulate_vxc: exc and vrho are required");
+    if (gga_ && !d.vsigma)
+      throw std::invalid_argument(
+          "accumulate_vxc: vsigma is required for a GGA session");
+
+    XCOutput out;
+    out.Nel = detail::integrate(rho_d_, grid_.weights);
+
+    const std::vector<double> exc(d.exc, d.exc + npts_);
+    const std::vector<double> vrho(d.vrho, d.vrho + npts_);
+    const std::vector<double> vsigma =
+        gga_ ? std::vector<double>(d.vsigma, d.vsigma + npts_)
+             : std::vector<double>(npts_, 0.0);
+
+    for (int g = 0; g < npts_; ++g)
+      if (!std::isfinite(exc[g]) || !std::isfinite(vrho[g]) ||
+          (gga_ && !std::isfinite(vsigma[g])))
+        ++out.nan_points;
+
+    const auto exc_d = detail::to_device(exc, "exc");
+    {
+      DeviceView1D integrand("rho exc", npts_);
+      auto rho = rho_d_;
+      Kokkos::parallel_for(
+          "rho exc", Kokkos::RangePolicy<ExecSpace>(0, npts_),
+          KOKKOS_LAMBDA(const int g) { integrand(g) = rho(g) * exc_d(g); });
+      out.Exc = detail::integrate(integrand, grid_.weights);
+    }
+
+    if (!Vxc.data)
+      return out;
+
+    const auto vrho_d = detail::to_device(vrho, "vrho");
+    const auto vsig_d = detail::to_device(vsigma, "vsigma");
+
+    DeviceView2DLeft Z("Z", n_, npts_);
+    {
+      auto w = grid_.weights;
+      auto chi = coll_.chi, dx = coll_.dchi_x, dy = coll_.dchi_y,
+           dz = coll_.dchi_z;
+      auto gx = gx_, gy = gy_, gz = gz_;
+      const bool is_gga = gga_;
+      Kokkos::parallel_for(
+          "Z matrix",
+          Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0},
+                                                            {n_, npts_}),
+          KOKKOS_LAMBDA(const int u, const int g) {
+            double z = 0.5 * chi(u, g) * vrho_d(g);
+            if (is_gga)
+              z += 2.0 * vsig_d(g) *
+                   (gx(g) * dx(u, g) + gy(g) * dy(u, g) + gz(g) * dz(u, g));
+            Z(u, g) = w(g) * z;
+          });
+    }
+    detail::accumulate_matrix(detail::symmetrized_gemm(coll_.chi, Z, n_), Vxc,
+                              n_, "Vxc");
+    return out;
+  }
+
+  /// Diagonal-only variant, for the adaptive grid.
+  XCOutput accumulate_diag_vxc(const XCDerivativesView &d, double *diag) {
+    require_density("accumulate_diag_vxc");
+    if (!diag)
+      throw std::invalid_argument("accumulate_diag_vxc: null diagonal");
+
+    HostMatrixRef none{};
+    XCOutput out = accumulate_vxc(d, none); // energy and Nel, no matrix
+
+    const std::vector<double> vrho(d.vrho, d.vrho + npts_);
+    const std::vector<double> vsigma =
+        gga_ ? std::vector<double>(d.vsigma, d.vsigma + npts_)
+             : std::vector<double>(npts_, 0.0);
+    const auto vrho_d = detail::to_device(vrho, "vrho");
+    const auto vsig_d = detail::to_device(vsigma, "vsigma");
+
+    DeviceView2DLeft Z("Z", n_, npts_);
+    auto w = grid_.weights;
+    auto chi = coll_.chi, dx = coll_.dchi_x, dy = coll_.dchi_y,
+         dz = coll_.dchi_z;
+    auto gx = gx_, gy = gy_, gz = gz_;
+    const bool is_gga = gga_;
+    Kokkos::parallel_for(
+        "Z matrix (diag)",
+        Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {n_, npts_}),
+        KOKKOS_LAMBDA(const int u, const int g) {
+          double z = 0.5 * chi(u, g) * vrho_d(g);
+          if (is_gga)
+            z += 2.0 * vsig_d(g) *
+                 (gx(g) * dx(u, g) + gy(g) * dy(u, g) + gz(g) * dz(u, g));
+          Z(u, g) = w(g) * z;
+        });
+
+    const auto dg = detail::symmetrized_diagonal(coll_.chi, Z, n_);
+    for (int i = 0; i < n_; ++i)
+      diag[i] += dg[static_cast<size_t>(i)];
+    return out;
+  }
+
+private:
+  void require_density(const char *who) const {
+    if (!has_density_)
+      throw std::logic_error(std::string(who) +
+                             ": set_density must be called first");
+  }
+
+  Evaluator basis_;
+  FlatGrid grid_;
+  bool gga_;
+  int n_, npts_;
+  detail::XCCollocation coll_;
+  DeviceView1D rho_d_, gx_, gy_, gz_, sigma_d_;
+  std::vector<double> rho_h_, sigma_h_;
+  mutable std::vector<double> w_h_;
+  bool has_density_ = false;
+};
+
 } // namespace Nukexc
