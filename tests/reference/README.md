@@ -21,6 +21,7 @@ is otherwise the easiest way to make such a comparison meaningless.
 | `water_631gdp_erkale.ref` | 6-31G(d,p) basis + analytic overlap | `tests/test_erkale_overlap.cxx` |
 | `radial_chebyshev_{25,50,75}.ref` | ERKALE radial grids, weights excluding r² | `tests/test_koster_radial.cxx` |
 | `becke_erkale_cellfn.ref` | ERKALE's f_s(mu, a=0.7), 2001 samples | `tests/test_partition_schemes.cxx` |
+| `lobatto_l{5,11,17,29}.ref` | ERKALE Lobatto shells, unit sphere | `tests/test_lobatto_angular.cxx` |
 | `integratorxx-upstream.md` | two IntegratorXX issues found here, to be filed | — |
 
 `water.xyz` is a copy of `input/water.xyz` with the leading blank line removed:
