@@ -6,15 +6,18 @@
  *    SPDX-License-Identifier: BSD-3-Clause
  */
 
-// Spherical free-atom densities from the compiled-in Thakkar tables.
+// Spherical free-atom densities, and Hirshfeld weights built from them.
 //
 // There is no ERKALE parity test here, and that is deliberate rather than
-// an omission: ERKALE has no equivalent table. Its free-atom densities come
-// from an atomic SCF in whatever orbital basis the calculation is using,
-// tabulated on a uniform radial grid and linearly interpolated
-// (HirshfeldAtom, src/hirshfeld.cpp), so they carry that basis's error.
-// The Thakkar expansions are near-Hartree-Fock-limit and basis-set
-// independent. Agreeing with ERKALE here would mean reproducing a defect.
+// an omission. ERKALE's Hirshfeld class builds its free-atom densities by
+// running an atomic SCF in whatever basis the calculation is using and
+// tabulating the result on a uniform radial grid with linear interpolation
+// (HirshfeldAtom, src/hirshfeld.cpp). Those densities therefore depend on
+// the orbital basis, and agreeing with them would mean agreeing with a
+// particular basis-set calculation. The Thakkar expansions used here are
+// near-Hartree-Fock-limit and basis-set independent, so the two will differ
+// by the basis-set error of whatever ERKALE was given -- several digits in
+// a small basis. Reproducing that would be reproducing a defect.
 //
 // What replaces parity is independent physics. Two properties pin the data
 // and the evaluator between them, and neither is enforced anywhere in the
@@ -32,7 +35,10 @@
 #include <catch2/catch_all.hpp>
 
 #include <nukexc/atomic_density.hpp>
+#include <nukexc/erkale_grid.hpp>
+#include <nukexc/hirshfeld.hpp>
 #include <nukexc/koster_radial.hpp>
+#include <nukexc/molecule.hpp>
 
 using namespace Nukexc;
 
@@ -228,6 +234,139 @@ TEST_CASE("Every tabulated element is usable", "[atomden]") {
   REQUIRE(thakkar::n_electrons(8) == 8.0);
   REQUIRE(thakkar::available(103));
   REQUIRE_FALSE(thakkar::available(104));
+}
+
+TEST_CASE("Hirshfeld weights are a partition of unity", "[hirshfeld]") {
+  Molecule mol;
+  read_xyz("input/water.xyz", mol);
+  const auto t = make_thakkar_density_table();
+
+  // Build an unpartitioned grid, then apply Hirshfeld once per owning atom
+  // and check the shares add to one at each spatial point. Doing it through
+  // the public entry point rather than a cell function keeps the test on
+  // the path the library actually takes.
+  FixedGridSpec spec;
+  spec.nrad = 20;
+  spec.lmax = 11;
+  spec.weight_threshold = 0.0;
+
+  const int natoms = static_cast<int>(mol.natoms);
+  std::vector<std::vector<double>> shares;
+  size_t npts = 0;
+
+  for (int owner = 0; owner < natoms; ++owner) {
+    FixedGridSpec s = spec;
+    s.partition = PartitionScheme::ERKALE; // overwritten below
+    auto grid = make_fixed_grid(mol, s);
+    // Re-make the raw weights: take a Becke-partitioned grid's geometry but
+    // reset the weights to one, then force every point to be owned by
+    // `owner` and apply Hirshfeld. The quotient does not depend on the
+    // weight it multiplies, so unit weights give the cell function itself.
+    Kokkos::deep_copy(grid.weights, 1.0);
+    Kokkos::deep_copy(grid.point_owner, owner);
+    partition_hirshfeld(grid.atom_centers, grid.Z, grid.quad_points,
+                        grid.point_owner, grid.weights, t);
+    auto w = Kokkos::create_mirror_view_and_copy(HostSpace{}, grid.weights);
+    shares.emplace_back(w.data(), w.data() + w.extent(0));
+    npts = w.extent(0);
+  }
+
+  REQUIRE(npts > 0);
+  int checked = 0;
+  for (size_t ip = 0; ip < npts; ++ip) {
+    double s = 0.0;
+    for (int a = 0; a < natoms; ++a)
+      s += shares[a][ip];
+    // Points so far out that every free-atom density has underflowed get
+    // zero rather than one, by construction; skip those and require that
+    // most points are not in that category.
+    if (s == 0.0)
+      continue;
+    INFO("point " << ip << ", shares sum to " << s);
+    REQUIRE_THAT(s, Catch::Matchers::WithinAbs(1.0, 1e-13));
+    ++checked;
+  }
+  INFO("checked " << checked << " of " << npts << " points");
+  REQUIRE(checked > static_cast<int>(npts) / 2);
+}
+
+TEST_CASE("A Hirshfeld grid integrates the promolecular density",
+          "[hirshfeld][grid]") {
+  // End-to-end: the superposition of free-atom densities over a
+  // Hirshfeld-partitioned water grid must give 10 electrons. This exercises
+  // the partition and the density together, and would catch a mismatch
+  // between the two -- e.g. the partition using a different element's
+  // density than the integrand does.
+  Molecule mol;
+  read_xyz("input/water.xyz", mol);
+  const auto t = make_thakkar_density_table();
+
+  FixedGridSpec spec;
+  spec.nrad = 99;
+  spec.lmax = 41;
+  spec.partition = PartitionScheme::Hirshfeld;
+  spec.atomic_densities = t;
+  const auto grid = make_fixed_grid(mol, spec);
+  REQUIRE(grid.quad_points.extent(0) > 0);
+
+  const int nat = static_cast<int>(grid.atom_centers.extent(0));
+  auto pts = grid.quad_points;
+  auto w = grid.weights;
+  auto cen = grid.atom_centers;
+  auto Z = grid.Z;
+
+  double nel = 0.0;
+  Kokkos::parallel_reduce(
+      "promolecule", Kokkos::RangePolicy<ExecSpace>(0, pts.extent(0)),
+      KOKKOS_LAMBDA(const int g, double &acc) {
+        double f = 0.0;
+        for (int k = 0; k < nat; ++k) {
+          const double dx = pts(g)[0] - cen(k)[0];
+          const double dy = pts(g)[1] - cen(k)[1];
+          const double dz = pts(g)[2] - cen(k)[2];
+          f += t.density(static_cast<int>(Z(k)),
+                         Kokkos::sqrt(dx * dx + dy * dy + dz * dz));
+        }
+        acc += w(g) * f;
+      },
+      nel);
+
+  INFO("promolecular electron count " << nel);
+  REQUIRE_THAT(nel, Catch::Matchers::WithinAbs(10.0, 1e-6));
+}
+
+TEST_CASE("Hirshfeld partitioning fails loudly on a missing element",
+          "[hirshfeld]") {
+  Molecule mol;
+  read_xyz("input/water.xyz", mol);
+  const auto t = make_thakkar_density_table();
+
+  FixedGridSpec spec;
+  spec.nrad = 10;
+  spec.lmax = 5;
+  auto grid = make_fixed_grid(mol, spec);
+
+  // An element past the end of the table would otherwise contribute zero
+  // density and hand its share of every point to its neighbours. The table
+  // runs to lawrencium, so this has to reach past the actinides.
+  Kokkos::deep_copy(grid.Z, 110u);
+  REQUIRE_THROWS_AS(partition_hirshfeld(grid.atom_centers, grid.Z,
+                                        grid.quad_points, grid.point_owner,
+                                        grid.weights, t),
+                    std::runtime_error);
+
+  // And an empty table is an error rather than a silent no-op.
+  AtomicDensityTable empty;
+  REQUIRE_THROWS_AS(partition_hirshfeld(grid.atom_centers, grid.Z,
+                                        grid.quad_points, grid.point_owner,
+                                        grid.weights, empty),
+                    std::invalid_argument);
+
+  // Selecting the scheme without supplying a table must fail too, rather
+  // than producing an unpartitioned grid.
+  FixedGridSpec bad = spec;
+  bad.partition = PartitionScheme::Hirshfeld;
+  REQUIRE_THROWS_AS(make_fixed_grid(mol, bad), std::invalid_argument);
 }
 
 int main(int argc, char *argv[]) {

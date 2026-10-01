@@ -81,7 +81,11 @@ namespace Nukexc {
 enum class PartitionScheme {
   Becke,  ///< original Becke, three iterations of p
   ERKALE, ///< clipped variant with a = 0.7, ERKALE's becke_weights
-  LKO     ///< Becke with the internuclear distance capped (see note above)
+  LKO,    ///< Becke with the internuclear distance capped (see note above)
+  /// Stockholder weights from superposed free-atom densities. Not a cell
+  /// function at all: it needs the free-atom densities, so it lives in
+  /// hirshfeld.hpp and takes an extra argument the others do not.
+  Hirshfeld
 };
 
 namespace detail {

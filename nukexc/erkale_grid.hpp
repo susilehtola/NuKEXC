@@ -63,6 +63,7 @@
 #include <Kokkos_Core.hpp>
 
 #include "grid.hpp"
+#include "hirshfeld.hpp"
 #include "koster_radial.hpp"
 #include "lobatto_angular.hpp"
 #include "molecule.hpp"
@@ -145,6 +146,9 @@ struct FixedGridSpec {
   PartitionScheme partition = PartitionScheme::ERKALE;
   /// Points below this weight are discarded after partitioning.
   double weight_threshold = 1e-15;
+  /// Free-atom densities, required only by PartitionScheme::Hirshfeld.
+  /// Build once with make_thakkar_density_table() and reuse: it allocates.
+  AtomicDensityTable atomic_densities;
 };
 
 /**
@@ -231,6 +235,11 @@ inline FlatGrid make_fixed_grid(const Molecule &mol, const FixedGridSpec &spec) 
   case PartitionScheme::LKO:
     partition_becke_team(grid.atom_centers, grid.quad_points,
                          grid.point_owner, grid.weights);
+    break;
+  case PartitionScheme::Hirshfeld:
+    partition_hirshfeld(grid.atom_centers, grid.Z, grid.quad_points,
+                        grid.point_owner, grid.weights,
+                        spec.atomic_densities);
     break;
   }
 
