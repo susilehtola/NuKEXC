@@ -1,5 +1,12 @@
 # libxckernel: the header-only ABI cannot see its own operand order
 
+> **Resolved in v0.5.0** (`5d84d7a`, 2026-10-06). Findings 1 and 2 are
+> both fixed; finding 3's recommendation was followed, in that the
+> ordering was left alone. Kept here for the rationale and for the
+> measurements, which are still the evidence that NuKEXC's XC path and
+> the generated kernels agree. See "Status after v0.5.0" at the end for
+> what changed and what it means for NuKEXC.
+
 Found while wiring NuKEXC's XC path onto the generated kernels (Phase 4,
 restricted `o1` Fock matrices for `lda`, `gga`, `mgga_tau`, `mgga`). One
 real defect, one hardening suggestion, and one tempting fix that would be
@@ -177,12 +184,76 @@ does change it should carry a version bump consumers can branch on.
 
 ---
 
-## What NuKEXC does meanwhile
+## Status after v0.5.0
 
-Generates its binding from `manifest.json` rather than hand-writing the
-`fields[]` and `xc[]` arrays, since the manifest declares the order
-machine-readably and is the only place a header-only consumer can
-currently read it. Once finding 1 lands, the generated binding can
-`static_assert` its packing against the header's own names instead of
-trusting the manifest it was generated from, which is the stronger check:
-it would catch a regeneration against a different libxckernel revision.
+Both findings are fixed, and the fix for 1 took the shape suggested here:
+the names are split to match the header-only signature rather than the C
+one, and the C ABI now builds its concatenated array *from* the header's
+lists, so the two cannot drift.
+
+```c
+/* include/xckernel/kernels/xck_mgga_r_o1.hpp, v0.5.0 */
+inline constexpr int xck_mgga_r_o1_n_fields = 4;
+inline constexpr int xck_mgga_r_o1_n_xc     = 4;
+inline constexpr const char* xck_mgga_r_o1_field_names[] = {
+    "w", "rho_x", "rho_y", "rho_z"};
+inline constexpr const char* xck_mgga_r_o1_xc_names[] = {
+    "vlapl", "vrho", "vsigma", "vtau"};
+```
+
+```c
+/* src/xck_mgga_r_o1.cpp, v0.5.0 -- one source of truth */
+const char* xck_mgga_r_o1_scal_names[8] = {
+    xckernel::xck_mgga_r_o1_field_names[0], ...
+    xckernel::xck_mgga_r_o1_xc_names[0], ... };
+```
+
+Finding 2 is fixed too, with named operand structs and an overload that
+packs the positional arrays itself:
+
+```c
+template <typename Txc> struct xck_mgga_r_o1_xc {
+    const Txc* vlapl; const Txc* vrho;
+    const Txc* vsigma; const Txc* vtau; };
+```
+
+### What this changes for NuKEXC
+
+The plan here had been to generate NuKEXC's binding from
+`manifest.json`, because that was the only machine-readable place a
+header-only consumer could read the operand order. **That is no longer
+needed.** The struct overload moves the ordering from something NuKEXC
+must get right into something the compiler enforces:
+
+```cpp
+xckernel::xck_gga_r_o1_xc<double> xc{.vrho = vrho.data(),
+                                     .vsigma = vsigma.data()};
+```
+
+so the generator is dropped from the Phase 4 plan -- it would now be
+complexity bought for nothing. The counts are additionally checkable at
+compile time, which is what guards against a regeneration at a different
+revision quietly changing arity:
+
+```cpp
+static_assert(xckernel::xck_gga_r_o1_n_fields == 4);
+static_assert(xckernel::xck_gga_r_o1_n_xc == 2);
+```
+
+Re-measured on v0.5.0 through the struct overload, water/TZP, 31 basis
+functions, 13180 points, NuKEXC screening disabled:
+
+| functional | worst abs | relative |
+|---|---|---|
+| `XC_LDA_X` | 1.95e-14 | 1.5e-14 |
+| `XC_GGA_X_PBE` | 1.55e-14 | 8.5e-15 |
+
+unchanged from the positional form, as expected -- the overload only
+packs the arrays.
+
+Also relevant from the 0.5.0 notes: `--kinds` landed, so NuKEXC can
+generate `exc,matrix` alone instead of all kinds. For the four families
+at order 1 that is 16 kernels and 240 KiB rather than 60 and 1.5 MiB.
+The `xck_kernel_info`
+layout change in the same release does not affect a header-only
+consumer, which never sees the index.
