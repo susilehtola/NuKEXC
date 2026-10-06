@@ -187,8 +187,16 @@ concept BasisEvaluator = requires(const E e, int b) {
 /// An evaluator that can also produce the given derivative order.
 template <typename E, BasisDeriv D>
 concept BasisEvaluatorWith =
-    BasisEvaluator<E> && requires(const E e, typename E::block_params p,
-                                  double *out) {
+    BasisEvaluator<E> &&
+    // An evaluator must ADVERTISE the order, not merely accept the call.
+    // eval_block<D> is a template whose unsupported orders fail on a
+    // static_assert in the body, so a plain `requires` that the call is
+    // well-formed is satisfied by every D -- which made this concept claim
+    // orders the primitive STO path cannot deliver, and pushed the failure
+    // from the caller down into stobasis.hpp. max_deriv is monotone in
+    // BasisDeriv: a tower of a given order contains every lower one.
+    (static_cast<int>(E::max_deriv) >= static_cast<int>(D)) &&
+    requires(const E e, typename E::block_params p, double *out) {
       e.template eval_block<D>(p, 0.0, 0.0, 0.0, out, 1);
     };
 

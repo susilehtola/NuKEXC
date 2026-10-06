@@ -461,6 +461,10 @@ public:
     return block_params{load_contracted_shell(b_, i)};
   }
 
+  /// Highest derivative order eval_block implements, as for the
+  /// primitive Slater path.
+  static constexpr BasisDeriv max_deriv = BasisDeriv::Gradient;
+
   template <BasisDeriv D>
   KOKKOS_INLINE_FUNCTION void eval_block(const block_params &p, double x,
                                          double y, double z, double *out,
