@@ -509,6 +509,11 @@ public:
     return block_params{b_.block_shell(i), b_.block_ctr(i)};
   }
 
+  /// Highest derivative order eval_block implements. The Gaussian path
+  /// is derived to arbitrary order, so this is the highest the tower
+  /// layout names rather than a limit of the recursion.
+  static constexpr BasisDeriv max_deriv = BasisDeriv::LaplGradient;
+
   template <BasisDeriv D>
   KOKKOS_INLINE_FUNCTION void eval_block(const block_params &p, double x,
                                          double y, double z, double *out,

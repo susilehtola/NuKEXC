@@ -617,6 +617,11 @@ public:
                               b_.n(i),    b_.l(i),    b_.m(i)};
   }
 
+  /// Highest derivative order eval_block implements. Slater functions
+  /// have no second derivatives derived here yet; see the static_assert in
+  /// eval_block, which this keeps callers from ever reaching.
+  static constexpr BasisDeriv max_deriv = BasisDeriv::Gradient;
+
   template <BasisDeriv D>
   KOKKOS_INLINE_FUNCTION void eval_block(const block_params &p, double x,
                                          double y, double z, double *out,
