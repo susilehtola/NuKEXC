@@ -275,6 +275,98 @@ inline void compute_density_and_sigma_dm(
       });
 }
 
+/**
+ *  @brief The meta-GGA density ingredients, tau and the density Laplacian.
+ *
+ *  These are INGREDIENTS, not chain-rule terms. Libxc owns the derivative
+ *  tower and libxckernel owns the derivatives of the ingredients with
+ *  respect to the density matrix; what is left for the host is the
+ *  ingredients themselves, which is this.
+ *
+ *      tau    = 1/2 sum_uv P_uv grad chi_u . grad chi_v
+ *      lapl   = 2 sum_u lapl chi_u (P chi)_u + 4 tau
+ *
+ *  The Laplacian follows from differentiating rho = sum_uv P_uv chi_u chi_v
+ *  twice and using the symmetry of P, the same assumption
+ *  compute_density_and_sigma_dm already makes when it writes
+ *  grad rho = 2 (P chi) . grad chi. Both terms are needed: the second is
+ *  exactly twice the raw gradient sum, so it is reused rather than
+ *  recomputed.
+ *
+ *  tau is the TOTAL kinetic energy density, matching the total rho that
+ *  compute_density_dm returns, which is Libxc's unpolarized convention.
+ *  Since the kinetic matrix is T_uv = 1/2 integral w grad chi_u . grad chi_v,
+ *  quadrature of tau over the same grid must reproduce Tr(P T) exactly --
+ *  not merely physically -- which is what tests/test_meta_fields.cxx
+ *  asserts.
+ *
+ *  One nbf x npts temporary is reused across the three Cartesian passes
+ *  rather than holding three at once: at 13k points and a few hundred
+ *  functions the difference is tens of megabytes.
+ *
+ *  Pass an EMPTY collocation_lapl to compute tau alone and leave lapl_rho
+ *  untouched. A tau-only meta-GGA needs no second derivatives, so it has
+ *  no Laplacian collocation to give -- and the alternative of passing
+ *  something else of the right shape would silently produce a wrong
+ *  Laplacian rather than no Laplacian.
+ */
+inline void compute_meta_fields_dm(const DeviceView2DLeft collocation_values,
+                                   const DeviceView2DLeft collocation_gx,
+                                   const DeviceView2DLeft collocation_gy,
+                                   const DeviceView2DLeft collocation_gz,
+                                   const DeviceView2DLeft collocation_lapl,
+                                   const DeviceView2DLeft P, DeviceView1D tau,
+                                   DeviceView1D lapl_rho) {
+  ExecSpace space;
+  const int N_bf = collocation_values.extent(0);
+  const int N_quad = collocation_values.extent(1);
+
+  DeviceView2DLeft Y("P dchi", N_bf, N_quad);
+
+  // Accumulate the raw sum_uv P_uv grad chi_u . grad chi_v into tau, one
+  // Cartesian direction at a time; halve it at the end.
+  Kokkos::deep_copy(tau, 0.0);
+  for (int d = 0; d < 3; ++d) {
+    const DeviceView2DLeft dchi =
+        (d == 0) ? collocation_gx : (d == 1) ? collocation_gy : collocation_gz;
+    KokkosBlas::gemm(space, "N", "N", 1.0, P, dchi, 0.0, Y);
+    Kokkos::parallel_for(
+        "accumulate tau", Kokkos::RangePolicy<ExecSpace>(space, 0, N_quad),
+        KOKKOS_LAMBDA(const int g) {
+          double t = 0.0;
+          for (int mu = 0; mu < N_bf; ++mu)
+            t += dchi(mu, g) * Y(mu, g);
+          tau(g) += t;
+        });
+  }
+
+  if (collocation_lapl.extent(0) == 0) {
+    // tau only.
+    Kokkos::parallel_for(
+        "halve tau", Kokkos::RangePolicy<ExecSpace>(space, 0, N_quad),
+        KOKKOS_LAMBDA(const int g) { tau(g) *= 0.5; });
+    return;
+  }
+
+  if (static_cast<int>(collocation_lapl.extent(0)) != N_bf ||
+      static_cast<int>(collocation_lapl.extent(1)) != N_quad)
+    throw std::invalid_argument(
+        "compute_meta_fields_dm: collocation_lapl must be (nbf, npts) or "
+        "empty");
+
+  KokkosBlas::gemm(space, "N", "N", 1.0, P, collocation_values, 0.0, Y);
+  Kokkos::parallel_for(
+      "meta fields", Kokkos::RangePolicy<ExecSpace>(space, 0, N_quad),
+      KOKKOS_LAMBDA(const int g) {
+        double l = 0.0;
+        for (int mu = 0; mu < N_bf; ++mu)
+          l += collocation_lapl(mu, g) * Y(mu, g);
+        // tau still holds the raw gradient sum, which is 2 tau.
+        lapl_rho(g) = 2.0 * l + 2.0 * tau(g);
+        tau(g) *= 0.5;
+      });
+}
+
 DeviceView1D compute_density(const DeviceView2DLeft collocation_values,
                              const DeviceView2DLeft mo_orbitals,
                              const DeviceView1D mo_coeff) {

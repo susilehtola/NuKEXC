@@ -27,6 +27,7 @@ add_executable(test_partition_schemes test_partition_schemes.cxx)
 add_executable(test_lobatto_angular test_lobatto_angular.cxx)
 add_executable(test_fixed_grid test_fixed_grid.cxx)
 add_executable(test_atomic_density test_atomic_density.cxx)
+add_executable(test_meta_fields test_meta_fields.cxx)
 
 add_executable(standalone standards.cxx standalone.cxx test_io.cxx)
 
@@ -65,6 +66,7 @@ set(ALL_TEST_TARGETS
     test_lobatto_angular
     test_fixed_grid
     test_atomic_density
+    test_meta_fields
 
     standalone
 
@@ -103,5 +105,6 @@ add_test( NAME PARTITION_SCHEMES_TEST COMMAND $<TARGET_FILE:test_partition_schem
 add_test( NAME LOBATTO_ANGULAR_TEST COMMAND $<TARGET_FILE:test_lobatto_angular> )
 add_test( NAME FIXED_GRID_TEST COMMAND $<TARGET_FILE:test_fixed_grid> )
 add_test( NAME ATOMIC_DENSITY_TEST COMMAND $<TARGET_FILE:test_atomic_density> )
+add_test( NAME META_FIELDS_TEST COMMAND $<TARGET_FILE:test_meta_fields> )
 # test_arborx was built but never registered, so nothing ran it.
 add_test( NAME ARBORX_TEST COMMAND $<TARGET_FILE:test_arborx> )
