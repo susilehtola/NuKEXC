@@ -60,6 +60,11 @@ target_include_directories(
   libnukexc
   INTERFACE
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>
+  # Vendored, header-only libxckernel. Its headers include each other as
+  # "xckernel/...", so external/ is the include root rather than
+  # external/xckernel/. Regenerate with python/generate_xc_kernels.py;
+  # see external/README.md for the version and command.
+  $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/external>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
