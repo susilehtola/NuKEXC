@@ -177,6 +177,9 @@ CoreHamiltonianResult compute_core_hamiltonian(const Evaluator &basis,
   DeviceView2DLeft Gy_a("Gy_a", N, CHUNK_SIZE), Gy_b("Gy_b", N, CHUNK_SIZE);
   DeviceView2DLeft Gz_a("Gz_a", N, CHUNK_SIZE), Gz_b("Gz_b", N, CHUNK_SIZE);
 
+  // sqrt of the nuclear attraction per point, one per double-buffer half.
+  DeviceView1D vnuc_a("vnuc_a", CHUNK_SIZE), vnuc_b("vnuc_b", CHUNK_SIZE);
+
   ExecSpace space_a, space_b;
 
   for (size_t start = 0; start < total_quad_points; start += CHUNK_SIZE) {
@@ -207,53 +210,53 @@ CoreHamiltonianResult compute_core_hamiltonian(const Evaluator &basis,
     auto Gz_view = Kokkos::subview(Gz_cur, Kokkos::ALL,
                                    std::make_pair(0, current_batch_size));
 
-    Kokkos::TeamPolicy<ExecSpace> policy(space_cur, current_batch_size,
-                                         Kokkos::AUTO());
-    using member_type = Kokkos::TeamPolicy<ExecSpace>::member_type;
+    // Basis evaluation goes through the shell abstraction: one thread per
+    // (shell, point), each writing only its own shell's functions. The
+    // previous version walked basis functions one at a time through
+    // load_shell, which static_asserts a single function per block -- so
+    // this routine, although templated over the evaluator concept, could
+    // not be instantiated with any evaluator whose shells hold more than
+    // one function. Every Gaussian or numerical-orbital basis is such an
+    // evaluator, which made the whole core-Hamiltonian family Slater-only
+    // in practice.
+    fill_collocation_value_grad(space_cur, basis, batch_pts, overlap_view,
+                                Gx_view, Gy_view, Gz_view);
 
-    // Single fused kernel: compute overlap weights, nuclear weights,
-    // and gradient weights all in one pass over (i, g)
+    // sqrt of the nuclear attraction, per point. Hoisted out of the scaling
+    // pass below because it depends only on the point: the fused version
+    // recomputed the atom sum once per basis function.
+    auto vnuc_cur = Kokkos::subview(even ? vnuc_a : vnuc_b,
+                                    std::make_pair(0, current_batch_size));
     Kokkos::parallel_for(
-        "Fused scale", policy, KOKKOS_LAMBDA(member_type team_member) {
-          const int g = team_member.league_rank();
+        "Nuclear attraction",
+        Kokkos::RangePolicy<ExecSpace>(space_cur, 0, current_batch_size),
+        KOKKOS_LAMBDA(const int g) {
           const Point local_pt = batch_pts(g);
-
-          Kokkos::parallel_for(
-              Kokkos::TeamVectorRange(team_member, N), [=](const int i) {
-                const auto basis_i = load_shell(basis, i);
-                basis_eval_with_grad(basis_i, local_pt, overlap_view(i, g),
-                                     Gx_view(i, g), Gy_view(i, g),
-                                     Gz_view(i, g));
-              });
-
+          double v = 0.0;
           // Z_eff(r) -> Z as r -> 0, so the SAP branch reduces to the bare
-          // nuclear attraction at the cusp and shares the epsilon_shift guard.
-          double v_nuc = 0.0;
-          Kokkos::parallel_reduce(
-              Kokkos::TeamThreadRange(team_member, atom_centers.extent(0)),
-              [=](const int k, double &local_v) {
-                double r = dist(local_pt, atom_centers(k)) + epsilon_shift;
-                local_v +=
-                    (use_SAP ? sap_zeff(sap, k, r) : double(Z(k))) / r;
-              },
-              v_nuc);
-          v_nuc = Kokkos::sqrt(v_nuc);
+          // nuclear attraction at the cusp and shares the epsilon_shift
+          // guard.
+          for (size_t k = 0; k < atom_centers.extent(0); ++k) {
+            const double r = dist(local_pt, atom_centers(k)) + epsilon_shift;
+            v += (use_SAP ? sap_zeff(sap, static_cast<int>(k), r)
+                          : double(Z(k))) /
+                 r;
+          }
+          vnuc_cur(g) = Kokkos::sqrt(v);
+        });
 
+    Kokkos::parallel_for(
+        "Scale by the quadrature weight",
+        Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>(
+            space_cur, {0, 0}, {N, current_batch_size}),
+        KOKKOS_LAMBDA(const int i, const int g) {
           const double wf = Kokkos::sqrt(batch_wts(g));
-          Kokkos::parallel_for(Kokkos::TeamVectorRange(team_member, N),
-                               [=](const int i) {
-                                 double ov_wf = overlap_view(i, g) * wf;
-                                 // Overlap weight
-                                 overlap_view(i, g) = ov_wf;
-
-                                 // Nuclear weight — accumulate over atoms
-                                 nuclear_view(i, g) = ov_wf * v_nuc;
-
-                                 // Gradient weights
-                                 Gx_view(i, g) *= wf;
-                                 Gy_view(i, g) *= wf;
-                                 Gz_view(i, g) *= wf;
-                               });
+          const double ov_wf = overlap_view(i, g) * wf;
+          overlap_view(i, g) = ov_wf;
+          nuclear_view(i, g) = ov_wf * vnuc_cur(g);
+          Gx_view(i, g) *= wf;
+          Gy_view(i, g) *= wf;
+          Gz_view(i, g) *= wf;
         });
 
     // Serialise GEMMs against previous iteration

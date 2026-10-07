@@ -47,6 +47,7 @@
 #include <nukexc/stobasis.hpp>
 #include <nukexc/xc_kernel_session.hpp>
 
+#include "gto_analytic_overlap.hpp"
 #include "sto_basis_reader.hpp"
 
 using namespace Nukexc;
@@ -67,36 +68,6 @@ struct Fixture {
     grid = make_flat_grid<ta_type, ll_type>(mol, nrad, lmax);
   }
 };
-
-/// A water-shaped Gaussian basis, built by hand. The Laplacian meta-GGA
-/// needs second derivatives of the basis, which the Slater paths do not
-/// derive (STOPrimitiveEvaluator::max_deriv is Gradient), so the full
-/// meta-GGA is exercised with Gaussians. It need not be a production basis:
-/// the checks below are structural identities between kernels, not
-/// accuracy measurements.
-GTOBasisSet<double> make_gto_basis(const Molecule &mol) {
-  auto cen = Kokkos::create_mirror_view_and_copy(HostSpace{}, mol.atom_centers);
-  auto Z = Kokkos::create_mirror_view_and_copy(HostSpace{}, mol.Z);
-  std::vector<GTOShell<double>> sh;
-  const auto t = ShellType::Spherical;
-  for (size_t a = 0; a < mol.natoms; ++a) {
-    const std::array<double, 3> o{cen(a)[0], cen(a)[1], cen(a)[2]};
-    const bool heavy = Z(a) > 2;
-    // s shell, contracted
-    sh.emplace_back(0, t, o,
-                    std::vector<double>{heavy ? 130.7 : 3.42,
-                                        heavy ? 23.81 : 0.624,
-                                        heavy ? 6.443 : 0.169},
-                    std::vector<double>{0.154, 0.535, 0.445}, 1);
-    // a diffuse s, so the density is not a single exponent
-    sh.emplace_back(0, t, o, std::vector<double>{heavy ? 0.38 : 0.12},
-                    std::vector<double>{1.0}, 1);
-    if (heavy) // p shell only on the heavy centre
-      sh.emplace_back(1, t, o, std::vector<double>{5.03, 1.17, 0.38},
-                      std::vector<double>{0.156, 0.607, 0.392}, 1);
-  }
-  return GTOBasisSet<double>(std::move(sh));
-}
 
 /// A plausible symmetric density matrix, scaled to a sane electron count.
 std::vector<double> make_P(int nbf) {
@@ -285,7 +256,7 @@ TEST_CASE("The full meta-GGA reduces to the GGA with vtau = vlapl = 0",
           "[xckernel][reduction][gto]") {
   // Gaussians, because the full meta-GGA reads the collocation Hessian.
   Fixture f(40, 17);
-  const auto host = make_gto_basis(f.mol);
+  const auto host = test::water_basis(f.mol, ShellType::Spherical);
   const GTOEvaluator ev(make_gto_device_basis(host));
   const int nbf = ev.nbf();
   INFO("GTO nbf = " << nbf);
@@ -332,7 +303,7 @@ TEST_CASE("The full meta-GGA with vlapl = 0 reduces to the tau-only one",
   // and vtau were transposed in the operand array this would fail while
   // the previous test still passed.
   Fixture f(40, 17);
-  const auto host = make_gto_basis(f.mol);
+  const auto host = test::water_basis(f.mol, ShellType::Spherical);
   const GTOEvaluator ev(make_gto_device_basis(host));
   const int nbf = ev.nbf();
   auto P = make_P(nbf);
@@ -469,7 +440,7 @@ TEST_CASE("Missing operands are rejected loudly", "[xckernel]") {
                     std::invalid_argument);
 
   // vlapl is required only by the full meta-GGA, which needs Gaussians.
-  const auto host = make_gto_basis(f.mol);
+  const auto host = test::water_basis(f.mol, ShellType::Spherical);
   const GTOEvaluator gev(make_gto_device_basis(host));
   const int gnbf = gev.nbf();
   auto gP = make_P(gnbf);
