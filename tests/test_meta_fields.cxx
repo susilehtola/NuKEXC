@@ -51,7 +51,7 @@
 #include <nukexc/molecule.hpp>
 #include <nukexc/stobasis.hpp>
 
-#include "gto_test_basis.hpp"
+#include "gto_analytic_overlap.hpp"
 #include "sto_basis_reader.hpp"
 
 using namespace Nukexc;
@@ -249,7 +249,7 @@ TEST_CASE("The density Laplacian integrates to zero", "[meta][lapl]") {
   // tolerance is relative to the scale of the integrand.
   Molecule mol;
   read_xyz("input/water.xyz", mol);
-  const auto host = test::gto_basis(mol);
+  const auto host = test::water_basis(mol, ShellType::Spherical);
   const GTOEvaluator ev(make_gto_device_basis(host));
   const auto grid = make_flat_grid<ta_type, ll_type>(mol, 99, 41);
   const int nbf = ev.nbf();
@@ -283,7 +283,7 @@ TEST_CASE("The density Laplacian matches finite differences", "[meta][lapl]") {
   // because a permuted trace is still a trace.
   Molecule mol;
   read_xyz("input/water.xyz", mol);
-  const auto host = test::gto_basis(mol);
+  const auto host = test::water_basis(mol, ShellType::Spherical);
   const GTOEvaluator ev(make_gto_device_basis(host));
   const int nbf = ev.nbf();
   const auto P = upload_P(make_P_host(nbf), nbf);

@@ -379,6 +379,70 @@ void fill_collocation_values(ExecSpace space, const Evaluator &basis,
 }
 
 /**
+ *  @brief Values and Cartesian gradients into four separate (nbf, npts) views.
+ *
+ *  The shape the dense core-Hamiltonian GEMMs want, for the same reason
+ *  fill_collocation_values exists: those paths build S, T and V_n as
+ *  A A^T products over per-component matrices, so a component-major rank-3
+ *  tower would have to be sliced and copied before any of it could be used.
+ *
+ *  Like every routine here it sees the basis only as SHELLS -- blocks of
+ *  functions on a centre, with a range used for screening. Nothing about
+ *  the radial form reaches this level, which is why the same quadrature
+ *  serves Gaussians, Slater functions and numerical atomic orbitals alike.
+ *
+ *  One thread per (shell, point), so each thread writes only its own
+ *  shell's functions: no atomics, and no assumption that a shell holds a
+ *  single function.
+ */
+template <typename Evaluator, typename PointsView, typename ValuesView,
+          typename GradView>
+  requires BasisEvaluatorWith<Evaluator, BasisDeriv::Gradient>
+void fill_collocation_value_grad(ExecSpace space, const Evaluator &basis,
+                                 PointsView points, ValuesView values,
+                                 GradView gx, GradView gy, GradView gz) {
+  const int npts = static_cast<int>(points.extent(0));
+  const int nblk = basis.nblock();
+  if (nblk == 0 || npts == 0)
+    return;
+
+  const int nbf = basis.nbf();
+  for (const auto &v : {std::pair<int, int>{static_cast<int>(values.extent(0)),
+                                            static_cast<int>(values.extent(1))},
+                        {static_cast<int>(gx.extent(0)),
+                         static_cast<int>(gx.extent(1))},
+                        {static_cast<int>(gy.extent(0)),
+                         static_cast<int>(gy.extent(1))},
+                        {static_cast<int>(gz.extent(0)),
+                         static_cast<int>(gz.extent(1))}})
+    if (v.first != nbf || v.second < npts)
+      throw std::invalid_argument(
+          "fill_collocation_value_grad: outputs must be (nbf, >= npts)");
+
+  constexpr int NC = basis_ncomp(BasisDeriv::Gradient);
+  constexpr int MBS = Evaluator::max_block_size;
+
+  Kokkos::parallel_for(
+      "fill_collocation_value_grad",
+      Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>(space, {0, 0},
+                                                        {nblk, npts}),
+      KOKKOS_LAMBDA(const int ib, const int g) {
+        double local[NC * MBS];
+        basis.template eval_block<BasisDeriv::Gradient>(
+            basis.load_block(ib), points(g)[0], points(g)[1], points(g)[2],
+            local, MBS);
+        const int bf0 = basis.block_first_bf(ib);
+        const int n = basis.block_size(ib);
+        for (int i = 0; i < n; ++i) {
+          values(bf0 + i, g) = local[BF_VAL * MBS + i];
+          gx(bf0 + i, g) = local[BF_DX * MBS + i];
+          gy(bf0 + i, g) = local[BF_DY * MBS + i];
+          gz(bf0 + i, g) = local[BF_DZ * MBS + i];
+        }
+      });
+}
+
+/**
  *  @brief libxckernel's collocation operands, as views onto a (ncomp, nbf, ng)
  *         array produced by fill_collocation.
  *

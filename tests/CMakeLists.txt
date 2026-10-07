@@ -29,6 +29,7 @@ add_executable(test_fixed_grid test_fixed_grid.cxx)
 add_executable(test_atomic_density test_atomic_density.cxx)
 add_executable(test_meta_fields test_meta_fields.cxx)
 add_executable(test_xc_kernel_session test_xc_kernel_session.cxx)
+add_executable(test_core_hamiltonian_shells test_core_hamiltonian_shells.cxx)
 
 add_executable(standalone standards.cxx standalone.cxx test_io.cxx)
 
@@ -69,6 +70,7 @@ set(ALL_TEST_TARGETS
     test_atomic_density
     test_meta_fields
     test_xc_kernel_session
+    test_core_hamiltonian_shells
 
     standalone
 
@@ -109,5 +111,6 @@ add_test( NAME FIXED_GRID_TEST COMMAND $<TARGET_FILE:test_fixed_grid> )
 add_test( NAME ATOMIC_DENSITY_TEST COMMAND $<TARGET_FILE:test_atomic_density> )
 add_test( NAME META_FIELDS_TEST COMMAND $<TARGET_FILE:test_meta_fields> )
 add_test( NAME XC_KERNEL_SESSION_TEST COMMAND $<TARGET_FILE:test_xc_kernel_session> )
+add_test( NAME COREH_SHELLS_TEST COMMAND $<TARGET_FILE:test_core_hamiltonian_shells> )
 # test_arborx was built but never registered, so nothing ran it.
 add_test( NAME ARBORX_TEST COMMAND $<TARGET_FILE:test_arborx> )
