@@ -323,6 +323,71 @@ struct CoreHamiltonianReducer {
   }
 };
 
+/**
+ *  @brief Per-box local basis-function numbering for a block neighbour list.
+ *
+ *  The neighbour list is over BLOCKS -- shells -- as octree.hpp says, since
+ *  a block is what carries a centre and a screening radius. A pair kernel
+ *  needs to walk basis-function pairs, so each box needs its shells' local
+ *  function offsets: shell k of box b starts at local function
+ *  bf_offset(offsets(b) + k), and the box has nbf(b) local functions.
+ *
+ *  Computed here rather than in the kernel because it is a prefix sum over
+ *  each box's shells and does not depend on the grid.
+ */
+struct LocalBasisMap {
+  Kokkos::View<int *> bf_offset; ///< parallel to nl.neighbors
+  Kokkos::View<int *> nbf;       ///< per box
+};
+
+template <typename Evaluator>
+  requires BasisEvaluator<Evaluator>
+inline LocalBasisMap build_local_basis_map(const Evaluator &basis,
+                                          const NeighborList &nl) {
+  const int num_boxes = static_cast<int>(nl.offsets.extent(0)) - 1;
+  LocalBasisMap m;
+  m.bf_offset = Kokkos::View<int *>("local bf offset", nl.neighbors.extent(0));
+  m.nbf = Kokkos::View<int *>("local nbf", num_boxes);
+
+  auto off = nl.offsets;
+  auto nb = nl.neighbors;
+  auto bf_off = m.bf_offset;
+  auto nbf = m.nbf;
+  Kokkos::parallel_for(
+      "local basis map", Kokkos::RangePolicy<ExecSpace>(0, num_boxes),
+      KOKKOS_LAMBDA(const int b) {
+        int acc = 0;
+        for (int k = off(b); k < off(b + 1); ++k) {
+          bf_off(k) = acc;
+          acc += basis.block_size(nb(k));
+        }
+        nbf(b) = acc;
+      });
+  Kokkos::fence();
+  return m;
+}
+
+/**
+ *  @brief Screened core Hamiltonian, over shells.
+ *
+ *  Each thread owns one pair of basis functions and walks the box's points,
+ *  which keeps the accumulator at three scalars. The alternative -- a thread
+ *  per shell pair, accumulating the whole n_i x n_j block -- would need
+ *  3 * max_block_size^2 doubles, about 31 KiB at GTO_MAX_L = 7, which no
+ *  thread can hold.
+ *
+ *  The cost of that choice is that a shell is evaluated once per function
+ *  pair rather than once per point: redundancy of order max_block_size. For
+ *  single-function shells, which is every Slater basis, there is no
+ *  redundancy and this is exactly what the previous version did. For
+ *  Gaussians it is real, and the fix is not a different accumulator but a
+ *  different algorithm: build the box's local collocation block once,
+ *  (nbf_local, npts_local), take S, T and V_n as local GEMMs through
+ *  KokkosBatched, and scatter. That is a larger piece of work -- it needs
+ *  point tiling to fit team scratch -- and it is what would make these
+ *  paths faster than the dense one rather than merely correct. Noted rather
+ *  than attempted here.
+ */
 template <typename Evaluator>
   requires BasisEvaluatorWith<Evaluator, BasisDeriv::Gradient>
 CoreHamiltonianResult compute_core_hamiltonian_screened(
@@ -335,6 +400,10 @@ CoreHamiltonianResult compute_core_hamiltonian_screened(
   const int max_points_per_box = nl.max_points_per_box;
   const int total_points = nl.total_points;
   const int num_boxes = nl.offsets.extent(0) - 1;
+
+  const auto lmap = build_local_basis_map(basis, nl);
+  auto loc_bf_off = lmap.bf_offset;
+  auto loc_nbf = lmap.nbf;
 
   CoreHamiltonianResult result;
   result.overlap = DeviceView2DLeft("Overlap matrix", N, N);
@@ -361,23 +430,51 @@ CoreHamiltonianResult compute_core_hamiltonian_screened(
         const int end_neighbors = nl.offsets(box_idx + 1);
         const int num_neighbors = end_neighbors - start_neighbors;
 
+        const int nbf_local = loc_nbf(box_idx);
+
+        // Which shell of this box owns a given local basis function, and
+        // which function within it. A binary search over the box's prefix
+        // sums rather than a lookup table, so nothing scales with
+        // max_block_size in memory.
+        auto owner_of = [=](const int L, int &ishell, int &comp) {
+          int lo = 0, hi = num_neighbors - 1;
+          while (lo < hi) {
+            const int mid = (lo + hi + 1) / 2;
+            if (loc_bf_off(start_neighbors + mid) <= L)
+              lo = mid;
+            else
+              hi = mid - 1;
+          }
+          ishell = lo;
+          comp = L - loc_bf_off(start_neighbors + lo);
+        };
+
+        constexpr int NC = basis_ncomp(BasisDeriv::Gradient);
+        constexpr int MBS = Evaluator::max_block_size;
+
         Kokkos::parallel_for(
-            Kokkos::TeamThreadMDRange(team_member, num_neighbors,
-                                      num_neighbors),
+            Kokkos::TeamThreadMDRange(team_member, nbf_local, nbf_local),
             [=](const int local_i, const int local_j) {
-              const int global_i = nl.neighbors(start_neighbors + local_i);
-              const int global_j = nl.neighbors(start_neighbors + local_j);
+              int si = 0, ci = 0, sj = 0, cj = 0;
+              owner_of(local_i, si, ci);
+              owner_of(local_j, sj, cj);
+
+              const int blk_i = nl.neighbors(start_neighbors + si);
+              const int blk_j = nl.neighbors(start_neighbors + sj);
+              const int global_i = basis.block_first_bf(blk_i) + ci;
+              const int global_j = basis.block_first_bf(blk_j) + cj;
 
               if (global_i < global_j)
                 return;
 
-              const auto local_basis_i = load_shell(basis, global_i);
-
-              const auto local_basis_j = load_shell(basis, global_j);
+              const auto pi = basis.load_block(blk_i);
+              const auto pj = basis.load_block(blk_j);
 
               double total_s = 0.0;
               double total_t = 0.0;
               double total_v = 0.0;
+
+              double li[NC * MBS], lj[NC * MBS];
 
               for (int local_g = 0; local_g < num_points; ++local_g) {
 
@@ -385,25 +482,31 @@ CoreHamiltonianResult compute_core_hamiltonian_screened(
                 double w_g = grid.weights(global_g);
                 Point quad_point_g = grid.quad_points(global_g);
                 double v_g = 0.0;
-                for (int k = 0; k < grid.atom_centers.extent(0); ++k) {
-                  double r = dist(grid.atom_centers(k), quad_point_g);
+                for (size_t k = 0; k < grid.atom_centers.extent(0); ++k) {
+                  // epsilon_shift as everywhere else: a guard against a
+                  // point landing exactly on a nucleus, not a physical
+                  // regularization. This path omitted it while the dense
+                  // and scratch ones applied it.
+                  const double r =
+                      dist(grid.atom_centers(k), quad_point_g) + epsilon_shift;
                   v_g -= grid.Z(k) / r;
                 }
 
-                double basis_val_i;
-                double basis_gx_i;
-                double basis_gy_i;
-                double basis_gz_i;
+                basis.template eval_block<BasisDeriv::Gradient>(
+                    pi, quad_point_g[0], quad_point_g[1], quad_point_g[2], li,
+                    MBS);
+                basis.template eval_block<BasisDeriv::Gradient>(
+                    pj, quad_point_g[0], quad_point_g[1], quad_point_g[2], lj,
+                    MBS);
 
-                double basis_val_j;
-                double basis_gx_j;
-                double basis_gy_j;
-                double basis_gz_j;
-
-                basis_eval_with_grad(local_basis_j, quad_point_g, basis_val_j,
-                                     basis_gx_j, basis_gy_j, basis_gz_j);
-                basis_eval_with_grad(local_basis_i, quad_point_g, basis_val_i,
-                                     basis_gx_i, basis_gy_i, basis_gz_i);
+                const double basis_val_i = li[BF_VAL * MBS + ci];
+                const double basis_gx_i = li[BF_DX * MBS + ci];
+                const double basis_gy_i = li[BF_DY * MBS + ci];
+                const double basis_gz_i = li[BF_DZ * MBS + ci];
+                const double basis_val_j = lj[BF_VAL * MBS + cj];
+                const double basis_gx_j = lj[BF_DX * MBS + cj];
+                const double basis_gy_j = lj[BF_DY * MBS + cj];
+                const double basis_gz_j = lj[BF_DZ * MBS + cj];
 
                 const double local_s = w_g * basis_val_i * basis_val_j;
                 total_s += local_s;

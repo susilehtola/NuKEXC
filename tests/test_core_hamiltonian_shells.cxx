@@ -42,6 +42,7 @@
 #include <nukexc/grid.hpp>
 #include <nukexc/gto_eval.hpp>
 #include <nukexc/molecule.hpp>
+#include <nukexc/octree.hpp>
 #include <nukexc/stobasis.hpp>
 
 #include "gto_analytic_overlap.hpp"
@@ -224,6 +225,62 @@ TEST_CASE("Slater and Gaussian paths both go through the shell abstraction",
       REQUIRE(d > 0.5);
       REQUIRE(d < 1.5);
     }
+  }
+}
+
+TEST_CASE("The screened path agrees with the dense one for a shell basis",
+          "[coreh][shells][screened]") {
+  // The dense path is checked against a closed form above, so it is the
+  // reference here. The screened path reaches the same matrices by a
+  // completely different route: an ArborX neighbour list over shells, a
+  // team per spatial box, and atomic scatter of function pairs. Agreement
+  // therefore exercises the local-to-global basis-function map -- the
+  // prefix sums and the binary search that recover (shell, component) from
+  // a local function index -- which has no analogue in the dense path.
+  //
+  // Before this change the screened kernels indexed the neighbour list as
+  // though it held basis functions. It holds blocks. For a Slater basis
+  // those coincide; for this one they do not, so the old code would have
+  // been wrong rather than merely uncompilable.
+  Molecule mol;
+  read_xyz("input/water.xyz", mol);
+  const auto host = test::water_basis(mol, ShellType::Spherical);
+  const GTOEvaluator ev(make_gto_device_basis(host));
+  const int nbf = ev.nbf();
+  REQUIRE(ev.nblock() < nbf);
+
+  auto grid = make_flat_grid<ta_type, ll_type>(mol, 75, 29);
+
+  // create_bounding_boxes permutes the grid in place (Morton order), so it
+  // must run before anything reads the points -- both paths then see the
+  // same permuted grid.
+  const int max_points_per_box = 128;
+  const int npts = static_cast<int>(grid.quad_points.extent(0));
+  auto bb = create_bounding_boxes(grid, max_points_per_box);
+  NeighborList nl;
+  build_neighbor_list(ev, bb, max_points_per_box, npts, nl);
+
+  const auto dense = compute_core_hamiltonian(ev, grid);
+  const auto scr = compute_core_hamiltonian_screened(ev, grid, nl);
+
+  struct Pair {
+    const char *name;
+    DeviceView2DLeft a, b;
+  };
+  for (const auto &pr : {Pair{"overlap", scr.overlap, dense.overlap},
+                         Pair{"kinetic", scr.kinetic, dense.kinetic},
+                         Pair{"nuclear", scr.nuclear, dense.nuclear}}) {
+    const auto got = to_host(pr.a);
+    const auto ref = to_host(pr.b);
+    double scale = 0.0;
+    const double w = worst_rel(got, ref, scale);
+    INFO(pr.name << ": worst |screened - dense| = " << w << ", scale "
+                 << scale << ", relative " << w / scale);
+    REQUIRE(scale > 1e-3);
+    // Screening drops contributions below the shells' cutoff radii, so this
+    // is not expected to be exact -- the cutoffs are what the tolerance is
+    // measuring.
+    REQUIRE(w < 1e-8 * scale);
   }
 }
 
