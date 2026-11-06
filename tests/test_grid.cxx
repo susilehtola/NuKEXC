@@ -168,6 +168,47 @@ void visualize_points_with_tiles(const FlatGrid &grid) {
             << "           correctly contained within their boxes.\n\n";
 }
 
+TEST_CASE("The same molecule gives the same grid, in the same order",
+          "[grid][determinism]") {
+  // make_flat_grid prunes points whose partition weight is negligible and
+  // compacts what is left. It used to assign each survivor its slot with an
+  // atomic counter, which hands out slots in thread-arrival order: the point
+  // SET was reproducible but the point ORDER was not, so two grids built
+  // from the same molecule in the same process came out permuted with
+  // respect to each other. That makes every quadrature sum accumulate in a
+  // different order -- results moving in their last bits run to run -- and
+  // it makes anything derived from the point index, including the grid
+  // batching, unreproducible. It also turns a latent bug anywhere downstream
+  // into an intermittent one, which is how this was found.
+  Molecule mol(
+      std::vector<std::vector<double>>{{0., 0., 0.}, {0., 0., 1.4}},
+      std::vector<unsigned>{1u, 8u});
+
+  const auto a = make_flat_grid<ta_type, ll_type>(mol, 40, 20);
+  const auto b = make_flat_grid<ta_type, ll_type>(mol, 40, 20);
+
+  REQUIRE(a.quad_points.extent(0) == b.quad_points.extent(0));
+  REQUIRE(a.quad_points.extent(0) > 1000); // or there is nothing to permute
+
+  auto pa = Kokkos::create_mirror_view_and_copy(HostSpace{}, a.quad_points);
+  auto pb = Kokkos::create_mirror_view_and_copy(HostSpace{}, b.quad_points);
+  auto wa = Kokkos::create_mirror_view_and_copy(HostSpace{}, a.weights);
+  auto wb = Kokkos::create_mirror_view_and_copy(HostSpace{}, b.weights);
+  auto oa = Kokkos::create_mirror_view_and_copy(HostSpace{}, a.point_owner);
+  auto ob = Kokkos::create_mirror_view_and_copy(HostSpace{}, b.point_owner);
+
+  // Bit for bit, index by index: the two runs did the same arithmetic, so
+  // anything short of equality is a reordering.
+  for (size_t i = 0; i < pa.extent(0); ++i) {
+    INFO("point " << i);
+    REQUIRE(pa(i)[0] == pb(i)[0]);
+    REQUIRE(pa(i)[1] == pb(i)[1]);
+    REQUIRE(pa(i)[2] == pb(i)[2]);
+    REQUIRE(wa(i) == wb(i));
+    REQUIRE(oa(i) == ob(i));
+  }
+}
+
 int main() {
 
   Kokkos::initialize();
