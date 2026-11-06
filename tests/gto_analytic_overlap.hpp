@@ -20,11 +20,8 @@
 // derived from a different route than the quadrature it checks, and the
 // Gaussian overlap is the one that has an elementary one.
 //
-// water_basis also lives here, and is the Gaussian basis the tests share.
-// It matters that it has a p shell: p, d and f shells are what make a
-// block hold more than one function, and single-function blocks are
-// exactly the case that hid the core-Hamiltonian defect this header's
-// users now check for.
+// Basis construction lives in test_basis_sets.hpp, not here: this header
+// is the closed form and nothing else.
 
 #include <cmath>
 #include <vector>
@@ -33,8 +30,6 @@
 
 #include <nukexc/gto_basisset.hpp>
 #include <nukexc/gto_shell.hpp>
-#include <nukexc/molecule.hpp>
-#include <nukexc/nukexc_config.hpp>
 
 namespace Nukexc {
 namespace test {
@@ -162,46 +157,6 @@ inline std::vector<double> analytic_overlap(const GTOBasisSet<double> &basis) {
     }
   }
   return S;
-}
-
-/// A small STO-3G-like water basis, built through the caller-array API.
-inline GTOBasisSet<double> water_basis(const Molecule &mol,
-                                      ShellType type) {
-  auto cen = Kokkos::create_mirror_view_and_copy(HostSpace{}, mol.atom_centers);
-  auto Z = Kokkos::create_mirror_view_and_copy(HostSpace{}, mol.Z);
-
-  std::vector<GTOShell<double>> sh;
-  for (size_t i = 0; i < mol.natoms; ++i) {
-    const std::array<double, 3> O = {cen(i)[0], cen(i)[1], cen(i)[2]};
-    if (Z(i) == 1) {
-      sh.emplace_back(0, type, O, std::vector<double>{3.425250914, 0.6239137298,
-                                                      0.1688554040},
-                      std::vector<double>{0.1543289673, 0.5353281423,
-                                          0.4446345422},
-                      1);
-    } else {
-      // O: 1s, and a generally contracted 2s/2p sharing one exponent set
-      sh.emplace_back(0, type, O,
-                      std::vector<double>{130.7093214, 23.80886605,
-                                          6.443608313},
-                      std::vector<double>{0.1543289673, 0.5353281423,
-                                          0.4446345422},
-                      1);
-      sh.emplace_back(0, type, O,
-                      std::vector<double>{5.033151319, 1.169596125,
-                                          0.3803889600},
-                      std::vector<double>{-0.09996722919, 0.3995128261,
-                                          0.7001154689},
-                      1);
-      sh.emplace_back(1, type, O,
-                      std::vector<double>{5.033151319, 1.169596125,
-                                          0.3803889600},
-                      std::vector<double>{0.1559162750, 0.6076837186,
-                                          0.3919573931},
-                      1);
-    }
-  }
-  return GTOBasisSet<double>(std::move(sh));
 }
 
 } // namespace test

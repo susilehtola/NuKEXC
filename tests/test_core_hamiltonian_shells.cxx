@@ -46,6 +46,7 @@
 #include <nukexc/stobasis.hpp>
 
 #include "gto_analytic_overlap.hpp"
+#include "test_basis_sets.hpp"
 #include "sto_basis_reader.hpp"
 
 using namespace Nukexc;
@@ -81,7 +82,7 @@ TEST_CASE("The core Hamiltonian accepts a multi-function-shell basis",
           "[coreh][shells][gto]") {
   Molecule mol;
   read_xyz("input/water.xyz", mol);
-  const auto host = test::water_basis(mol, ShellType::Spherical);
+  const auto host = test::sto3g_basis(mol);
   const GTOEvaluator ev(make_gto_device_basis(host));
 
   // The basis must actually exercise the case, or the test is vacuous: at
@@ -114,7 +115,7 @@ TEST_CASE("The quadrature overlap matches the closed form for Gaussians",
   // functions; both show up here and neither would show in a trace.
   Molecule mol;
   read_xyz("input/water.xyz", mol);
-  const auto host = test::water_basis(mol, ShellType::Spherical);
+  const auto host = test::sto3g_basis(mol);
   const GTOEvaluator ev(make_gto_device_basis(host));
   const int nbf = ev.nbf();
 
@@ -140,7 +141,7 @@ TEST_CASE("The core Hamiltonian is symmetric for a shell basis",
           "[coreh][shells][gto]") {
   Molecule mol;
   read_xyz("input/water.xyz", mol);
-  const auto host = test::water_basis(mol, ShellType::Spherical);
+  const auto host = test::sto3g_basis(mol);
   const GTOEvaluator ev(make_gto_device_basis(host));
   const int nbf = ev.nbf();
 
@@ -174,7 +175,7 @@ TEST_CASE("Kinetic and nuclear energies have the right sign and scale",
   // untouched.
   Molecule mol;
   read_xyz("input/water.xyz", mol);
-  const auto host = test::water_basis(mol, ShellType::Spherical);
+  const auto host = test::sto3g_basis(mol);
   const GTOEvaluator ev(make_gto_device_basis(host));
   const int nbf = ev.nbf();
 
@@ -206,7 +207,7 @@ TEST_CASE("Slater and Gaussian paths both go through the shell abstraction",
   const STOPrimitiveEvaluator sev(sto);
   REQUIRE(sev.nblock() == sev.nbf()); // single-function shells
 
-  const auto gto = test::water_basis(mol, ShellType::Spherical);
+  const auto gto = test::sto3g_basis(mol);
   const GTOEvaluator gev(make_gto_device_basis(gto));
   REQUIRE(gev.nblock() < gev.nbf()); // multi-function shells
 
@@ -244,7 +245,7 @@ TEST_CASE("The screened path agrees with the dense one for a shell basis",
   // been wrong rather than merely uncompilable.
   Molecule mol;
   read_xyz("input/water.xyz", mol);
-  const auto host = test::water_basis(mol, ShellType::Spherical);
+  const auto host = test::sto3g_basis(mol);
   const GTOEvaluator ev(make_gto_device_basis(host));
   const int nbf = ev.nbf();
   REQUIRE(ev.nblock() < nbf);
