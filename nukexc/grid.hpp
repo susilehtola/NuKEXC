@@ -308,42 +308,52 @@ make_flat_grid(const Molecule &mol, const size_t nrad = 50,
 
   // Remove all weights below the weight threshold, compacting points, weights
   // and owners together so the surviving grid stays self-consistent.
-  Kokkos::View<int *> w_counter("Counter", 1);
-  Kokkos::parallel_for(
-      "Count weights", Kokkos::RangePolicy<ExecSpace>(0, total_points),
-      KOKKOS_LAMBDA(const int g) {
-        if (wt_flat(g) > weight_threshold) {
-          Kokkos::atomic_add(&w_counter(0), 1);
-        };
+  //
+  // The destination of each surviving point comes from a prefix sum, not from
+  // an atomic counter. An atomic hands out slots in thread-arrival order, so
+  // the same program on the same input produced the grid in a DIFFERENT ORDER
+  // on every run: the quadrature then accumulated its sums in a different
+  // order and every result moved in its last bits for no reason a caller
+  // could see, batching decisions changed run to run, and nothing derived
+  // from the point order could be cached or compared. A scan is also cheaper
+  // than a contended atomic on one counter.
+  Kokkos::View<int *> dest("compaction destinations", total_points + 1);
+  Kokkos::parallel_scan(
+      "Compaction destinations", Kokkos::RangePolicy<ExecSpace>(0, total_points),
+      KOKKOS_LAMBDA(const int g, int &acc, const bool final) {
+        if (final)
+          dest(g) = acc;
+        if (wt_flat(g) > weight_threshold)
+          ++acc;
+        if (final && g + 1 == static_cast<int>(total_points))
+          dest(total_points) = acc;
       });
 
-  auto w_counter_h =
-      Kokkos::create_mirror_view_and_copy(HostSpace{}, w_counter);
+  int n_kept = 0;
+  if (total_points > 0)
+    Kokkos::deep_copy(n_kept, Kokkos::subview(dest, total_points));
 
   // Initialize the compacted views with the correct sizes
-  Kokkos::View<Point *> qp_1d("quad points 1D", w_counter_h(0));
-  Kokkos::View<double *> wt_1d("weights 1D", w_counter_h(0));
-  Kokkos::View<int *> owner_1d("point owner 1D", w_counter_h(0));
-
-  // Reset the counter
-  Kokkos::deep_copy(w_counter, 0);
+  Kokkos::View<Point *> qp_1d("quad points 1D", n_kept);
+  Kokkos::View<double *> wt_1d("weights 1D", n_kept);
+  Kokkos::View<int *> owner_1d("point owner 1D", n_kept);
 
   Kokkos::parallel_for(
       "FlattenViews", Kokkos::RangePolicy<ExecSpace>(0, total_points),
       KOKKOS_LAMBDA(const int g) {
         if (wt_flat(g) > weight_threshold) {
-          int dest = Kokkos::atomic_fetch_add(&w_counter(0), 1);
-          wt_1d(dest) = wt_flat(g);
-          qp_1d(dest) = qp_flat(g);
-          owner_1d(dest) = owner_flat(g);
+          const int d = dest(g);
+          wt_1d(d) = wt_flat(g);
+          qp_1d(d) = qp_flat(g);
+          owner_1d(d) = owner_flat(g);
         }
       });
 
   if (verbose == true)
     Kokkos::printf("Reduced weight count from %zu to %d (%f %%) for a weight "
                    "threshold of %e\n",
-                   total_points, w_counter_h(0),
-                   100 * (1.0 - w_counter_h(0) / double(total_points)),
+                   total_points, n_kept,
+                   100 * (1.0 - n_kept / double(total_points)),
                    weight_threshold);
 
   return {qp_1d, wt_1d, ac_dev, Z_dev, owner_1d};
