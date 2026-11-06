@@ -236,8 +236,7 @@ void run_benchmark_screened(const Config &cfg) {
     nl_timer.reset();
     auto bb = create_bounding_boxes(grid, cfg.max_points_per_box);
     NeighborList nl;
-    build_neighbor_list(STOPrimitiveEvaluator(basis), bb, cfg.max_points_per_box,
-                        grid.quad_points.extent(0), nl);
+    build_neighbor_list(STOPrimitiveEvaluator(basis), bb, cfg.max_points_per_box, grid.quad_points, nl);
     double t_neighbors = nl_timer.seconds();
 
     core_hamiltonian_timer.reset();
@@ -275,8 +274,7 @@ void run_benchmark_scratch(const Config &cfg) {
     nl_timer.reset();
     auto bb = create_bounding_boxes(grid, cfg.max_points_per_box);
     NeighborList nl;
-    build_neighbor_list(STOPrimitiveEvaluator(basis), bb, cfg.max_points_per_box,
-                        grid.quad_points.extent(0), nl);
+    build_neighbor_list(STOPrimitiveEvaluator(basis), bb, cfg.max_points_per_box, grid.quad_points, nl);
     double t_neighbors = nl_timer.seconds();
 
     core_hamiltonian_timer.reset();
@@ -314,8 +312,7 @@ void run_benchmark_tiled(const Config &cfg) {
     nl_timer.reset();
     auto bb = create_bounding_boxes(grid, cfg.max_points_per_box);
     NeighborList nl;
-    build_neighbor_list(STOPrimitiveEvaluator(basis), bb, cfg.max_points_per_box,
-                        grid.quad_points.extent(0), nl);
+    build_neighbor_list(STOPrimitiveEvaluator(basis), bb, cfg.max_points_per_box, grid.quad_points, nl);
     double t_neighbors = nl_timer.seconds();
 
     core_hamiltonian_timer.reset();
@@ -353,8 +350,7 @@ void run_benchmark_sparse(const Config &cfg) {
     nl_timer.reset();
     auto bb = create_bounding_boxes(grid, cfg.max_points_per_box);
     NeighborList nl;
-    build_neighbor_list(STOPrimitiveEvaluator(basis), bb, cfg.max_points_per_box,
-                        grid.quad_points.extent(0), nl);
+    build_neighbor_list(STOPrimitiveEvaluator(basis), bb, cfg.max_points_per_box, grid.quad_points, nl);
     double t_neighbors = nl_timer.seconds();
 
     core_hamiltonian_timer.reset();

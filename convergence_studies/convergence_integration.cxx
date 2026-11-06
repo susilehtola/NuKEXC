@@ -142,8 +142,7 @@ CoreHamiltonianResult compute_reference(const Config cfg, size_t nrad,
   if (cfg.screening) {
     auto bb = create_bounding_boxes(grid, cfg.max_points_per_box);
     NeighborList nl;
-    build_neighbor_list(STOPrimitiveEvaluator(stobasis), bb, cfg.max_points_per_box,
-                        grid.quad_points.extent(0), nl);
+    build_neighbor_list(STOPrimitiveEvaluator(stobasis), bb, cfg.max_points_per_box, grid.quad_points, nl);
     core = compute_core_hamiltonian_screened(STOPrimitiveEvaluator(stobasis), grid, nl);
   } else {
     core = compute_core_hamiltonian(STOPrimitiveEvaluator(stobasis), grid);

@@ -259,7 +259,7 @@ TEST_CASE("The screened path agrees with the dense one for a shell basis",
   const int npts = static_cast<int>(grid.quad_points.extent(0));
   auto bb = create_bounding_boxes(grid, max_points_per_box);
   NeighborList nl;
-  build_neighbor_list(ev, bb, max_points_per_box, npts, nl);
+  build_neighbor_list(ev, bb, max_points_per_box, grid.quad_points, nl);
 
   const auto dense = compute_core_hamiltonian(ev, grid);
   const auto scr = compute_core_hamiltonian_screened(ev, grid, nl);

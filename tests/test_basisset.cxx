@@ -234,7 +234,7 @@ void benchmark_collocation(Config cfg) {
   const int max_points_per_box = cfg.max_points_per_box;
   NeighborList nl;
   auto bounding_boxes = create_bounding_boxes(grid, max_points_per_box);
-  build_neighbor_list(STOPrimitiveEvaluator(basis), bounding_boxes, max_points_per_box, N_quad, nl);
+  build_neighbor_list(STOPrimitiveEvaluator(basis), bounding_boxes, max_points_per_box, grid.quad_points, nl);
 
   const int num_boxes = nl.offsets.extent(0) - 1;
   Kokkos::View<double **> S("overlap", N_bf,
