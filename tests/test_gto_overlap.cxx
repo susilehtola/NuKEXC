@@ -40,10 +40,10 @@
 #include <nukexc/molecule.hpp>
 
 #include "gto_analytic_overlap.hpp"
+#include "test_basis_sets.hpp"
 
 using namespace Nukexc;
 using Nukexc::test::analytic_overlap;
-using Nukexc::test::water_basis;
 using ta_type = IntegratorXX::TreutlerAhlrichs<double, double>;
 using ll_type = IntegratorXX::LebedevLaikov<double>;
 
@@ -73,7 +73,7 @@ TEST_CASE("Quadrature overlap reproduces the closed form",
   read_xyz("input/water.xyz", mol);
 
   for (auto type : {ShellType::Cartesian, ShellType::Spherical}) {
-    const auto host = water_basis(mol, type);
+    const auto host = test::sto3g_basis(mol, type);
     const auto dev = make_gto_device_basis(host);
     const int nbf = dev.nbf;
     INFO((type == ShellType::Spherical ? "spherical" : "Cartesian"));

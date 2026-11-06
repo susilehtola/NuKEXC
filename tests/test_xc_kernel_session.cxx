@@ -48,6 +48,7 @@
 #include <nukexc/xc_kernel_session.hpp>
 
 #include "gto_analytic_overlap.hpp"
+#include "test_basis_sets.hpp"
 #include "sto_basis_reader.hpp"
 
 using namespace Nukexc;
@@ -256,7 +257,7 @@ TEST_CASE("The full meta-GGA reduces to the GGA with vtau = vlapl = 0",
           "[xckernel][reduction][gto]") {
   // Gaussians, because the full meta-GGA reads the collocation Hessian.
   Fixture f(40, 17);
-  const auto host = test::water_basis(f.mol, ShellType::Spherical);
+  const auto host = test::sto3g_basis(f.mol);
   const GTOEvaluator ev(make_gto_device_basis(host));
   const int nbf = ev.nbf();
   INFO("GTO nbf = " << nbf);
@@ -303,7 +304,7 @@ TEST_CASE("The full meta-GGA with vlapl = 0 reduces to the tau-only one",
   // and vtau were transposed in the operand array this would fail while
   // the previous test still passed.
   Fixture f(40, 17);
-  const auto host = test::water_basis(f.mol, ShellType::Spherical);
+  const auto host = test::sto3g_basis(f.mol);
   const GTOEvaluator ev(make_gto_device_basis(host));
   const int nbf = ev.nbf();
   auto P = make_P(nbf);
@@ -440,7 +441,7 @@ TEST_CASE("Missing operands are rejected loudly", "[xckernel]") {
                     std::invalid_argument);
 
   // vlapl is required only by the full meta-GGA, which needs Gaussians.
-  const auto host = test::water_basis(f.mol, ShellType::Spherical);
+  const auto host = test::sto3g_basis(f.mol);
   const GTOEvaluator gev(make_gto_device_basis(host));
   const int gnbf = gev.nbf();
   auto gP = make_P(gnbf);
