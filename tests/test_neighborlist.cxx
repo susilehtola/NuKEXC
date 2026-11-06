@@ -69,7 +69,7 @@ TEST_CASE("NeighborList: benzene regression",
   auto bb = create_bounding_boxes(grid, points_per_box);
 
   NeighborList nl;
-  build_neighbor_list(STOPrimitiveEvaluator(basis), bb, points_per_box, grid.quad_points.extent(0),
+  build_neighbor_list(STOPrimitiveEvaluator(basis), bb, points_per_box, grid.quad_points,
                       nl, true, "benzene_histogram");
 
   auto offsets_h =
@@ -116,7 +116,7 @@ TEST_CASE("NeighborList: taxol regression",
 
   auto bb = create_bounding_boxes(grid, points_per_box);
   NeighborList nl;
-  build_neighbor_list(STOPrimitiveEvaluator(basis), bb, points_per_box, grid.quad_points.extent(0),
+  build_neighbor_list(STOPrimitiveEvaluator(basis), bb, points_per_box, grid.quad_points,
                       nl, true, "taxol_histogram");
 
   auto offsets_h =

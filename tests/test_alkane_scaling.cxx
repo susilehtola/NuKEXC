@@ -25,27 +25,46 @@
 // The chain is tested along x and along (1,1,1)/sqrt(3). The expectation
 // going in was that the diagonal case would be the hard one -- a thin tube
 // through a large cube, so that axis-aligned boxes around runs of
-// consecutive points would be far larger than the points in them.
+// consecutive points would be far larger than the points in them. That is
+// right, and it took two separate fixes to remove it; the measurements that
+// led there are worth recording, because the first scheme hid the effect
+// rather than curing it.
 //
-// Measured, it is the other way round, and the mechanism is worth recording
-// because it is the opposite of the intuition. ArborX's Morton64 normalizes
-// coordinates to the grid's bounding box, so it subdivides every axis into
-// the same number of cells whatever that axis's extent. For C16 the
-// bounding box is 38.1 x 5.6 x 3.4 bohr aligned, against
-// 24.1 x 22.8 x 24.7 diagonal. The aligned chain therefore gets Morton
-// cells eleven times longer along the chain than across it, so its tiles
-// are elongated, their bounding boxes fat, and they overlap more shells.
-// The diagonal chain gets near-cubic cells and compact tiles, and comes out
-// about 16% CHEAPER at large box sizes.
+// With BatchScheme::MortonTiles the diagonal chain measured CHEAPER than the
+// aligned one, which is the opposite of the expectation. The reason is a
+// defect, not a virtue: ArborX's Morton64 normalizes coordinates to the
+// grid's bounding box, so it subdivides every axis into the same number of
+// cells whatever that axis's extent. For C16 the bounding box is
+// 38.1 x 5.6 x 3.4 bohr aligned against 24.1 x 22.8 x 24.7 diagonal, so the
+// ALIGNED chain gets Morton cells eleven times longer along the chain than
+// across it, elongated tiles, and fat bounding boxes. Morton tiling is
+// orientation dependent in both directions at once, and on this system the
+// two dependences happened to cross.
 //
-// So the pathological orientation here is the axis-aligned one, and the
-// defect is the anisotropy of Morton cells rather than the molecule's
-// direction. Both orientations are asserted, so whichever way a future
-// batching scheme shifts the balance, the test still pins the property that
-// matters: that neither grows without bound.
+// BatchScheme::CutPlane removes the first half. Its recursion is rotation
+// equivariant by construction -- rotate the points and the centroid, scatter
+// matrix and principal axis all rotate with them, so the batches contain the
+// same points -- and it cut aligned pair work on C24 at 2048 points per box
+// by 56%, from 4932 to 2179. The diagonal case barely moved, 3985 to 3835,
+// and so became the expensive orientation: the partitions were now identical
+// but the AXIS-ALIGNED BOX around a rotated batch is bigger, 2938 against
+// 1642 bohr^3 of mean box volume for the same point sets.
+//
+// The second half is removed by screening against the points rather than
+// against the box, which is Blum's step (2) and is exact. Oriented bounding
+// boxes would have narrowed the gap; testing the points closes it, because
+// the points in a batch are the same set under rotation whatever box is
+// drawn around them. With both in place the two orientations agree to within
+// 1% at every box size measured, and the pair work on C24 at 2048 points per
+// box is 2036 aligned against 2026 diagonal, down 2.4x from where the
+// original Morton-plus-box scheme left it.
+//
+// Everything asserted below is therefore the conjunction of the two: a
+// regression in either one shows up as an orientation dependence.
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <vector>
 
 #include <Kokkos_Core.hpp>
@@ -72,11 +91,14 @@ struct Counts {
   int npts = 0;
   double mean_shells = 0.0; ///< mean m_b: the neighbour-list size
   double mean_sq = 0.0;     ///< mean m_b^2: the pair-kernel work per box
+  double mean_box_vol = 0.0; ///< mean AABB volume of a batch
+  double mean_box_diag = 0.0; ///< mean AABB diagonal of a batch
 };
 
 /// Build the grid, boxes and neighbour list, and count. No timing.
 Counts measure(int ncarbon, test::ChainAxis axis, int max_points_per_box,
-               size_t nrad, size_t lmax) {
+               size_t nrad, size_t lmax,
+               BatchScheme scheme = BatchScheme::CutPlane) {
   auto mol = test::alkane(ncarbon, axis);
   const auto host = test::sto3g_basis(mol);
   const GTOEvaluator ev(make_gto_device_basis(host));
@@ -84,9 +106,9 @@ Counts measure(int ncarbon, test::ChainAxis axis, int max_points_per_box,
 
   Counts c;
   c.npts = static_cast<int>(grid.quad_points.extent(0));
-  auto bb = create_bounding_boxes(grid, max_points_per_box);
+  auto bb = create_bounding_boxes(grid, max_points_per_box, scheme);
   NeighborList nl;
-  build_neighbor_list(ev, bb, max_points_per_box, c.npts, nl);
+  build_neighbor_list(ev, bb, max_points_per_box, grid.quad_points, nl);
 
   auto off = Kokkos::create_mirror_view_and_copy(HostSpace{}, nl.offsets);
   c.nboxes = static_cast<int>(off.extent(0)) - 1;
@@ -99,6 +121,21 @@ Counts measure(int ncarbon, test::ChainAxis axis, int max_points_per_box,
   }
   c.mean_shells = double(total) / c.nboxes;
   c.mean_sq = double(sq) / c.nboxes;
+
+  auto bbh = Kokkos::create_mirror_view_and_copy(HostSpace{}, bb);
+  double vol = 0.0, diag = 0.0;
+  for (int b = 0; b < c.nboxes; ++b) {
+    double e[3], d2 = 0.0, v = 1.0;
+    for (int k = 0; k < 3; ++k) {
+      e[k] = bbh(b).maxCorner()[k] - bbh(b).minCorner()[k];
+      d2 += e[k] * e[k];
+      v *= e[k];
+    }
+    vol += v;
+    diag += std::sqrt(d2);
+  }
+  c.mean_box_vol = vol / c.nboxes;
+  c.mean_box_diag = diag / c.nboxes;
   return c;
 }
 
@@ -227,32 +264,168 @@ TEST_CASE("Shells per box saturate as the alkane chain grows",
   }
 }
 
-TEST_CASE("The diagonal chain is not the pathological orientation",
+TEST_CASE("Batching and screening do not care how the molecule is oriented",
           "[scaling][alkane][diagonal]") {
-  // Recorded because it is the opposite of what one expects, and because a
-  // batching scheme that oriented its boxes should change it. ArborX's
-  // Morton codes are normalized to the grid's bounding box, which is
-  // strongly anisotropic for an axis-aligned chain and nearly cubic for a
-  // diagonal one, so it is the ALIGNED chain whose tiles come out
-  // elongated and overlap more shells.
-  //
-  // Asserted loosely and in the direction measured. If recursive
-  // cut-plane batching replaces the Morton tiling -- Blum et al.,
-  // Comput. Phys. Commun. 180 (2009) 2175, step (1), after Kahan -- the
-  // two orientations should converge towards each other, and this test
-  // should be revisited rather than merely retuned.
+  // The property the implementation is supposed to have: the same molecule
+  // rotated costs the same to integrate. Pair work is sum_b m_b^2, so the
+  // ratio between the two orientations is the thing to pin, and it has to be
+  // near one at every box size -- a scheme that is orientation independent
+  // only for small batches has merely hidden the dependence below the
+  // resolution of the test.
   const size_t nrad = 20, lmax = 11;
 
-  for (int mppb : {128, 1024}) {
-    const auto a = measure(16, test::ChainAxis::Aligned, mppb, nrad, lmax);
-    const auto d = measure(16, test::ChainAxis::Diagonal, mppb, nrad, lmax);
-    const double ratio = d.mean_sq / a.mean_sq;
-    INFO("max_points_per_box " << mppb << ": aligned " << a.mean_sq
-                               << ", diagonal " << d.mean_sq << ", ratio "
-                               << ratio);
-    // Both must be the same order; neither orientation may blow up.
-    REQUIRE(ratio > 0.5);
-    REQUIRE(ratio < 1.5);
+  for (int nc : {16, 24}) {
+    for (int mppb : {128, 512, 2048}) {
+      const auto a = measure(nc, test::ChainAxis::Aligned, mppb, nrad, lmax);
+      const auto d = measure(nc, test::ChainAxis::Diagonal, mppb, nrad, lmax);
+
+      // The two orientations get essentially the same grid, so essentially
+      // the same number of batches. Not exactly: make_flat_grid discards
+      // points whose partition weight falls below 1e-30, and rotating the
+      // molecule perturbs those near-zero Becke weights by rounding, so a
+      // few points land on the other side of that cut. Measured at C16 the
+      // difference is one box in 378. Points worth 1e-30 change nothing
+      // except this count.
+      INFO("boxes: aligned " << a.nboxes << ", diagonal " << d.nboxes
+                             << "; points " << a.npts << " and " << d.npts);
+      REQUIRE_THAT(double(d.nboxes) / a.nboxes,
+                   Catch::Matchers::WithinAbs(1.0, 0.01));
+      REQUIRE_THAT(double(d.npts) / a.npts,
+                   Catch::Matchers::WithinAbs(1.0, 0.01));
+
+      const double ratio = d.mean_sq / a.mean_sq;
+      INFO("C" << nc << ", " << mppb << " points/box: aligned " << a.mean_sq
+                << ", diagonal " << d.mean_sq << ", ratio " << ratio);
+      // Measured within 1% at every setting here. 10% is loose enough to
+      // survive a different grid or cutoff, and still an order of magnitude
+      // tighter than the 1.8x that box-based screening gives.
+      REQUIRE_THAT(ratio, Catch::Matchers::WithinAbs(1.0, 0.10));
+    }
+  }
+}
+
+TEST_CASE("Cut-plane batching beats Morton tiling, and is what makes the "
+          "orientations agree",
+          "[scaling][alkane][diagonal]") {
+  // Guards the reason BatchScheme::CutPlane is the default. Exact screening
+  // alone is not enough: the Morton partition is itself anisotropic, so even
+  // with the boxes out of the picture it leaves a large orientation
+  // dependence. Measured on C24 at 2048 points per box, Morton gives 3976
+  // aligned against 2182 diagonal; cut-plane gives 2036 against 2026.
+  const size_t nrad = 20, lmax = 11;
+  const int nc = 24, mppb = 2048;
+
+  const auto ma =
+      measure(nc, test::ChainAxis::Aligned, mppb, nrad, lmax,
+              BatchScheme::MortonTiles);
+  const auto md =
+      measure(nc, test::ChainAxis::Diagonal, mppb, nrad, lmax,
+              BatchScheme::MortonTiles);
+  const auto ca = measure(nc, test::ChainAxis::Aligned, mppb, nrad, lmax,
+                          BatchScheme::CutPlane);
+  const auto cd = measure(nc, test::ChainAxis::Diagonal, mppb, nrad, lmax,
+                          BatchScheme::CutPlane);
+
+  const double morton_dev = std::abs(md.mean_sq / ma.mean_sq - 1.0);
+  const double cut_dev = std::abs(cd.mean_sq / ca.mean_sq - 1.0);
+  INFO("orientation sensitivity: Morton " << morton_dev << ", cut-plane "
+                                          << cut_dev);
+  REQUIRE(morton_dev > 0.2); // Morton really is orientation dependent
+  REQUIRE(cut_dev < 0.1);    // cut-plane really is not
+  REQUIRE(cut_dev < morton_dev);
+
+  // And it is not paying for that with more work: cut-plane must be at
+  // least as cheap as Morton in the orientation Morton handles best.
+  INFO("pair work: Morton " << std::min(ma.mean_sq, md.mean_sq)
+                            << ", cut-plane "
+                            << std::max(ca.mean_sq, cd.mean_sq));
+  REQUIRE(std::max(ca.mean_sq, cd.mean_sq) <
+          std::min(ma.mean_sq, md.mean_sq));
+
+  // The mechanism, so a failure above says which half broke: cut-plane
+  // batches are more compact, which shows up directly as box volume.
+  INFO("mean box volume: Morton aligned " << ma.mean_box_vol
+                                          << ", cut-plane aligned "
+                                          << ca.mean_box_vol);
+  REQUIRE(ca.mean_box_vol < ma.mean_box_vol);
+  REQUIRE(cd.mean_box_vol < md.mean_box_vol);
+}
+
+TEST_CASE("The neighbour list is exactly the blocks that reach the box",
+          "[scaling][alkane][neighborlist]") {
+  // The correctness statement behind the numbers above, checked by brute
+  // force against every (box, block) pair: a block belongs in box b's list
+  // if and only if some point of box b lies within that block's cutoff.
+  // Both directions matter. A missing entry is a wrong answer; a spurious
+  // one is wasted work that no integration test would ever report, which is
+  // exactly how a loose neighbour list survives unnoticed.
+  const size_t nrad = 14, lmax = 11;
+  const int mppb = 256;
+
+  for (auto axis : {test::ChainAxis::Aligned, test::ChainAxis::Diagonal}) {
+    auto mol = test::alkane(6, axis);
+    const auto host = test::sto3g_basis(mol);
+    const GTOEvaluator ev(make_gto_device_basis(host));
+    auto grid = make_flat_grid<ta_type, ll_type>(mol, nrad, lmax);
+    const int npts = static_cast<int>(grid.quad_points.extent(0));
+
+    auto bb = create_bounding_boxes(grid, mppb);
+    NeighborList nl;
+    build_neighbor_list(ev, bb, mppb, grid.quad_points, nl);
+
+    auto off = Kokkos::create_mirror_view_and_copy(HostSpace{}, nl.offsets);
+    auto nbr = Kokkos::create_mirror_view_and_copy(HostSpace{}, nl.neighbors);
+    auto pts =
+        Kokkos::create_mirror_view_and_copy(HostSpace{}, grid.quad_points);
+    auto cen = Kokkos::create_mirror_view_and_copy(HostSpace{}, ev.centers());
+    auto rad = Kokkos::create_mirror_view_and_copy(HostSpace{}, ev.radii());
+
+    const int nblocks = static_cast<int>(cen.extent(0));
+    const int nboxes = static_cast<int>(off.extent(0)) - 1;
+    REQUIRE(nboxes == (npts + mppb - 1) / mppb);
+
+    long listed = 0;
+    for (int b = 0; b < nboxes; ++b) {
+      const int p0 = b * mppb;
+      const int p1 = std::min(p0 + mppb, npts);
+
+      // Truth: brute force over this box's points.
+      std::vector<bool> truth(nblocks, false);
+      for (int j = 0; j < nblocks; ++j) {
+        const double r2 = rad(j) * rad(j);
+        for (int p = p0; p < p1 && !truth[j]; ++p) {
+          double d2 = 0.0;
+          for (int k = 0; k < 3; ++k) {
+            const double t = pts(p)[k] - cen(j)[k];
+            d2 += t * t;
+          }
+          if (d2 <= r2)
+            truth[j] = true;
+        }
+      }
+
+      std::vector<bool> got(nblocks, false);
+      for (int e = off(b); e < off(b + 1); ++e) {
+        INFO("box " << b << " lists block " << nbr(e) << " twice or out of "
+                    << "range");
+        REQUIRE(nbr(e) >= 0);
+        REQUIRE(nbr(e) < nblocks);
+        REQUIRE(!got[nbr(e)]);
+        got[nbr(e)] = true;
+        ++listed;
+      }
+      // Sorted, which the screened kernels rely on.
+      for (int e = off(b) + 1; e < off(b + 1); ++e)
+        REQUIRE(nbr(e - 1) < nbr(e));
+
+      for (int j = 0; j < nblocks; ++j) {
+        INFO("box " << b << ", block " << j << ": listed " << got[j]
+                    << ", reaches a point " << truth[j]);
+        REQUIRE(got[j] == truth[j]);
+      }
+    }
+    // A list that came out empty would pass every assertion above.
+    REQUIRE(listed > nboxes);
   }
 }
 

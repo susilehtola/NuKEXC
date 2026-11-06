@@ -388,13 +388,13 @@ int main(int argc, char *argv[]) {
       {
         TIME_SCOPE(startup_timing, "Bounding boxes + neighbor list (aux)");
         auto bb_aux = create_bounding_boxes(grid, cfg.max_points_per_box);
-        build_neighbor_list(STOPrimitiveEvaluator(basis_aux), bb_aux, cfg.max_points_per_box, N_quad,
+        build_neighbor_list(STOPrimitiveEvaluator(basis_aux), bb_aux, cfg.max_points_per_box, grid.quad_points,
                             nl_aux, cfg.nl_histogram, "neighbor_histogram_aux");
       }
       {
         TIME_SCOPE(startup_timing, "Bounding boxes + neighbor list (primary)");
         auto bb = create_bounding_boxes(grid, cfg.max_points_per_box);
-        build_neighbor_list(STOPrimitiveEvaluator(basis), bb, cfg.max_points_per_box, N_quad, nl,
+        build_neighbor_list(STOPrimitiveEvaluator(basis), bb, cfg.max_points_per_box, grid.quad_points, nl,
                             cfg.nl_histogram, "neighbor_histogram");
       }
     }
