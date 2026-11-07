@@ -79,7 +79,7 @@ Config parse_args(int argc, char *argv[]) {
 
           << "  --basis=<dir>             Basis set directory       (default: "
           << cfg.basis_dir << ")\n"
-          << "  --alg=<string>    Algorithm(screened/scratch/dense) (default: "
+          << "  --alg=<string>      Algorithm (screened/dense)      (default: "
           << cfg.algorithm << ")\n"
           << "  --nrad=<int>              Radial grid points        (default: "
           << cfg.nrad << ")\n"
@@ -254,124 +254,6 @@ void run_benchmark_screened(const Config &cfg) {
   print_results(results, true);
 }
 
-void run_benchmark_scratch(const Config &cfg) {
-  using ta_type = IntegratorXX::TreutlerAhlrichs<double, double>;
-  using ll_type = IntegratorXX::LebedevLaikov<double>;
-
-  std::cout << "\n── Screened Core Hamiltonian ──\n";
-
-  std::vector<BenchmarkResult> results;
-  for (auto &[name, mol] : make_molecules()) {
-    STOBasisSet basis = test::load_adf_basis(mol, cfg.basis_dir, cfg.screening_tol);
-
-    Kokkos::Timer total_timer, grid_timer, nl_timer, core_hamiltonian_timer;
-    total_timer.reset();
-
-    grid_timer.reset();
-    FlatGrid grid = make_flat_grid<ta_type, ll_type>(mol, cfg.nrad, cfg.nang);
-    double t_grid = grid_timer.seconds();
-
-    nl_timer.reset();
-    auto bb = create_bounding_boxes(grid, cfg.max_points_per_box);
-    NeighborList nl;
-    build_neighbor_list(STOPrimitiveEvaluator(basis), bb, cfg.max_points_per_box, grid.quad_points, nl);
-    double t_neighbors = nl_timer.seconds();
-
-    core_hamiltonian_timer.reset();
-    auto hcore = compute_core_hamiltonian_screened_scratch(STOPrimitiveEvaluator(basis), grid, nl);
-
-    double t_core_hamiltonian = core_hamiltonian_timer.seconds();
-
-    const int N = hcore.overlap.extent(0);
-    DeviceView2DLeft mo_coeff("mo_coeff", N, N);
-    DeviceView1D mo_energies("mo_energies", N);
-
-    results.push_back({name, N, (int)grid.quad_points.extent(0), t_grid,
-                       t_neighbors, t_core_hamiltonian, total_timer.seconds()});
-  }
-  print_results(results, true);
-}
-
-void run_benchmark_tiled(const Config &cfg) {
-  using ta_type = IntegratorXX::TreutlerAhlrichs<double, double>;
-  using ll_type = IntegratorXX::LebedevLaikov<double>;
-
-  std::cout << "\n── Screened Core Hamiltonian ──\n";
-
-  std::vector<BenchmarkResult> results;
-  for (auto &[name, mol] : make_molecules()) {
-    STOBasisSet basis = test::load_adf_basis(mol, cfg.basis_dir, cfg.screening_tol);
-
-    Kokkos::Timer total_timer, grid_timer, nl_timer, core_hamiltonian_timer;
-    total_timer.reset();
-
-    grid_timer.reset();
-    FlatGrid grid = make_flat_grid<ta_type, ll_type>(mol, cfg.nrad, cfg.nang);
-    double t_grid = grid_timer.seconds();
-
-    nl_timer.reset();
-    auto bb = create_bounding_boxes(grid, cfg.max_points_per_box);
-    NeighborList nl;
-    build_neighbor_list(STOPrimitiveEvaluator(basis), bb, cfg.max_points_per_box, grid.quad_points, nl);
-    double t_neighbors = nl_timer.seconds();
-
-    core_hamiltonian_timer.reset();
-    auto hcore = compute_core_hamiltonian_screened_tiled(STOPrimitiveEvaluator(basis), grid, nl);
-
-    double t_core_hamiltonian = core_hamiltonian_timer.seconds();
-
-    const int N = hcore.overlap.extent(0);
-    DeviceView2DLeft mo_coeff("mo_coeff", N, N);
-    DeviceView1D mo_energies("mo_energies", N);
-
-    results.push_back({name, N, (int)grid.quad_points.extent(0), t_grid,
-                       t_neighbors, t_core_hamiltonian, total_timer.seconds()});
-  }
-  print_results(results, true);
-}
-
-void run_benchmark_sparse(const Config &cfg) {
-  using ta_type = IntegratorXX::TreutlerAhlrichs<double, double>;
-  using ll_type = IntegratorXX::LebedevLaikov<double>;
-
-  std::cout << "\n── Screened Core Hamiltonian ──\n";
-
-  std::vector<BenchmarkResult> results;
-  for (auto &[name, mol] : make_molecules()) {
-    STOBasisSet basis = test::load_adf_basis(mol, cfg.basis_dir, cfg.screening_tol);
-
-    Kokkos::Timer total_timer, grid_timer, nl_timer, core_hamiltonian_timer;
-    total_timer.reset();
-
-    grid_timer.reset();
-    FlatGrid grid = make_flat_grid<ta_type, ll_type>(mol, cfg.nrad, cfg.nang);
-    double t_grid = grid_timer.seconds();
-
-    nl_timer.reset();
-    auto bb = create_bounding_boxes(grid, cfg.max_points_per_box);
-    NeighborList nl;
-    build_neighbor_list(STOPrimitiveEvaluator(basis), bb, cfg.max_points_per_box, grid.quad_points, nl);
-    double t_neighbors = nl_timer.seconds();
-
-    core_hamiltonian_timer.reset();
-    auto hcore = compute_core_hamiltonian_screened_sparse(STOPrimitiveEvaluator(basis), grid, nl);
-
-    double t_core_hamiltonian = core_hamiltonian_timer.seconds();
-
-    const int N = hcore.overlap.extent(0);
-    DeviceView2DLeft mo_coeff("mo_coeff", N, N);
-    DeviceView1D mo_energies("mo_energies", N);
-
-    results.push_back({name, N, (int)grid.quad_points.extent(0), t_grid,
-                       t_neighbors, t_core_hamiltonian, total_timer.seconds()});
-  }
-  print_results(results, true);
-}
-
-
-
-// ── Main ─────────────────────────────────────────────────────────────────
-
 int main(int argc, char *argv[]) {
   Config cfg;
   try {
@@ -381,20 +263,20 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
+  if (cfg.algorithm != "screened" && cfg.algorithm != "dense") {
+    std::cerr << "Error: unknown algorithm \"" << cfg.algorithm
+              << "\"; expected screened or dense\n";
+    return 1;
+  }
+
   Kokkos::initialize();
   {
     print_config(cfg);
 
     if (cfg.algorithm == "screened")
       run_benchmark_screened(cfg);
-    else if (cfg.algorithm == "scratch")
-      run_benchmark_scratch(cfg);
-    else if (cfg.algorithm == "tiled")
-      run_benchmark_tiled(cfg);
-    else if (cfg.algorithm == "dense")
+    else
       run_benchmark_fused(cfg);
-    else if (cfg.algorithm == "sparse")
-      run_benchmark_sparse(cfg);
  
     std::cout << "\n";
   }
