@@ -42,7 +42,8 @@
 // Same job as host_interface.hpp's XCSession -- hold the collocation and the
 // density across a functional evaluation -- but the Fock assembly comes from
 // libxckernel instead of being written out here, which is what lets it cover
-// meta-GGAs at all.
+// meta-GGAs at all, restricted and unrestricted alike. The hand-written
+// paths in host_interface.hpp stop at GGA in both spin cases.
 //
 // This is deliberately a SEPARATE class rather than a new mode of XCSession.
 // XCSession's hand-written LDA and GGA assembly is validated against ERKALE,
@@ -52,6 +53,17 @@
 // bit-for-bit, and the two are compared in tests/test_xc_kernel_session.cxx.
 // Once meta-GGA parity against ERKALE is established the two can be merged
 // the other way round, with the kernels backing XCSession.
+//
+// RESTRICTED AND UNRESTRICTED IN ONE SESSION
+// ------------------------------------------
+// Spin is a property of the density, not of the basis: the collocation tower
+// is the same for both channels, and it is the expensive thing the session
+// exists to hold. So there is one class with two set_density overloads rather
+// than a restricted and an unrestricted class sharing a base, and an
+// unrestricted evaluation builds the tower exactly once. Which overload was
+// called last is remembered, and the ingredient accessors of the other spin
+// case then throw -- otherwise rho() after set_density(Pa, Pb) would hand
+// back whatever the previous restricted call left behind.
 //
 // The collocation tower is kept rather than split and discarded. XCSession
 // builds the (ncomp, nbf, npts) tower, copies the components into separate
@@ -63,6 +75,7 @@
 // within each component. One copy of the tower is far cheaper than
 // evaluating the basis twice, which is the alternative.
 
+#include <algorithm>
 #include <stdexcept>
 #include <vector>
 
@@ -155,7 +168,7 @@ public:
       tau_h_ = detail::to_host(tau_d_);
     if (family_ == XCFamily::MetaGGALapl)
       lapl_h_ = detail::to_host(lapl_d_);
-    has_density_ = true;
+    spin_ = SpinState::Restricted;
   }
 
   /// Ingredients for the functional, on the host, in Libxc's layouts.
@@ -249,17 +262,234 @@ public:
     if (rc != 0)
       throw std::runtime_error("xc kernel returned " + std::to_string(rc));
 
-    const int ld = Vxc.ld > 0 ? Vxc.ld : n_;
-    for (int i = 0; i < n_; ++i)
-      for (int j = 0; j < n_; ++j) {
-        const double v = V[static_cast<size_t>(i) * n_ + j];
-        const size_t off = (Vxc.layout == MatrixLayout::ColumnMajor)
-                               ? static_cast<size_t>(i) +
-                                     static_cast<size_t>(j) * ld
-                               : static_cast<size_t>(i) * ld +
-                                     static_cast<size_t>(j);
-        Vxc.data[off] += v;
+    scatter(V, Vxc);
+    return out;
+  }
+
+  // ==========================================================================
+  //  Unrestricted (spin-polarized) path
+  // ==========================================================================
+
+  /**
+   *  @brief Contract alpha and beta density matrices onto the grid.
+   *
+   *  Replaces whatever density was set before, restricted or not. The
+   *  collocation is untouched, so switching spin case costs no basis
+   *  evaluation.
+   *
+   *  sigma_ab = grad rho_a . grad rho_b is formed here: it is not something
+   *  compute_density_and_sigma_dm can produce from one density matrix, and
+   *  both spin channels' Fock matrices depend on it.
+   */
+  void set_density(const HostMatrixView &Pa, const HostMatrixView &Pb) {
+    const auto Pad = detail::upload_matrix(Pa, n_, "Pa");
+    const auto Pbd = detail::upload_matrix(Pb, n_, "Pb");
+
+    ra_ = DeviceView1D("rho_a", npts_);
+    rb_ = DeviceView1D("rho_b", npts_);
+
+    if (family_ == XCFamily::LDA) {
+      ra_ = compute_density_dm(chi_, Pad);
+      rb_ = compute_density_dm(chi_, Pbd);
+    } else {
+      saa_ = DeviceView1D("sigma_aa", npts_);
+      sab_ = DeviceView1D("sigma_ab", npts_);
+      sbb_ = DeviceView1D("sigma_bb", npts_);
+      gax_ = DeviceView1D("rho_a_x", npts_);
+      gay_ = DeviceView1D("rho_a_y", npts_);
+      gaz_ = DeviceView1D("rho_a_z", npts_);
+      gbx_ = DeviceView1D("rho_b_x", npts_);
+      gby_ = DeviceView1D("rho_b_y", npts_);
+      gbz_ = DeviceView1D("rho_b_z", npts_);
+      compute_density_and_sigma_dm(chi_, gx_chi_, gy_chi_, gz_chi_, Pad, ra_,
+                                   gax_, gay_, gaz_, saa_);
+      compute_density_and_sigma_dm(chi_, gx_chi_, gy_chi_, gz_chi_, Pbd, rb_,
+                                   gbx_, gby_, gbz_, sbb_);
+      auto ax = gax_, ay = gay_, az = gaz_, bx = gbx_, by = gby_, bz = gbz_,
+           ab = sab_;
+      Kokkos::parallel_for(
+          "sigma_ab", Kokkos::RangePolicy<ExecSpace>(0, npts_),
+          KOKKOS_LAMBDA(const int g) {
+            ab(g) = ax(g) * bx(g) + ay(g) * by(g) + az(g) * bz(g);
+          });
+    }
+
+    if (needs_tau()) {
+      taua_ = DeviceView1D("tau_a", npts_);
+      taub_ = DeviceView1D("tau_b", npts_);
+      lapla_ = DeviceView1D("lapl_rho_a", npts_);
+      laplb_ = DeviceView1D("lapl_rho_b", npts_);
+      // Spin-resolved by construction: compute_meta_fields_dm halves the
+      // raw gradient sum of whichever density matrix it is given, so with
+      // P^alpha it returns Libxc's tau_a rather than half the total.
+      compute_meta_fields_dm(chi_, gx_chi_, gy_chi_, gz_chi_, lapl_chi_, Pad,
+                             taua_, lapla_);
+      compute_meta_fields_dm(chi_, gx_chi_, gy_chi_, gz_chi_, lapl_chi_, Pbd,
+                             taub_, laplb_);
+    }
+    Kokkos::fence();
+
+    const auto ra_h = detail::to_host(ra_);
+    const auto rb_h = detail::to_host(rb_);
+    rho_tot_h_.resize(static_cast<size_t>(npts_));
+    rho_u_h_.resize(2 * static_cast<size_t>(npts_));
+    for (int g = 0; g < npts_; ++g) {
+      rho_u_h_[2 * static_cast<size_t>(g)] = ra_h[g];
+      rho_u_h_[2 * static_cast<size_t>(g) + 1] = rb_h[g];
+      rho_tot_h_[static_cast<size_t>(g)] = ra_h[g] + rb_h[g];
+    }
+
+    if (family_ != XCFamily::LDA) {
+      const auto aa = detail::to_host(saa_), ab = detail::to_host(sab_),
+                 bb = detail::to_host(sbb_);
+      sigma_u_h_.resize(3 * static_cast<size_t>(npts_));
+      for (int g = 0; g < npts_; ++g) {
+        sigma_u_h_[3 * static_cast<size_t>(g)] = aa[g];
+        sigma_u_h_[3 * static_cast<size_t>(g) + 1] = ab[g];
+        sigma_u_h_[3 * static_cast<size_t>(g) + 2] = bb[g];
       }
+      gax_h_u_ = detail::to_host(gax_);
+      gay_h_u_ = detail::to_host(gay_);
+      gaz_h_u_ = detail::to_host(gaz_);
+      gbx_h_u_ = detail::to_host(gbx_);
+      gby_h_u_ = detail::to_host(gby_);
+      gbz_h_u_ = detail::to_host(gbz_);
+    } else {
+      sigma_u_h_.clear();
+    }
+
+    if (needs_tau()) {
+      const auto ta = detail::to_host(taua_), tb = detail::to_host(taub_);
+      tau_u_h_.resize(2 * static_cast<size_t>(npts_));
+      for (int g = 0; g < npts_; ++g) {
+        tau_u_h_[2 * static_cast<size_t>(g)] = ta[g];
+        tau_u_h_[2 * static_cast<size_t>(g) + 1] = tb[g];
+      }
+    } else {
+      tau_u_h_.clear();
+    }
+
+    if (family_ == XCFamily::MetaGGALapl) {
+      const auto la = detail::to_host(lapla_), lb = detail::to_host(laplb_);
+      lapl_u_h_.resize(2 * static_cast<size_t>(npts_));
+      for (int g = 0; g < npts_; ++g) {
+        lapl_u_h_[2 * static_cast<size_t>(g)] = la[g];
+        lapl_u_h_[2 * static_cast<size_t>(g) + 1] = lb[g];
+      }
+    } else {
+      lapl_u_h_.clear();
+    }
+
+    // Sized here rather than in the constructor, which does not know whether
+    // this session will ever be used spin-polarized. Both are no-ops from
+    // the second call on, so an SCF loop still allocates nothing.
+    unpacked_.resize(family_, npts_);
+    work_u_.resize(static_cast<size_t>(
+        xc_fock_work_size_unrestricted(family_, npts_, n_)));
+
+    spin_ = SpinState::Unrestricted;
+  }
+
+  /// Spin-resolved ingredients in Libxc's polarized layout, interleaved per
+  /// point: rho as (a, b), sigma as (aa, ab, bb), tau and lapl as (a, b).
+  /// Ready to hand straight to an XC_POLARIZED functional.
+  const std::vector<double> &rho_spin() const {
+    need_u("rho_spin");
+    return rho_u_h_;
+  }
+  const std::vector<double> &sigma_spin() const {
+    need_u("sigma_spin");
+    have(sigma_u_h_, "sigma_spin");
+    return sigma_u_h_;
+  }
+  const std::vector<double> &tau_spin() const {
+    need_u("tau_spin");
+    have(tau_u_h_, "tau_spin");
+    return tau_u_h_;
+  }
+  const std::vector<double> &lapl_spin() const {
+    need_u("lapl_spin");
+    have(lapl_u_h_, "lapl_spin");
+    return lapl_u_h_;
+  }
+
+  /// Electron count per channel, for the density currently set.
+  double nel_alpha() const {
+    need_u("nel_alpha");
+    return detail::integrate(ra_, grid_.weights);
+  }
+  double nel_beta() const {
+    need_u("nel_beta");
+    return detail::integrate(rb_, grid_.weights);
+  }
+
+  /**
+   *  @brief Accumulate Exc and both spin channels of the XC Fock matrix.
+   *
+   *  @param packed Libxc's polarized derivative arrays as Libxc writes them,
+   *                interleaved per point; de-interleaved internally, so the
+   *                caller never writes that loop
+   *  @param zk     energy density per particle, or null for the matrices
+   *                alone
+   *  @param Vxc_a  accumulated into
+   *  @param Vxc_b  accumulated into
+   *
+   *  Both matrices are needed or neither: two null data pointers give the
+   *  energy and electron counts alone, and exactly one null is a mistake
+   *  rather than a request, so it throws.
+   */
+  XCOutputPolarized accumulate_fock(const XCPackedDerivsU &packed,
+                                    const double *zk,
+                                    const HostMatrixRef &Vxc_a,
+                                    const HostMatrixRef &Vxc_b) {
+    need_u("accumulate_fock");
+
+    XCOutputPolarized out;
+    out.Nel_alpha = detail::integrate(ra_, grid_.weights);
+    out.Nel_beta = detail::integrate(rb_, grid_.weights);
+    out.Nel = out.Nel_alpha + out.Nel_beta;
+    // The energy expression does not know about spin: it is the total
+    // density against zk either way, so the restricted kernel is the right
+    // one and there is no polarized counterpart to reach for.
+    if (zk)
+      out.Exc =
+          xc_energy_restricted(npts_, weights().data(), rho_tot_h_.data(), zk);
+
+    if (!Vxc_a.data && !Vxc_b.data)
+      return out;
+    if (!Vxc_a.data || !Vxc_b.data)
+      throw std::invalid_argument(
+          "XCKernelSession::accumulate_fock: one of Vxc_a and Vxc_b is null. "
+          "Pass both to assemble both channels, or neither for the energy "
+          "alone -- a single channel of an unrestricted XC potential is not "
+          "a meaningful quantity on its own");
+
+    const XCKernelDerivsU d = unpacked_.unpack(family_, npts_, packed);
+    const XCKernelFieldsU fl{
+        .w = weights().data(),
+        .rho_a_x = gax_h_u_.empty() ? nullptr : gax_h_u_.data(),
+        .rho_a_y = gay_h_u_.empty() ? nullptr : gay_h_u_.data(),
+        .rho_a_z = gaz_h_u_.empty() ? nullptr : gaz_h_u_.data(),
+        .rho_b_x = gbx_h_u_.empty() ? nullptr : gbx_h_u_.data(),
+        .rho_b_y = gby_h_u_.empty() ? nullptr : gby_h_u_.data(),
+        .rho_b_z = gbz_h_u_.empty() ? nullptr : gbz_h_u_.data()};
+
+    // One buffer, reused: the two channels differ only in which kernel runs
+    // and where the result lands.
+    std::vector<double> V(static_cast<size_t>(n_) * n_);
+    const auto channel = [&](XCSpin sp, const HostMatrixRef &M) {
+      std::fill(V.begin(), V.end(), 0.0);
+      const int rc =
+          xc_fock_unrestricted(family_, sp, npts_, n_, tower_h_.data(), fl, d,
+                               V.data(), work_u_.data());
+      if (rc != 0)
+        throw std::runtime_error(std::string("xc kernel returned ") +
+                                 std::to_string(rc) + " for the " +
+                                 xc_spin_name(sp) + " channel");
+      scatter(V, M);
+    };
+    channel(XCSpin::Alpha, Vxc_a);
+    channel(XCSpin::Beta, Vxc_b);
     return out;
   }
 
@@ -270,9 +500,42 @@ private:
   }
 
   void need(const char *what) const {
-    if (!has_density_)
+    if (spin_ == SpinState::None)
       throw std::logic_error(std::string("XCKernelSession::") + what +
                              ": set_density has not been called");
+    if (spin_ != SpinState::Restricted)
+      throw std::logic_error(
+          std::string("XCKernelSession::") + what +
+          ": the density currently set is spin-polarized; use the "
+          "spin-resolved accessors and the (Vxc_a, Vxc_b) overload");
+  }
+
+  void need_u(const char *what) const {
+    if (spin_ == SpinState::None)
+      throw std::logic_error(std::string("XCKernelSession::") + what +
+                             ": set_density has not been called");
+    if (spin_ != SpinState::Unrestricted)
+      throw std::logic_error(
+          std::string("XCKernelSession::") + what +
+          ": the density currently set is spin-restricted; use rho(), "
+          "sigma() and the single-matrix overload");
+  }
+
+  /// Copy the kernel's dense (nbf, nbf) block into the caller's matrix,
+  /// accumulating and honouring its layout and leading dimension. Shared by
+  /// the restricted path and both spin channels.
+  void scatter(const std::vector<double> &V, const HostMatrixRef &M) const {
+    const int ld = M.ld > 0 ? M.ld : n_;
+    for (int i = 0; i < n_; ++i)
+      for (int j = 0; j < n_; ++j) {
+        const double v = V[static_cast<size_t>(i) * n_ + j];
+        const size_t off = (M.layout == MatrixLayout::ColumnMajor)
+                               ? static_cast<size_t>(i) +
+                                     static_cast<size_t>(j) * ld
+                               : static_cast<size_t>(i) * ld +
+                                     static_cast<size_t>(j);
+        M.data[off] += v;
+      }
   }
 
   void have(const std::vector<double> &v, const char *what) const {
@@ -366,7 +629,24 @@ private:
   std::vector<double> rho_h_, sigma_h_, gx_h_, gy_h_, gz_h_, tau_h_, lapl_h_;
   mutable std::vector<double> w_h_;
   std::vector<double> work_;
-  bool has_density_ = false;
+
+  /// Which set_density overload was called last.
+  enum class SpinState { None, Restricted, Unrestricted };
+  SpinState spin_ = SpinState::None;
+
+  // Spin-resolved ingredients, used only by the unrestricted path.
+  DeviceView1D ra_, rb_;
+  DeviceView1D gax_, gay_, gaz_, gbx_, gby_, gbz_;
+  DeviceView1D saa_, sab_, sbb_, taua_, taub_, lapla_, laplb_;
+  /// Interleaved for Libxc: (a, b) and (aa, ab, bb) per point.
+  std::vector<double> rho_u_h_, sigma_u_h_, tau_u_h_, lapl_u_h_;
+  /// Total density, for the energy and the electron count.
+  std::vector<double> rho_tot_h_;
+  /// De-interleaved for the kernels.
+  std::vector<double> gax_h_u_, gay_h_u_, gaz_h_u_, gbx_h_u_, gby_h_u_,
+      gbz_h_u_;
+  XCUnpackedDerivsU unpacked_;
+  std::vector<double> work_u_;
 };
 
 } // namespace Nukexc
