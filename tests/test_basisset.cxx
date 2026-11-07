@@ -529,7 +529,10 @@ void benchmark_collocation(Config cfg) {
     // pairwise S(i,j) by reading the cache. This removes the O(neighbors^2 *
     // points) redundant basis_eval_fast calls (and the two live ShellParams)
     // from the hot reduction loop -- the register-pressure fix intended for
-    // compute_coulomb_sparse / compute_exact_exchange_sparse.
+    // the screened Coulomb and exchange kernels. The Coulomb one now packs
+    // the collocation per box instead (see nukexc/packed_blocks.hpp), which
+    // removes the redundancy rather than caching it; the exchange one has
+    // not been converted yet.
 
     // Upper bound on neighbors per box, needed to size the phi cache scratch.
     auto offsets_h =
