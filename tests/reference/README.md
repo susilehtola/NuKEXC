@@ -168,9 +168,14 @@ reaches the kernels through a string-keyed dispatch table and NuKEXC through
 libxckernel's named structs, so a swapped same-spin and cross-spin sigma
 derivative, or a `vlapl` in the `vrho` slot, cannot survive the comparison.
 
-Closing the remaining gap needs an ERKALE from before the libxckernel switch,
-whose `increment_lda` / `increment_gga` / `increment_mgga_kin` assembly was
-hand-written and therefore genuinely independent.
+That gap is closed without a second implementation of the derivative at all.
+`tests/test_xc_finite_difference.cxx` differentiates the energy numerically
+with respect to every element of both spin density matrices and compares
+against the kernels' matrices; an energy needs no chain rule, so nothing
+generated appears on the reference side. The two tests are complementary and
+neither stands alone: the numerical derivative is taken through the same
+ingredients this file validates, and this file validates ingredients whose
+derivative it cannot check.
 
 ### Current agreement
 
