@@ -381,23 +381,17 @@ int main(int argc, char *argv[]) {
     // point ordering while grid.weights uses the post-permutation ordering,
     // which silently corrupts every subsequent quadrature
 
-    NeighborList nl;     // primary basis neighbor list (K/J sparse)
-    NeighborList nl_aux; // auxiliary basis neighbor list (aux overlap sparse)
+    NeighborList nl; // primary basis neighbor list (J and K, screened)
 
+    // The auxiliary basis no longer gets one: the only thing that used it was
+    // the screened fitting metric, and the metric cannot be screened at all
+    // (see coulomb_overlap_metric). That also removes a second
+    // create_bounding_boxes call, which permuted the grid a second time.
     if (use_neighbor_path) {
-      TIME_SCOPE(startup_timing, "Build neighbor lists (sparse)");
-      {
-        TIME_SCOPE(startup_timing, "Bounding boxes + neighbor list (aux)");
-        auto bb_aux = create_bounding_boxes(grid, cfg.max_points_per_box);
-        build_neighbor_list(STOPrimitiveEvaluator(basis_aux), bb_aux, cfg.max_points_per_box, grid.quad_points,
-                            nl_aux, cfg.nl_histogram, "neighbor_histogram_aux");
-      }
-      {
-        TIME_SCOPE(startup_timing, "Bounding boxes + neighbor list (primary)");
-        auto bb = create_bounding_boxes(grid, cfg.max_points_per_box);
-        build_neighbor_list(STOPrimitiveEvaluator(basis), bb, cfg.max_points_per_box, grid.quad_points, nl,
-                            cfg.nl_histogram, "neighbor_histogram");
-      }
+      TIME_SCOPE(startup_timing, "Build neighbor list (screened)");
+      auto bb = create_bounding_boxes(grid, cfg.max_points_per_box);
+      build_neighbor_list(STOPrimitiveEvaluator(basis), bb, cfg.max_points_per_box, grid.quad_points, nl,
+                          cfg.nl_histogram, "neighbor_histogram");
     }
 
     // ---- Collocations (dense path and/or DFT quadrature) ------------------
@@ -443,14 +437,13 @@ int main(int argc, char *argv[]) {
     }
 
     // ---- Auxiliary overlap (A|B), dense / sparse / tiled -------------------
-    if (is_tiled) {
-      TIME_SCOPE(startup_timing, "Auxiliary Coulomb overlap (tiled)");
+    if (is_tiled || is_sparse) {
+      // One matrix, built the same way for both: the metric cannot be
+      // screened (the Coulomb potential has a 1/r tail), so the tiled and
+      // sparse variants differed only in how they staged the evaluations.
+      TIME_SCOPE(startup_timing, "Auxiliary Coulomb overlap (chunked GEMM)");
       aux_overlap_sym =
-          coulomb_overlap_integral_tiled(space, STOPotentialEvaluator(basis_aux), grid, nl_aux, tile);
-    } else if (is_sparse) {
-      TIME_SCOPE(startup_timing, "Auxiliary Coulomb overlap (sparse)");
-      aux_overlap_sym =
-          coulomb_overlap_integral_sparse(space, STOPotentialEvaluator(basis_aux), grid, nl_aux);
+          coulomb_overlap_metric(space, STOPotentialEvaluator(basis_aux), grid);
     } else {
       TIME_SCOPE(startup_timing, "Auxiliary Coulomb overlap (dense GEMM)");
       KokkosBlas::gemm(space, "N", "T", 1.0, basis_aux_collocation,
@@ -631,11 +624,12 @@ int main(int argc, char *argv[]) {
       {
         TIME_SCOPE(fock_timing, "Coulomb (J) build");
         DeviceView2DLeft J;
-        if (is_tiled) {
-          J = compute_coulomb_tiled(space, k_C_tot, k_occ_tot, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux),
-                                    grid, nl, half_inverse_X, tile);
-        } else if (is_sparse) {
-          J = compute_coulomb_sparse(space, k_C_tot, k_occ_tot, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl, half_inverse_X);
+        if (is_tiled || is_sparse) {
+          // compute_coulomb_tiled and compute_coulomb_sparse were the same
+          // matrix reached by two routes, and both evaluated a shell once
+          // per neighbour pair. compute_coulomb_screened replaces them, so
+          // --tile now affects only the exchange build.
+          J = compute_coulomb_screened(space, k_C_tot, k_occ_tot, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl, half_inverse_X);
         } else {
           J = compute_coulomb(space, k_C_tot, k_occ_tot, basis_collocation,
                               basis_aux_collocation,

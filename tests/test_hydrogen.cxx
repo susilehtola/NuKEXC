@@ -632,8 +632,8 @@ TEST_CASE("compute_coulomb -- hydrogen 1s self-repulsion", "[coulomb]") {
   REQUIRE_THAT(J_h(0, 0), Catch::Matchers::WithinRel(5.0 / 8.0, 1e-10));
 }
 
-TEST_CASE("compute_coulomb sparse -- hydrogen 1s self-repulsion",
-          "[coulomb][sparse]") {
+TEST_CASE("compute_coulomb screened -- hydrogen 1s self-repulsion",
+          "[coulomb][screened]") {
   Molecule mol(std::vector<std::vector<double>>{{0., 0., 0.}},
                std::vector<unsigned>{1u});
   auto grid = make_flat_grid<bk_type, ll_type>(mol, 100, 20);
@@ -668,15 +668,13 @@ TEST_CASE("compute_coulomb sparse -- hydrogen 1s self-repulsion",
   NeighborList nl;
   build_neighbor_list(STOPrimitiveEvaluator(basis), bb, max_points_per_box, grid.quad_points,
                       nl);
-  NeighborList nl_aux;
-  build_neighbor_list(STOPrimitiveEvaluator(basis_aux), bb, max_points_per_box, grid.quad_points, nl_aux);
 
   // Compute (A|B)
   DeviceView2DLeft aux_overlap_sym =
-      coulomb_overlap_integral_sparse(space, STOPotentialEvaluator(basis_aux), grid, nl_aux);
+      coulomb_overlap_metric(space, STOPotentialEvaluator(basis_aux), grid);
   DeviceView2DLeft half_inverse_X = compute_half_inverse(aux_overlap_sym, 1e-4);
 
-  DeviceView2DLeft J = compute_coulomb_sparse(space, mo_orbitals, mo_coeff, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl, half_inverse_X);
+  DeviceView2DLeft J = compute_coulomb_screened(space, mo_orbitals, mo_coeff, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl, half_inverse_X);
 
   auto J_h = Kokkos::create_mirror_view(J);
   Kokkos::deep_copy(J_h, J);
@@ -793,12 +791,10 @@ TEST_CASE("compute_exchange sparse -- hydrogen 1s self-exchange",
   NeighborList nl;
   build_neighbor_list(STOPrimitiveEvaluator(basis), bb, max_points_per_box, grid.quad_points,
                       nl);
-  NeighborList nl_aux;
-  build_neighbor_list(STOPrimitiveEvaluator(basis_aux), bb, max_points_per_box, grid.quad_points, nl_aux);
 
   // Compute (A|B)
   DeviceView2DLeft aux_overlap_sym =
-      coulomb_overlap_integral_sparse(space, STOPotentialEvaluator(basis_aux), grid, nl_aux);
+      coulomb_overlap_metric(space, STOPotentialEvaluator(basis_aux), grid);
   DeviceView2DLeft half_inverse_X = compute_half_inverse(aux_overlap_sym, 1e-4);
 
   DeviceView2DLeft K = compute_exact_exchange_sparse(space, mo_orbitals, mo_coeff, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl, half_inverse_X);
@@ -909,44 +905,6 @@ TEST_CASE("compute_gga -- hydrogen 1s gga", "[gga]") {
                Catch::Matchers::WithinRel(ref_potential, 1e-10));
 }
 
-TEST_CASE("compute_coulomb_tiled -- hydrogen 1s self-repulsion",
-          "[coulomb][tiled]") {
-  Molecule mol(std::vector<std::vector<double>>{{0., 0., 0.}},
-               std::vector<unsigned>{1u});
-  auto grid = make_flat_grid<bk_type, ll_type>(mol, 100, 20);
-  STOBasisSet basis = make_manual_basis({{1, 0, 0, 1.0, 0., 0., 0.}});
-  STOBasisSet basis_aux = make_manual_basis({
-      {1, 0, 0, 0.5, 0., 0., 0.},
-      {1, 0, 0, 1.0, 0., 0., 0.},
-      {1, 0, 0, 2.0, 0., 0., 0.},
-      {1, 0, 0, 3.0, 0., 0., 0.},
-      {1, 0, 0, 4.0, 0., 0., 0.},
-  });
-  DeviceView2DLeft mo_orbitals("Mo orbitals", 1, 1);
-  DeviceView1D mo_coeff("MO coeff", 1);
-  auto orbitals_h = Kokkos::create_mirror_view(mo_orbitals);
-  auto coeff_h = Kokkos::create_mirror_view(mo_coeff);
-  orbitals_h(0, 0) = 1.0;
-  coeff_h(0) = 1.0;
-  Kokkos::deep_copy(mo_orbitals, orbitals_h);
-  Kokkos::deep_copy(mo_coeff, coeff_h);
-
-  ExecSpace space;
-  int max_points_per_box = 32;
-  auto bb = create_bounding_boxes(grid, max_points_per_box);
-  NeighborList nl, nl_aux;
-  build_neighbor_list(STOPrimitiveEvaluator(basis), bb, max_points_per_box, grid.quad_points,
-                      nl);
-  build_neighbor_list(STOPrimitiveEvaluator(basis_aux), bb, max_points_per_box, grid.quad_points, nl_aux);
-  auto aux_overlap_sym =
-      coulomb_overlap_integral_sparse(space, STOPotentialEvaluator(basis_aux), grid, nl_aux);
-  auto half_inverse_X = compute_half_inverse(aux_overlap_sym, 1e-4);
-
-  DeviceView2DLeft J = compute_coulomb_tiled(space, mo_orbitals, mo_coeff, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl, half_inverse_X);
-  auto J_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, J);
-  REQUIRE_THAT(J_h(0, 0), Catch::Matchers::WithinRel(5.0 / 8.0, 1e-10));
-}
-
 TEST_CASE("compute_exact_exchange_tiled -- hydrogen 1s self-exchange",
           "[exchange][tiled]") {
   Molecule mol(std::vector<std::vector<double>>{{0., 0., 0.}},
@@ -972,12 +930,11 @@ TEST_CASE("compute_exact_exchange_tiled -- hydrogen 1s self-exchange",
   ExecSpace space;
   int max_points_per_box = 32;
   auto bb = create_bounding_boxes(grid, max_points_per_box);
-  NeighborList nl, nl_aux;
+  NeighborList nl;
   build_neighbor_list(STOPrimitiveEvaluator(basis), bb, max_points_per_box, grid.quad_points,
                       nl);
-  build_neighbor_list(STOPrimitiveEvaluator(basis_aux), bb, max_points_per_box, grid.quad_points, nl_aux);
   auto aux_overlap_sym =
-      coulomb_overlap_integral_sparse(space, STOPotentialEvaluator(basis_aux), grid, nl_aux);
+      coulomb_overlap_metric(space, STOPotentialEvaluator(basis_aux), grid);
   auto half_inverse_X = compute_half_inverse(aux_overlap_sym, 1e-4);
 
   DeviceView2DLeft K = compute_exact_exchange_tiled(space, mo_orbitals, mo_coeff, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl, half_inverse_X);
@@ -985,8 +942,8 @@ TEST_CASE("compute_exact_exchange_tiled -- hydrogen 1s self-exchange",
   REQUIRE_THAT(K_h(0, 0), Catch::Matchers::WithinRel(5.0 / 8.0, 1e-10));
 }
 
-TEST_CASE("tiled Coulomb/exchange match sparse (multi-tile, tile=1)",
-          "[coulomb][exchange][tiled]") {
+TEST_CASE("Coulomb and exchange agree across their routes (tile=1)",
+          "[coulomb][exchange][tiled][screened]") {
   // Two H atoms, two s-STOs each -> N_bf = 4, so central boxes have several
   // neighbors; tile_size = 1 forces the multi-tile / off-diagonal-block path.
   Molecule mol(std::vector<std::vector<double>>{{0., 0., 0.}, {0., 0., 1.4}},
@@ -1022,33 +979,49 @@ TEST_CASE("tiled Coulomb/exchange match sparse (multi-tile, tile=1)",
   ExecSpace space;
   int max_points_per_box = 32;
   auto bb = create_bounding_boxes(grid, max_points_per_box);
-  NeighborList nl, nl_aux;
+  NeighborList nl;
   build_neighbor_list(STOPrimitiveEvaluator(basis), bb, max_points_per_box, grid.quad_points,
                       nl);
-  build_neighbor_list(STOPrimitiveEvaluator(basis_aux), bb, max_points_per_box, grid.quad_points, nl_aux);
   auto aux_overlap_sym =
-      coulomb_overlap_integral_sparse(space, STOPotentialEvaluator(basis_aux), grid, nl_aux);
+      coulomb_overlap_metric(space, STOPotentialEvaluator(basis_aux), grid);
   auto half_inverse_X = compute_half_inverse(aux_overlap_sym, 1e-6);
 
   const int N_aux = basis_aux.nbf();
 
-  // --- Coulomb overlap metric (A|B): tiled(tile=1) vs sparse, element-wise ---
-  auto aux_overlap_tiled =
-      coulomb_overlap_integral_tiled(space, STOPotentialEvaluator(basis_aux), grid, nl_aux, 1);
-  auto So_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, aux_overlap_sym);
-  auto St_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, aux_overlap_tiled);
-  for (int a = 0; a < N_aux; ++a)
-    for (int b = 0; b < N_aux; ++b)
-      REQUIRE_THAT(St_h(a, b), Catch::Matchers::WithinAbs(So_h(a, b), 1e-9));
+  // --- Coulomb: screened vs dense, element-wise ---
+  // Both are given the SAME fitting metric, so what is compared is the
+  // assembly alone: the dense path builds the full collocation and contracts
+  // it with one global GEMM, the screened path packs per box and scatters.
+  // Two centres and four shells, so the boxes have several neighbours each
+  // and the local numbering is not the identity.
+  const int N_quad = static_cast<int>(grid.quad_points.extent(0));
+  DeviceView2DLeft basis_collocation("basis collocation", N_bf, N_quad);
+  DeviceView2DLeft aux_collocation("aux collocation", N_aux, N_quad);
+  DeviceView2DLeft aux_potential_scaled("aux potential scaled", N_aux, N_quad);
+  ExecSpace fill_space;
+  fill_collocation(fill_space, basis, grid.quad_points, basis_collocation);
+  fill_collocation(fill_space, basis_aux, grid.quad_points, aux_collocation);
+  sto_potential_collocation_scaled(space, basis_aux, grid,
+                                   aux_potential_scaled);
 
-  // --- Coulomb: tiled(tile=1) vs sparse, element-wise ---
-  auto J_sparse = compute_coulomb_sparse(space, mo_orbitals, mo_coeff, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl, half_inverse_X);
-  auto J_tiled = compute_coulomb_tiled(space, mo_orbitals, mo_coeff, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl, half_inverse_X, 1);
-  auto Js_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, J_sparse);
-  auto Jt_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, J_tiled);
+  auto J_dense =
+      compute_coulomb(space, mo_orbitals, mo_coeff, basis_collocation,
+                      aux_collocation, aux_potential_scaled, half_inverse_X);
+  auto J_screened = compute_coulomb_screened(space, mo_orbitals, mo_coeff, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl, half_inverse_X);
+  auto Jd_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, J_dense);
+  auto Js_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, J_screened);
+  double jscale = 0.0;
   for (int a = 0; a < N_bf; ++a)
     for (int b = 0; b < N_bf; ++b)
-      REQUIRE_THAT(Jt_h(a, b), Catch::Matchers::WithinAbs(Js_h(a, b), 1e-9));
+      jscale = std::max(jscale, std::abs(Jd_h(a, b)));
+  REQUIRE(jscale > 1e-3);
+  for (int a = 0; a < N_bf; ++a)
+    for (int b = 0; b < N_bf; ++b) {
+      INFO("J(" << a << ", " << b << "): screened " << Js_h(a, b) << ", dense "
+                << Jd_h(a, b) << ", scale " << jscale);
+      REQUIRE_THAT(Js_h(a, b),
+                   Catch::Matchers::WithinAbs(Jd_h(a, b), 1e-8 * jscale));
+    }
 
   // --- Exchange: tiled(tile=1) vs sparse, element-wise ---
   auto K_sparse = compute_exact_exchange_sparse(space, mo_orbitals, mo_coeff, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl, half_inverse_X);
