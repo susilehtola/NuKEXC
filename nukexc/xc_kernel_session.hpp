@@ -91,6 +91,44 @@
 namespace Nukexc {
 
 /**
+ *  @brief Which kernel family a Libxc functional needs.
+ *
+ *  The mapping lives here because this is where Libxc and the kernels meet:
+ *  xc_kernels.hpp deliberately knows nothing about Libxc (it takes derivative
+ *  arrays, not functionals), while host_interface.hpp knows nothing about
+ *  kernel families.
+ *
+ *  The meta-GGA split is on XC_FLAGS_NEEDS_LAPLACIAN rather than on the
+ *  functional's name. A tau-only meta-GGA handed the Laplacian family would
+ *  still give the right answer -- vlapl comes back zero -- but it would pay
+ *  for a Hessian collocation tower it never reads, and asking the functional
+ *  is both cheaper and not a list to maintain.
+ *
+ *  @throws std::invalid_argument for a family with no kernel (LCA, OEP)
+ */
+inline XCFamily xc_family_of(const xc_func_type &func) {
+  switch (func.info->family) {
+  case XC_FAMILY_LDA:
+  case XC_FAMILY_HYB_LDA:
+    return XCFamily::LDA;
+  case XC_FAMILY_GGA:
+  case XC_FAMILY_HYB_GGA:
+    return XCFamily::GGA;
+  case XC_FAMILY_MGGA:
+  case XC_FAMILY_HYB_MGGA:
+    return (func.info->flags & XC_FLAGS_NEEDS_LAPLACIAN)
+               ? XCFamily::MetaGGALapl
+               : XCFamily::MetaGGATau;
+  default:
+    break;
+  }
+  throw std::invalid_argument(
+      std::string("xc_family_of: no kernel for Libxc family ") +
+      std::to_string(func.info->family) + " (functional " +
+      (func.info->name ? func.info->name : "?") + ")");
+}
+
+/**
  *  @brief Collocation, density and meta ingredients for one functional.
  *
  *  Usage:
