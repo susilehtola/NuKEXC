@@ -38,6 +38,14 @@
 // cancel. Saying so here rather than letting "validated against ERKALE" be
 // read as more than it is.
 //
+// That gap is closed in test_xc_finite_difference.cxx, which needs no second
+// implementation of the derivative: it differentiates the energy numerically
+// with respect to every element of both density matrices and compares against
+// the kernels' matrices. The two tests lean on each other -- this one says the
+// ingredients and the conventions are right, that one says the derivative with
+// respect to them is right -- and neither is sufficient alone, since the
+// numerical derivative is built on the same ingredients it cannot check.
+//
 // What it does verify independently, because the two codes share no code for
 // any of it: the basis evaluation and its ordering, the quadrature grid, the
 // construction of rho, sigma, tau and the Laplacian from a density matrix,

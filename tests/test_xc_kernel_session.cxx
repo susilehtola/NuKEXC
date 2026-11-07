@@ -19,8 +19,11 @@
 // screening rather than an error in either.
 //
 // REDUCTION. For the meta-GGAs there is no hand-written path to compare
-// against -- that is the whole reason for the kernels. But the families
-// nest: a meta-GGA kernel handed vtau = 0 must reproduce the GGA kernel
+// against -- that is the whole reason for the kernels. Their chain rule is
+// checked against a numerical derivative of the energy in
+// test_xc_finite_difference.cxx and their ingredients against ERKALE in
+// test_erkale_xc.cxx; what is left for this file is the wiring, and for
+// that the families nest: a meta-GGA kernel handed vtau = 0 must reproduce the GGA kernel
 // exactly, and the full meta-GGA handed vlapl = 0 must reproduce the
 // tau-only one. Those identities exercise precisely the wiring that is
 // easy to get wrong, since xck_mgga_r_o1 takes its derivative arrays as
@@ -596,8 +599,10 @@ TEST_CASE("The kernel path reproduces the hand-written unrestricted LDA "
 TEST_CASE("A closed-shell density gives the same XC potential restricted "
           "or unrestricted",
           "[xckernel][unrestricted][mgga][gto]") {
-  // The acceptance test for the unrestricted meta-GGA kernels, which have no
-  // hand-written oracle in NuKEXC and no ERKALE comparison yet.
+  // A cheap, exact relation between the restricted and unrestricted kernels.
+  // It was the first check the unrestricted meta-GGA kernels had, before
+  // test_erkale_xc.cxx and test_xc_finite_difference.cxx existed, and it is
+  // worth keeping because it is exact where those two are not.
   //
   // Restricted P parametrizes P^a = P^b = P/2, so for a closed-shell density
   //
