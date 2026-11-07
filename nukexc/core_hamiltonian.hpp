@@ -382,9 +382,13 @@ CoreHamiltonianResult compute_core_hamiltonian_screened(
 
   using policy_type = Kokkos::TeamPolicy<ExecSpace>;
   using member_type = policy_type::member_type;
-  using GemmNT = KokkosBatched::TeamVectorGemm<
-      member_type, KokkosBatched::Trans::NoTranspose,
-      KokkosBatched::Trans::Transpose, KokkosBatched::Algo::Gemm::Unblocked>;
+
+  // The three products are fused into ONE team kernel rather than going
+  // through packed_blocks.hpp's block_gemm_nt, because the weighted copies
+  // are built here and the nuclear term reuses the overlap's buffer: the
+  // team barriers that makes possible are exactly what a sequence of
+  // separate GEMM launches cannot express. The GEMM itself is the shared
+  // PackedGemmNT.
 
   auto nbf_v = L.map.nbf;
   auto npts_v = L.npts;
@@ -400,8 +404,8 @@ CoreHamiltonianResult compute_core_hamiltonian_screened(
     if (nbox <= 0)
       continue;
 
-    pack_collocation_value_grad(basis, grid, nl, L, box_begin, box_end, chi,
-                               grad);
+    pack_collocation<BasisDeriv::Gradient>(basis, grid, nl, L, box_begin,
+                                           box_end, chi, grad);
     ExecSpace().fence();
 
     Kokkos::parallel_for(
@@ -431,7 +435,7 @@ CoreHamiltonianResult compute_core_hamiltonian_screened(
                                  WA(i, g) = w(g0 + g) * A(i, g);
                                });
           team.team_barrier();
-          GemmNT::invoke(team, 1.0, WA, A, 0.0, S);
+          PackedGemmNT::invoke(team, 1.0, WA, A, 0.0, S);
           team.team_barrier();
 
           // Nuclear attraction. WA is reused, hence the barrier above: the
@@ -442,7 +446,7 @@ CoreHamiltonianResult compute_core_hamiltonian_screened(
                 WA(i, g) = w(g0 + g) * vnuc(g0 + g) * A(i, g);
               });
           team.team_barrier();
-          GemmNT::invoke(team, 1.0, WA, A, 0.0, V);
+          PackedGemmNT::invoke(team, 1.0, WA, A, 0.0, V);
 
           // Kinetic energy, all three components in one product.
           Kokkos::parallel_for(Kokkos::TeamThreadMDRange(team, n, 3 * np),
@@ -451,7 +455,7 @@ CoreHamiltonianResult compute_core_hamiltonian_screened(
                                  WG(i, cg) = 0.5 * w(g0 + g) * G(i, cg);
                                });
           team.team_barrier();
-          GemmNT::invoke(team, 1.0, WG, G, 0.0, T);
+          PackedGemmNT::invoke(team, 1.0, WG, G, 0.0, T);
         });
     ExecSpace().fence();
 

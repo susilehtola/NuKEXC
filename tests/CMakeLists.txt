@@ -32,6 +32,7 @@ add_executable(test_meta_fields test_meta_fields.cxx)
 add_executable(test_xc_kernel_session test_xc_kernel_session.cxx)
 add_executable(test_xc_finite_difference test_xc_finite_difference.cxx)
 add_executable(test_core_hamiltonian_shells test_core_hamiltonian_shells.cxx)
+add_executable(test_xc_screened test_xc_screened.cxx)
 add_executable(test_alkane_scaling test_alkane_scaling.cxx)
 add_executable(test_sym3x3 test_sym3x3.cxx)
 
@@ -77,6 +78,7 @@ set(ALL_TEST_TARGETS
     test_xc_kernel_session
     test_xc_finite_difference
     test_core_hamiltonian_shells
+    test_xc_screened
     test_alkane_scaling
     test_sym3x3
 
@@ -122,6 +124,7 @@ add_test( NAME META_FIELDS_TEST COMMAND $<TARGET_FILE:test_meta_fields> )
 add_test( NAME XC_KERNEL_SESSION_TEST COMMAND $<TARGET_FILE:test_xc_kernel_session> )
 add_test( NAME XC_FINITE_DIFFERENCE_TEST COMMAND $<TARGET_FILE:test_xc_finite_difference> )
 add_test( NAME COREH_SHELLS_TEST COMMAND $<TARGET_FILE:test_core_hamiltonian_shells> )
+add_test( NAME XC_SCREENED_TEST COMMAND $<TARGET_FILE:test_xc_screened> )
 add_test( NAME ALKANE_SCALING_TEST COMMAND $<TARGET_FILE:test_alkane_scaling> )
 add_test( NAME SYM3X3_TEST COMMAND $<TARGET_FILE:test_sym3x3> )
 # test_arborx was built but never registered, so nothing ran it.
