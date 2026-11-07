@@ -37,6 +37,7 @@
 #include "basis_evaluator.hpp"
 #include "nukexc_config.hpp"
 #include "octree.hpp"
+#include "packed_blocks.hpp"
 #include "stobasis.hpp"
 
 #include <KokkosBatched_Copy_Decl.hpp>
@@ -97,68 +98,6 @@ DeviceView1D compute_density(const Evaluator basis, const FlatGrid grid,
   return density;
 };
 
-template <typename Evaluator>
-  requires BasisEvaluatorWith<Evaluator, BasisDeriv::Value>
-DeviceView1D compute_density_sparse(const Evaluator basis,
-                                    const FlatGrid grid, const NeighborList nl,
-                                    const DeviceView2DLeft mo_orbitals,
-                                    const DeviceView1D mo_coeff) {
-
-  ExecSpace space;
-  const int N_quad = grid.quad_points.extent(0);
-  const int N_occ = mo_orbitals.extent(1);
-
-  const int max_points_per_box = nl.max_points_per_box;
-  const int num_boxes = nl.offsets.extent(0) - 1;
-
-  DeviceView1D density("density", N_quad);
-
-  Kokkos::TeamPolicy<ExecSpace> policy_boxes(space, num_boxes, Kokkos::AUTO());
-
-  using member_type = Kokkos::TeamPolicy<ExecSpace>::member_type;
-  // Contract the basis in order to get the density
-  Kokkos::parallel_for(
-      "Contract Basis", policy_boxes,
-      KOKKOS_LAMBDA(const member_type &team_member) {
-        const int box_idx = team_member.league_rank();
-        const int start_points = box_idx * max_points_per_box;
-        const int end_points =
-            Kokkos::min(start_points + max_points_per_box, N_quad);
-        const int num_points = end_points - start_points;
-
-        const int start_neighbors = nl.offsets(box_idx);
-        const int num_neighbors = nl.offsets(box_idx + 1) - start_neighbors;
-
-        Kokkos::parallel_for(
-            Kokkos::TeamVectorRange(team_member, num_points),
-            [=](const int local_g) {
-              const int global_g = start_points + local_g;
-              Point point_g = grid.quad_points(global_g);
-
-              for (int global_i = 0; global_i < N_occ; ++global_i) {
-                double psi_i = 0.0;
-                for (int local_j = 0; local_j < num_neighbors; ++local_j) {
-                  // Neighbour-list entries are BLOCKS. For an STO a block is
-                  // one function, so this is the same work as before; for a
-                  // GTO it is one contraction, whose functions all share the
-                  // single evaluation below.
-                  const int blk = nl.neighbors(start_neighbors + local_j);
-                  double phi[Evaluator::max_block_size];
-                  basis.template eval_block<BasisDeriv::Value>(
-                      basis.load_block(blk), point_g[0], point_g[1],
-                      point_g[2], phi, 1);
-                  const int bf0 = basis.block_first_bf(blk);
-                  const int nfun = basis.block_size(blk);
-                  for (int t = 0; t < nfun; ++t)
-                    psi_i += mo_orbitals(bf0 + t, global_i) * phi[t];
-                }
-                density(global_g) += mo_coeff(global_i) * psi_i * psi_i;
-              }
-            });
-      });
-
-  return density;
-};
 
 // ============================================================================
 //  Which contraction to use
@@ -474,82 +413,6 @@ void compute_density_and_sigma(const DeviceView2DLeft collocation_values,
       });
 };
 
-// Sparse counterpart of compute_density_and_sigma. rho, gx_rho, gy_rho and
-// gz_rho are accumulated into, so they must be zero on entry; sigma is
-// overwritten. Each grid point belongs to exactly one box, so a given
-// global_g has a single writer thread.
-template <typename Evaluator>
-  requires BasisEvaluatorWith<Evaluator, BasisDeriv::Gradient>
-void compute_density_and_sigma_sparse(
-    const Evaluator basis, const FlatGrid grid, const NeighborList nl,
-    const DeviceView2DLeft mo_orbitals, const DeviceView1D mo_coeff,
-    DeviceView1D rho, DeviceView1D gx_rho, DeviceView1D gy_rho,
-    DeviceView1D gz_rho, DeviceView1D sigma) {
-
-  ExecSpace space;
-  const int N_quad = grid.quad_points.extent(0);
-  const int N_occ = mo_orbitals.extent(1);
-
-  const int max_points_per_box = nl.max_points_per_box;
-  const int num_boxes = nl.offsets.extent(0) - 1;
-
-  Kokkos::TeamPolicy<ExecSpace> policy_boxes(space, num_boxes, Kokkos::AUTO());
-
-  using member_type = Kokkos::TeamPolicy<ExecSpace>::member_type;
-  // Contract the basis in order to get the density and its gradient
-  Kokkos::parallel_for(
-      "Contract Basis", policy_boxes,
-      KOKKOS_LAMBDA(const member_type &team_member) {
-        const int box_idx = team_member.league_rank();
-        const int start_points = box_idx * max_points_per_box;
-        const int end_points =
-            Kokkos::min(start_points + max_points_per_box, N_quad);
-        const int num_points = end_points - start_points;
-
-        const int start_neighbors = nl.offsets(box_idx);
-        const int num_neighbors = nl.offsets(box_idx + 1) - start_neighbors;
-
-        Kokkos::parallel_for(
-            Kokkos::TeamVectorRange(team_member, num_points),
-            [=](const int local_g) {
-              const int global_g = start_points + local_g;
-              Point point_g = grid.quad_points(global_g);
-
-              for (int global_i = 0; global_i < N_occ; ++global_i) {
-                double psi_i = 0.0;
-                double psi_gx_i = 0.0;
-                double psi_gy_i = 0.0;
-                double psi_gz_i = 0.0;
-                for (int local_j = 0; local_j < num_neighbors; ++local_j) {
-                  const int blk = nl.neighbors(start_neighbors + local_j);
-                  constexpr int MBS = Evaluator::max_block_size;
-                  double buf[basis_ncomp(BasisDeriv::Gradient) * MBS];
-                  basis.template eval_block<BasisDeriv::Gradient>(
-                      basis.load_block(blk), point_g[0], point_g[1],
-                      point_g[2], buf, MBS);
-                  const int bf0 = basis.block_first_bf(blk);
-                  const int nfun = basis.block_size(blk);
-                  for (int t = 0; t < nfun; ++t) {
-                    const double c_ji = mo_orbitals(bf0 + t, global_i);
-                    psi_i += c_ji * buf[BF_VAL * MBS + t];
-                    psi_gx_i += c_ji * buf[BF_DX * MBS + t];
-                    psi_gy_i += c_ji * buf[BF_DY * MBS + t];
-                    psi_gz_i += c_ji * buf[BF_DZ * MBS + t];
-                  }
-                }
-                rho(global_g) += mo_coeff(global_i) * psi_i * psi_i;
-                gx_rho(global_g) += 2.0 * mo_coeff(global_i) * psi_gx_i * psi_i;
-                gy_rho(global_g) += 2.0 * mo_coeff(global_i) * psi_gy_i * psi_i;
-                gz_rho(global_g) += 2.0 * mo_coeff(global_i) * psi_gz_i * psi_i;
-              }
-              // sigma is quadratic in the summed gradient, so it can only be
-              // formed once the loop over occupied orbitals has finished.
-              sigma(global_g) = gx_rho(global_g) * gx_rho(global_g) +
-                                gy_rho(global_g) * gy_rho(global_g) +
-                                gz_rho(global_g) * gz_rho(global_g);
-            });
-      });
-};
 
 // EXPERIMENTAL -- meta-GGA groundwork. Not on any production path and not
 // exercised by any test; its only caller is compute_mgga() in xc_integrals.hpp,
@@ -724,6 +587,149 @@ inline void compute_orbital_densities_and_sigma(
         gz_rho(i, g) = dz;
         sigma(i, g) = dx * dx + dy * dy + dz * dz;
       });
+}
+
+// ============================================================================
+//  Screened density: pack -> GEMM -> contract
+// ============================================================================
+
+/**
+ *  @brief P_uv = sum_k occ_k C_uk C_vk.
+ *
+ *  The screened kernels contract through P rather than through the occupied
+ *  orbitals. Per Blum et al. (Eqs. 27-28) the comparison that decides this
+ *  is N_occ against the BATCH's non-zero function count n_be, not against
+ *  nbf: n_be is bounded by the screening radii while N_occ grows with the
+ *  system, so the density-matrix route is the one that stays O(N) per point.
+ *  It also costs nothing extra for fractional or ensemble occupations.
+ */
+inline DeviceView2DLeft
+density_matrix_from_orbitals(const DeviceView2DLeft &mo_orbitals,
+                             const DeviceView1D &occ) {
+  const int nbf = static_cast<int>(mo_orbitals.extent(0));
+  const int n_occ = static_cast<int>(mo_orbitals.extent(1));
+  if (static_cast<int>(occ.extent(0)) < n_occ)
+    throw std::invalid_argument(
+        "density_matrix_from_orbitals: fewer occupations than orbitals");
+
+  DeviceView2DLeft P("density matrix", nbf, nbf);
+  Kokkos::parallel_for(
+      "density matrix from orbitals",
+      Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {nbf, nbf}),
+      KOKKOS_LAMBDA(const int u, const int v) {
+        double acc = 0.0;
+        for (int k = 0; k < n_occ; ++k)
+          acc += occ(k) * mo_orbitals(u, k) * mo_orbitals(v, k);
+        P(u, v) = acc;
+      });
+  Kokkos::fence();
+  return P;
+}
+
+/**
+ *  @brief rho, and optionally grad rho, on the grid from a density matrix.
+ *
+ *  Per box: pack the collocation once per (shell, point), gather P into the
+ *  box's local block, form X = P_local chi with one GEMM, and contract
+ *
+ *      rho(g)      = sum_i chi(i, g) X(i, g)
+ *      d rho/dc(g) = 2 sum_i dchi_c(i, g) X(i, g)
+ *
+ *  the factor two being the two terms of the product rule, equal because P
+ *  is symmetric. The work is O(sum_b n_be_b^2 npts_b) with ONE shell
+ *  evaluation per (shell, point) -- the orbital-loop kernels this replaces
+ *  re-evaluated every shell once per occupied orbital, so their evaluation
+ *  count carried a factor N_occ that nothing in the mathematics asks for.
+ *
+ *  Every grid point lies in exactly one box, so each output element has a
+ *  single writer and the outputs are assigned rather than accumulated. They
+ *  are zeroed first, since a box with no shells on it writes nothing.
+ */
+template <BasisDeriv Deriv, typename Evaluator>
+  requires BasisEvaluatorWith<Evaluator, Deriv>
+inline void packed_density(const Evaluator &basis, const FlatGrid &grid,
+                           const NeighborList &nl, const PackedBlockLayout &L,
+                           const DeviceView2DLeft &P, DeviceView1D rho,
+                           DeviceView1D gx = DeviceView1D(),
+                           DeviceView1D gy = DeviceView1D(),
+                           DeviceView1D gz = DeviceView1D()) {
+  using policy_type = Kokkos::TeamPolicy<ExecSpace>;
+  using member_type = policy_type::member_type;
+  constexpr bool want_grad = (Deriv == BasisDeriv::Gradient);
+
+  if constexpr (want_grad) {
+    if (gx.extent(0) != rho.extent(0) || gy.extent(0) != rho.extent(0) ||
+        gz.extent(0) != rho.extent(0))
+      throw std::invalid_argument(
+          "packed_density: gradient outputs must match rho in length");
+  }
+
+  Kokkos::deep_copy(rho, 0.0);
+  if constexpr (want_grad) {
+    Kokkos::deep_copy(gx, 0.0);
+    Kokkos::deep_copy(gy, 0.0);
+    Kokkos::deep_copy(gz, 0.0);
+  }
+
+  Kokkos::View<double *> chi("packed chi", L.max_chunk_coll);
+  Kokkos::View<double *> grad("packed grad",
+                              want_grad ? 3 * L.max_chunk_coll : 0);
+  Kokkos::View<double *> X("P chi", L.max_chunk_coll);
+  Kokkos::View<double *> Pblk("P blocks", L.max_chunk_blk);
+
+  auto nbf_v = L.map.nbf;
+  auto npts_v = L.npts;
+  auto coll_off = L.coll_off;
+  const int mppb = nl.max_points_per_box;
+
+  for (size_t c = 0; c + 1 < L.chunk_begin.size(); ++c) {
+    const int b0 = L.chunk_begin[c], b1 = L.chunk_begin[c + 1];
+    const int nbox = b1 - b0;
+
+    pack_collocation<Deriv>(basis, grid, nl, L, b0, b1, chi, grad);
+    gather_packed_blocks(L, b0, b1, P, Pblk);
+    ExecSpace().fence();
+    block_gemm_matrix_times_collocation(L, b0, b1, 1, Pblk, chi, X);
+    ExecSpace().fence();
+
+    Kokkos::parallel_for(
+        "contract packed density", policy_type(nbox, Kokkos::AUTO()),
+        KOKKOS_LAMBDA(const member_type &team) {
+          const int b = b0 + team.league_rank();
+          const int n = nbf_v(b);
+          const int np = npts_v(b);
+          if (n == 0 || np == 0)
+            return;
+          const size_t cb = coll_off(b) - coll_off(b0);
+          const double *chi_b = chi.data() + cb;
+          const double *grad_b = want_grad ? grad.data() + 3 * cb : nullptr;
+          const double *X_b = X.data() + cb;
+          const int g0 = b * mppb;
+
+          Kokkos::parallel_for(
+              Kokkos::TeamVectorRange(team, np), [&](const int g) {
+                double r = 0.0, dx = 0.0, dy = 0.0, dz = 0.0;
+                for (int i = 0; i < n; ++i) {
+                  const double x = X_b[static_cast<size_t>(i) * np + g];
+                  r += chi_b[static_cast<size_t>(i) * np + g] * x;
+                  if constexpr (want_grad) {
+                    const double *gr =
+                        grad_b + static_cast<size_t>(i) * 3 * np;
+                    dx += gr[0 * np + g] * x;
+                    dy += gr[1 * np + g] * x;
+                    dz += gr[2 * np + g] * x;
+                  }
+                }
+                rho(g0 + g) = r;
+                if constexpr (want_grad) {
+                  gx(g0 + g) = 2.0 * dx;
+                  gy(g0 + g) = 2.0 * dy;
+                  gz(g0 + g) = 2.0 * dz;
+                }
+              });
+        });
+    ExecSpace().fence();
+  }
 }
 
 } // namespace Nukexc

@@ -11,11 +11,13 @@ set(SUPPORT ${NUKEXC_TEST_SUPPORT_DIR})
 add_executable(benchmark_partition ${SUPPORT}/standards.cxx benchmark_partition.cxx)
 add_executable(benchmark_coreH     ${SUPPORT}/standards.cxx benchmark_coreH.cxx  ${SUPPORT}/test_io.cxx)
 add_executable(benchmark_cutoff    ${SUPPORT}/standards.cxx benchmark_cutoff.cxx ${SUPPORT}/test_io.cxx)
+add_executable(benchmark_xc        ${SUPPORT}/standards.cxx benchmark_xc.cxx     ${SUPPORT}/test_io.cxx)
 
 set(ALL_BENCHMARK_TARGETS
     benchmark_partition
     benchmark_coreH
     benchmark_cutoff
+    benchmark_xc
 )
 
 # The benchmarks resolve their data with paths relative to the working

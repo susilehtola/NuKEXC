@@ -297,29 +297,32 @@ inline Kokkos::View<double *> nuclear_potential_on_grid(const FlatGrid &grid) {
 }
 
 /**
- *  @brief Pack value and gradient collocation for one chunk of boxes.
+ *  @brief Pack collocation for one chunk of boxes.
  *
  *  One thread per (box, shell, point): the shell is evaluated once and all
  *  of its functions are written, so the evaluation count is
  *  O(sum_b nshell_b * npts_b) rather than the O(nbf_b^2 * npts_b) a
  *  function-pair kernel pays.
  *
+ *  @tparam Deriv  Value packs only chi; Gradient also packs grad.
  *  @param chi   packed (nbf_b, npts_b) blocks, row-major per box
  *  @param grad  packed (nbf_b, 3 * npts_b) blocks, component-major within
  *               the point axis: component c of point g at column
  *               c * npts_b + g. That layout makes the kinetic energy ONE
  *               GEMM over 3 * npts columns instead of three over npts.
+ *               Ignored, and may be a default-constructed View, when
+ *               Deriv is Value.
  */
-template <typename Evaluator>
-  requires BasisEvaluatorWith<Evaluator, BasisDeriv::Gradient>
-inline void pack_collocation_value_grad(const Evaluator &basis,
-                                        const FlatGrid &grid,
-                                        const NeighborList &nl,
-                                        const PackedBlockLayout &L,
-                                        const int box_begin,
-                                        const int box_end,
-                                        Kokkos::View<double *> chi,
-                                        Kokkos::View<double *> grad) {
+template <BasisDeriv Deriv, typename Evaluator>
+  requires BasisEvaluatorWith<Evaluator, Deriv>
+inline void pack_collocation(const Evaluator &basis, const FlatGrid &grid,
+                             const NeighborList &nl,
+                             const PackedBlockLayout &L, const int box_begin,
+                             const int box_end, Kokkos::View<double *> chi,
+                             Kokkos::View<double *> grad =
+                                 Kokkos::View<double *>()) {
+  static_assert(Deriv == BasisDeriv::Value || Deriv == BasisDeriv::Gradient,
+                "pack_collocation packs values or values and gradients");
   using policy_type = Kokkos::TeamPolicy<ExecSpace>;
   using member_type = policy_type::member_type;
 
@@ -336,11 +339,11 @@ inline void pack_collocation_value_grad(const Evaluator &basis,
   auto pts = grid.quad_points;
   const int mppb = nl.max_points_per_box;
 
-  constexpr int NC = basis_ncomp(BasisDeriv::Gradient);
+  constexpr int NC = basis_ncomp(Deriv);
   constexpr int MBS = Evaluator::max_block_size;
 
   Kokkos::parallel_for(
-      "pack collocation value grad", policy_type(nbox, Kokkos::AUTO()),
+      "pack collocation", policy_type(nbox, Kokkos::AUTO()),
       KOKKOS_LAMBDA(const member_type &team) {
         const int b = box_begin + team.league_rank();
         const int nshell = off(b + 1) - off(b);
@@ -351,7 +354,8 @@ inline void pack_collocation_value_grad(const Evaluator &basis,
 
         const size_t cb = coll_off(b) - coll_off(box_begin);
         double *chi_b = chi.data() + cb;
-        double *grad_b = grad.data() + 3 * cb;
+        double *grad_b =
+            (Deriv == BasisDeriv::Gradient) ? grad.data() + 3 * cb : nullptr;
         const int g0 = b * mppb;
 
         Kokkos::parallel_for(
@@ -364,16 +368,18 @@ inline void pack_collocation_value_grad(const Evaluator &basis,
               const Point p = pts(g0 + g);
 
               double local[NC * MBS];
-              basis.template eval_block<BasisDeriv::Gradient>(
-                  basis.load_block(blk), p[0], p[1], p[2], local, MBS);
+              basis.template eval_block<Deriv>(basis.load_block(blk), p[0],
+                                               p[1], p[2], local, MBS);
 
               for (int i = 0; i < n; ++i) {
                 const size_t row = static_cast<size_t>(l0 + i);
                 chi_b[row * np + g] = local[BF_VAL * MBS + i];
-                double *gr = grad_b + row * 3 * static_cast<size_t>(np);
-                gr[0 * np + g] = local[BF_DX * MBS + i];
-                gr[1 * np + g] = local[BF_DY * MBS + i];
-                gr[2 * np + g] = local[BF_DZ * MBS + i];
+                if constexpr (Deriv == BasisDeriv::Gradient) {
+                  double *gr = grad_b + row * 3 * static_cast<size_t>(np);
+                  gr[0 * np + g] = local[BF_DX * MBS + i];
+                  gr[1 * np + g] = local[BF_DY * MBS + i];
+                  gr[2 * np + g] = local[BF_DZ * MBS + i];
+                }
               }
             });
       });
@@ -423,5 +429,257 @@ inline void scatter_packed_blocks(const PackedBlockLayout &L,
             });
       });
 }
+
+/// Team-vector GEMM of one box's blocks, A B^T.
+using PackedGemmNT = KokkosBatched::TeamVectorGemm<
+    Kokkos::TeamPolicy<ExecSpace>::member_type,
+    KokkosBatched::Trans::NoTranspose, KokkosBatched::Trans::Transpose,
+    KokkosBatched::Algo::Gemm::Unblocked>;
+
+/// Team-vector GEMM of one box's blocks, A B.
+using PackedGemmNN = KokkosBatched::TeamVectorGemm<
+    Kokkos::TeamPolicy<ExecSpace>::member_type,
+    KokkosBatched::Trans::NoTranspose, KokkosBatched::Trans::NoTranspose,
+    KokkosBatched::Algo::Gemm::Unblocked>;
+
+/**
+ *  @brief Per box: blocks_b = alpha * A_b B_b^T.
+ *
+ *  A_b and B_b are packed (nbf_b, ncol_mult * npts_b) collocation-shaped
+ *  buffers and blocks_b is the (nbf_b, nbf_b) matrix block. One team per
+ *  box, so the whole chunk is one kernel launch.
+ *
+ *  ncol_mult is 1 for a value block and 3 for a gradient block, where the
+ *  three Cartesian components are laid out along the point axis and the
+ *  contraction runs over all of them at once.
+ */
+inline void block_gemm_nt(const PackedBlockLayout &L, const int box_begin,
+                          const int box_end, const int ncol_mult,
+                          const double alpha, const Kokkos::View<double *> &A,
+                          const Kokkos::View<double *> &B,
+                          const Kokkos::View<double *> &blocks) {
+  using policy_type = Kokkos::TeamPolicy<ExecSpace>;
+  using member_type = policy_type::member_type;
+
+  const int nbox = box_end - box_begin;
+  if (nbox <= 0)
+    return;
+
+  auto nbf_v = L.map.nbf;
+  auto npts_v = L.npts;
+  auto coll_off = L.coll_off;
+  auto blk_off = L.blk_off;
+
+  Kokkos::parallel_for(
+      "block gemm A B^T", policy_type(nbox, Kokkos::AUTO()),
+      KOKKOS_LAMBDA(const member_type &team) {
+        const int b = box_begin + team.league_rank();
+        const int n = nbf_v(b);
+        const int np = npts_v(b);
+        if (n == 0 || np == 0)
+          return;
+        const size_t cb =
+            ncol_mult * (coll_off(b) - coll_off(box_begin));
+        const size_t bb = blk_off(b) - blk_off(box_begin);
+        const int ncol = ncol_mult * np;
+
+        PackedMatrix Am(A.data() + cb, n, ncol);
+        PackedMatrix Bm(B.data() + cb, n, ncol);
+        PackedMatrix Cm(blocks.data() + bb, n, n);
+        PackedGemmNT::invoke(team, alpha, Am, Bm, 0.0, Cm);
+      });
+}
+
+/**
+ *  @brief Per box: out_b = A_b B_b, with A_b an (nbf_b, nbf_b) matrix block.
+ *
+ *  The shape the density takes: a gathered density-matrix block times the
+ *  box's collocation, giving a collocation-shaped result.
+ */
+inline void block_gemm_matrix_times_collocation(
+    const PackedBlockLayout &L, const int box_begin, const int box_end,
+    const int ncol_mult, const Kokkos::View<double *> &A,
+    const Kokkos::View<double *> &B, const Kokkos::View<double *> &out) {
+  using policy_type = Kokkos::TeamPolicy<ExecSpace>;
+  using member_type = policy_type::member_type;
+
+  const int nbox = box_end - box_begin;
+  if (nbox <= 0)
+    return;
+
+  auto nbf_v = L.map.nbf;
+  auto npts_v = L.npts;
+  auto coll_off = L.coll_off;
+  auto blk_off = L.blk_off;
+
+  Kokkos::parallel_for(
+      "block gemm A B", policy_type(nbox, Kokkos::AUTO()),
+      KOKKOS_LAMBDA(const member_type &team) {
+        const int b = box_begin + team.league_rank();
+        const int n = nbf_v(b);
+        const int np = npts_v(b);
+        if (n == 0 || np == 0)
+          return;
+        const size_t cb = ncol_mult * (coll_off(b) - coll_off(box_begin));
+        const size_t bb = blk_off(b) - blk_off(box_begin);
+        const int ncol = ncol_mult * np;
+
+        PackedMatrix Am(A.data() + bb, n, n);
+        PackedMatrix Bm(B.data() + cb, n, ncol);
+        PackedMatrix Cm(out.data() + cb, n, ncol);
+        PackedGemmNN::invoke(team, 1.0, Am, Bm, 0.0, Cm);
+      });
+}
+
+/**
+ *  @brief Gather a global matrix into packed (nbf_b, nbf_b) blocks.
+ *
+ *  The inverse of scatter_packed_blocks, through the same local-to-global
+ *  map: blocks_b(i, j) = global(l2g(i), l2g(j)). A box's shells appear once
+ *  in its neighbour list, so no element is read twice into one block.
+ */
+inline void gather_packed_blocks(const PackedBlockLayout &L,
+                                 const int box_begin, const int box_end,
+                                 const DeviceView2DLeft &global,
+                                 const Kokkos::View<double *> &blocks) {
+  using policy_type = Kokkos::TeamPolicy<ExecSpace>;
+  using member_type = policy_type::member_type;
+
+  const int nbox = box_end - box_begin;
+  if (nbox <= 0)
+    return;
+
+  auto nbf_v = L.map.nbf;
+  auto blk_off = L.blk_off;
+  auto bf_off = L.bf_off;
+  auto l2g = L.loc2glob;
+
+  Kokkos::parallel_for(
+      "gather packed blocks", policy_type(nbox, Kokkos::AUTO()),
+      KOKKOS_LAMBDA(const member_type &team) {
+        const int b = box_begin + team.league_rank();
+        const int n = nbf_v(b);
+        if (n == 0)
+          return;
+        double *blk = blocks.data() + (blk_off(b) - blk_off(box_begin));
+        const size_t base = bf_off(b);
+
+        Kokkos::parallel_for(
+            Kokkos::TeamThreadMDRange<Kokkos::Rank<2>, member_type>(team, n, n),
+            [&](const int i, const int j) {
+              blk[static_cast<size_t>(i) * n + j] =
+                  global(l2g(base + i), l2g(base + j));
+            });
+      });
+}
+
+/**
+ *  @brief out += Z chi^T over the whole grid, with Z built pointwise.
+ *
+ *  Every screened one-electron quadrature has this shape: a per-point
+ *  operand times the collocation on one index, contracted against the bare
+ *  collocation on the other. The Coulomb matrix takes Z = w v_J chi, the
+ *  LDA potential Z = w v_rho chi, the GGA potential adds the gradient term,
+ *  and the overlap is the Z = w chi case.
+ *
+ *  `zf` is called as zf(g, chi, dx, dy, dz) with g the GLOBAL point index
+ *  and the four collocation values of one local function at that point. It
+ *  must carry the quadrature weight itself, since only the caller knows
+ *  whether the weight belongs on this factor or the other one. With
+ *  Deriv == Value the three derivative arguments are zero and must not be
+ *  used.
+ *
+ *  The result is NOT symmetrized: Z chi^T is symmetric only when Z is a
+ *  multiple of chi, so the GGA caller has to add the transpose. The caller
+ *  also zeroes `out`, because a caller summing several contributions wants
+ *  them accumulated.
+ */
+template <BasisDeriv Deriv, typename Evaluator, typename ZFunctor>
+  requires BasisEvaluatorWith<Evaluator, Deriv>
+inline void accumulate_collocation_product(const Evaluator &basis,
+                                           const FlatGrid &grid,
+                                           const NeighborList &nl,
+                                           const PackedBlockLayout &L,
+                                           const ZFunctor zf,
+                                           const DeviceView2DLeft &out) {
+  using policy_type = Kokkos::TeamPolicy<ExecSpace>;
+  using member_type = policy_type::member_type;
+  constexpr bool want_grad = (Deriv == BasisDeriv::Gradient);
+
+  // Allocated once at the largest chunk and reused, so the loop over chunks
+  // does not allocate.
+  Kokkos::View<double *> chi("packed chi", L.max_chunk_coll);
+  Kokkos::View<double *> grad("packed grad",
+                              want_grad ? 3 * L.max_chunk_coll : 0);
+  Kokkos::View<double *> Z("packed Z", L.max_chunk_coll);
+  Kokkos::View<double *> blocks("packed blocks", L.max_chunk_blk);
+
+  auto nbf_v = L.map.nbf;
+  auto npts_v = L.npts;
+  auto coll_off = L.coll_off;
+  const int mppb = nl.max_points_per_box;
+
+  for (size_t c = 0; c + 1 < L.chunk_begin.size(); ++c) {
+    const int b0 = L.chunk_begin[c], b1 = L.chunk_begin[c + 1];
+    const int nbox = b1 - b0;
+
+    pack_collocation<Deriv>(basis, grid, nl, L, b0, b1, chi, grad);
+
+    Kokkos::parallel_for(
+        "build Z", policy_type(nbox, Kokkos::AUTO()),
+        KOKKOS_LAMBDA(const member_type &team) {
+          const int b = b0 + team.league_rank();
+          const int n = nbf_v(b);
+          const int np = npts_v(b);
+          if (n == 0 || np == 0)
+            return;
+          const size_t cb = coll_off(b) - coll_off(b0);
+          const double *chi_b = chi.data() + cb;
+          const double *grad_b = want_grad ? grad.data() + 3 * cb : nullptr;
+          double *Z_b = Z.data() + cb;
+          const int g0 = b * mppb;
+
+          Kokkos::parallel_for(
+              Kokkos::TeamThreadMDRange<Kokkos::Rank<2>, member_type>(team, n,
+                                                                      np),
+              [&](const int i, const int g) {
+                const size_t row = static_cast<size_t>(i);
+                double dx = 0.0, dy = 0.0, dz = 0.0;
+                if constexpr (want_grad) {
+                  const double *gr =
+                      grad_b + row * 3 * static_cast<size_t>(np);
+                  dx = gr[0 * np + g];
+                  dy = gr[1 * np + g];
+                  dz = gr[2 * np + g];
+                }
+                Z_b[row * np + g] =
+                    zf(g0 + g, chi_b[row * np + g], dx, dy, dz);
+              });
+        });
+
+    block_gemm_nt(L, b0, b1, 1, 1.0, Z, chi, blocks);
+    scatter_packed_blocks(L, b0, b1, blocks, out);
+  }
+  Kokkos::fence();
+}
+
+/**
+ *  @brief Z = w(g) v(g) chi: the pointwise weight an LDA potential, a
+ *         Coulomb matrix or an overlap takes in
+ *         accumulate_collocation_product.
+ *
+ *  A named functor rather than a lambda because a device lambda defined
+ *  inside another lambda is not portable, and because this shape is wanted
+ *  by more than one caller.
+ */
+template <typename WView, typename VView> struct WeightedCollocation {
+  WView w;
+  VView v;
+  KOKKOS_INLINE_FUNCTION double operator()(const int g, const double chi,
+                                           const double, const double,
+                                           const double) const {
+    return w(g) * v(g) * chi;
+  }
+};
 
 } // namespace Nukexc
