@@ -40,79 +40,21 @@
 #include <nukexc/density.hpp>
 #include <nukexc/molecule.hpp>
 
+#include "erkale_ref_reader.hpp"
+
 using namespace Nukexc;
 using ta_type = IntegratorXX::TreutlerAhlrichs<double, double>;
 using ll_type = IntegratorXX::LebedevLaikov<double>;
 
 namespace {
 
-struct Reference {
-  GTOBasisSet<double> basis;
-  std::vector<double> overlap; // row-major nbf x nbf
-  int nbf = 0;
-};
+using Reference = test::ErkaleReference;
 
+/// The parser is shared with test_erkale_xc.cxx; see erkale_ref_reader.hpp.
+/// The overlap is a named block in the file, read as nbf x nbf row-major.
 Reference load_reference(const std::string &path) {
-  std::ifstream in(path);
-  if (!in)
-    throw std::runtime_error("cannot open reference " + path +
-                             " (see tests/reference/README.md)");
-
-  std::vector<GTOShell<double>> shells;
-  std::vector<double> S;
-  int nbf = 0;
-  std::string line;
-
-  while (std::getline(in, line)) {
-    if (line.empty() || line[0] == '#')
-      continue;
-    std::istringstream ss(line);
-    std::string tag;
-    ss >> tag;
-
-    if (tag == "nbf") {
-      ss >> nbf;
-    } else if (tag == "shell") {
-      int l, sph, nprim, nctr;
-      double ox, oy, oz;
-      ss >> l >> sph >> ox >> oy >> oz >> nprim >> nctr;
-
-      std::vector<double> alpha(nprim), coeff(static_cast<size_t>(nprim) * nctr);
-      for (int p = 0; p < nprim; ++p) {
-        std::getline(in, line);
-        std::istringstream es(line);
-        std::string t;
-        es >> t >> alpha[p];
-      }
-      for (size_t c = 0; c < coeff.size(); ++c) {
-        std::getline(in, line);
-        std::istringstream cs(line);
-        std::string t;
-        cs >> t >> coeff[c];
-      }
-
-      // ERKALE writes coefficients of UNNORMALIZED primitives, already
-      // normalized -- exactly NormalizationConvention::ERKALE's output. Ask
-      // for that convention rather than None so this also checks that
-      // renormalizing an already-normalized shell is idempotent.
-      shells.emplace_back(l, sph ? ShellType::Spherical : ShellType::Cartesian,
-                          std::array<double, 3>{ox, oy, oz}, std::move(alpha),
-                          std::move(coeff), nctr,
-                          NormalizationConvention::ERKALE);
-    } else if (tag == "overlap") {
-      size_t n;
-      ss >> n;
-      S.resize(n);
-      for (size_t i = 0; i < n; ++i)
-        in >> S[i];
-    }
-  }
-
-  Reference r{GTOBasisSet<double>(std::move(shells)), std::move(S), nbf};
-  if (r.basis.nbf() != nbf)
-    throw std::runtime_error("reference nbf " + std::to_string(nbf) +
-                             " but the shells give " +
-                             std::to_string(r.basis.nbf()));
+  auto r = test::load_erkale_reference(path);
+  r.matrix("overlap"); // fail here rather than at the first element access
   return r;
 }
 
@@ -127,7 +69,7 @@ TEST_CASE("The reference basis round-trips", "[erkale][parity]") {
   REQUIRE(ref.nbf == 24);
   REQUIRE(ref.basis.nshells() == 11);
   REQUIRE(ref.basis.max_l() == 2);
-  REQUIRE(static_cast<int>(ref.overlap.size()) == 24 * 24);
+  REQUIRE(static_cast<int>(ref.block("overlap").size()) == 24 * 24);
 
   // cc-pVDZ oxygen s is generally contracted: one exponent set, two columns.
   bool found_general = false;
@@ -151,7 +93,7 @@ TEST_CASE("Normalization reproduces ERKALE's overlap diagonal",
     for (double v : norms) {
       INFO("function " << k);
       REQUIRE_THAT(v, Catch::Matchers::WithinAbs(
-                          ref.overlap[static_cast<size_t>(k) * n + k], 1e-12));
+                          ref.block("overlap")[static_cast<size_t>(k) * n + k], 1e-12));
       ++k;
     }
   }
@@ -196,7 +138,7 @@ TEST_CASE("Quadrature overlap reproduces ERKALE's analytic overlap",
   for (int i = 0; i < nbf; ++i)
     for (int j = 0; j < nbf; ++j) {
       const double d =
-          std::abs(S_h(i, j) - ref.overlap[static_cast<size_t>(i) * nbf + j]);
+          std::abs(S_h(i, j) - ref.block("overlap")[static_cast<size_t>(i) * nbf + j]);
       if (d > worst) {
         worst = d;
         wi = i;
@@ -206,7 +148,7 @@ TEST_CASE("Quadrature overlap reproduces ERKALE's analytic overlap",
 
   INFO("worst element (" << wi << "," << wj << "): NuKEXC " << S_h(wi, wj)
                          << " vs ERKALE "
-                         << ref.overlap[static_cast<size_t>(wi) * nbf + wj]
+                         << ref.block("overlap")[static_cast<size_t>(wi) * nbf + wj]
                          << ", deviation " << worst);
   // Quadrature error, not a convention mismatch: a wrong phase, ordering or
   // normalization would show up at O(1), not at this level.
@@ -241,7 +183,7 @@ TEST_CASE("Water density integrates to the electron count",
     double acc = 0.0;
     for (int i = 0; i < nbf; ++i)
       for (int j = 0; j < nbf; ++j)
-        acc += a[i] * ref.overlap[static_cast<size_t>(i) * nbf + j] * b[j];
+        acc += a[i] * ref.block("overlap")[static_cast<size_t>(i) * nbf + j] * b[j];
     return acc;
   };
   for (int k = 0; k < nocc; ++k) {
