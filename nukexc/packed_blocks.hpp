@@ -146,6 +146,7 @@ struct PackedBlockLayout {
   int max_nbf = 0;        ///< largest nbf(b), for team sizing
   int max_npts = 0;       ///< largest npts(b)
   int max_chunk_npts = 0; ///< largest point count in one chunk
+  size_t max_chunk_nbf = 0; ///< largest sum of nbf(b) over one chunk
 
   /// First grid point of box b. The boxes partition the grid into
   /// consecutive runs, so a chunk of boxes is a contiguous point range --
@@ -255,6 +256,8 @@ build_packed_block_layout(const Evaluator &basis, const NeighborList &nl,
     for (int b = lo; b < hi; ++b)
       pts += npts_h(b);
     L.max_chunk_npts = std::max(L.max_chunk_npts, pts);
+    L.max_chunk_nbf =
+        std::max(L.max_chunk_nbf, bf_off_h(hi) - bf_off_h(lo));
   }
 
   L.coll_off = Kokkos::View<size_t *>("coll_off", num_boxes + 1);
@@ -494,23 +497,30 @@ inline void block_gemm_nt(const PackedBlockLayout &L, const int box_begin,
   auto coll_off = L.coll_off;
   auto blk_off = L.blk_off;
 
+  // One THREAD per box, with a register-blocked serial GEMM, rather than one
+  // team per box with a team-level one. The boxes are the parallel dimension
+  // and there are far more of them than threads, so the team level buys
+  // nothing here -- and KokkosBatched implements Algo::Gemm::Blocked only for
+  // its serial kernels, which measured 1.3x faster than the team-level
+  // unblocked one on the same products.
   Kokkos::parallel_for(
-      "block gemm A B^T", policy_type(nbox, Kokkos::AUTO()),
-      KOKKOS_LAMBDA(const member_type &team) {
-        const int b = box_begin + team.league_rank();
+      "block gemm A B^T", Kokkos::RangePolicy<ExecSpace>(box_begin, box_end),
+      KOKKOS_LAMBDA(const int b) {
         const int n = nbf_v(b);
         const int np = npts_v(b);
         if (n == 0 || np == 0)
           return;
-        const size_t cb =
-            ncol_mult * (coll_off(b) - coll_off(box_begin));
+        const size_t cb = ncol_mult * (coll_off(b) - coll_off(box_begin));
         const size_t bb = blk_off(b) - blk_off(box_begin);
         const int ncol = ncol_mult * np;
 
         PackedMatrix Am(A.data() + cb, n, ncol);
         PackedMatrix Bm(B.data() + cb, n, ncol);
         PackedMatrix Cm(blocks.data() + bb, n, n);
-        PackedGemmNT::invoke(team, alpha, Am, Bm, 0.0, Cm);
+        KokkosBatched::SerialGemm<
+            KokkosBatched::Trans::NoTranspose, KokkosBatched::Trans::Transpose,
+            KokkosBatched::Algo::Gemm::Blocked>::invoke(alpha, Am, Bm, 0.0,
+                                                        Cm);
       });
 }
 
@@ -537,9 +547,8 @@ inline void block_gemm_matrix_times_collocation(
   auto blk_off = L.blk_off;
 
   Kokkos::parallel_for(
-      "block gemm A B", policy_type(nbox, Kokkos::AUTO()),
-      KOKKOS_LAMBDA(const member_type &team) {
-        const int b = box_begin + team.league_rank();
+      "block gemm A B", Kokkos::RangePolicy<ExecSpace>(box_begin, box_end),
+      KOKKOS_LAMBDA(const int b) {
         const int n = nbf_v(b);
         const int np = npts_v(b);
         if (n == 0 || np == 0)
@@ -551,7 +560,10 @@ inline void block_gemm_matrix_times_collocation(
         PackedMatrix Am(A.data() + bb, n, n);
         PackedMatrix Bm(B.data() + cb, n, ncol);
         PackedMatrix Cm(out.data() + cb, n, ncol);
-        PackedGemmNN::invoke(team, 1.0, Am, Bm, 0.0, Cm);
+        KokkosBatched::SerialGemm<
+            KokkosBatched::Trans::NoTranspose,
+            KokkosBatched::Trans::NoTranspose,
+            KokkosBatched::Algo::Gemm::Blocked>::invoke(1.0, Am, Bm, 0.0, Cm);
       });
 }
 

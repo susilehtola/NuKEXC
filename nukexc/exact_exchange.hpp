@@ -209,8 +209,18 @@ inline DeviceView2DLeft compute_exact_exchange_screened(
   using AuxPotential = Kokkos::View<double **, Kokkos::LayoutRight, MemSpace>;
   AuxPotential Vaux("aux potential chunk", N_aux, L.max_chunk_npts);
   Kokkos::View<double *> chi("packed chi", L.max_chunk_coll);
-  Kokkos::View<double *> psi("psi", static_cast<size_t>(batch) *
-                                        L.max_chunk_npts);
+  // psi is (batch, chunk points): the GEMM below scales a box's collocation
+  // by one orbital at a time, so that orbital's points have to be
+  // contiguous.
+  const size_t psi_stride = static_cast<size_t>(L.max_chunk_npts);
+  // Vaux is allocated (N_aux, max_chunk_npts) row-major, so this is its row
+  // stride; the GEMM needs it to view one box's columns.
+  const size_t aux_row_stride = static_cast<size_t>(L.max_chunk_npts);
+  Kokkos::View<double *> psi("psi", static_cast<size_t>(batch) * psi_stride);
+  // chi scaled by one orbital, and the (naux, nbf_b) blocks the GEMM writes.
+  Kokkos::View<double *> X("chi times psi", L.max_chunk_coll);
+  Kokkos::View<double *> Tblk("three center blocks",
+                              static_cast<size_t>(N_aux) * L.max_chunk_nbf);
   Kokkos::View<double ***, Kokkos::LayoutLeft, MemSpace> Bten(
       "three center integral", N_aux, N_bf, batch);
   DeviceView2DLeft Cmat("three center integral scaled", N_bf, K);
@@ -279,49 +289,106 @@ inline DeviceView2DLeft compute_exact_exchange_screened(
                     for (int j = 0; j < nb; ++j)
                       acc[j] += mo_orbitals(mu, i0 + j) * ci;
                   }
-                  double *out = psi_b + static_cast<size_t>(gloc + g) * nb;
                   for (int j = 0; j < nb; ++j)
-                    out[j] = acc[j];
+                    psi_b[j * psi_stride + static_cast<size_t>(gloc + g)] =
+                        acc[j];
                 });
           });
       space.fence();
 
-      Kokkos::parallel_for(
-          "Three center integral, screened", policy_type(nbox, Kokkos::AUTO()),
-          KOKKOS_LAMBDA(const member_type &team) {
-            const int b = b0 + team.league_rank();
-            const int n = nbf_v(b);
-            const int np = npts_v(b);
-            if (n == 0 || np == 0)
-              return;
-            const double *chi_b = chi.data() + (coll_off(b) - coll_off(b0));
-            const size_t base = bf_off(b);
-            const int gloc = b * mppb - g0;
-            const double *psi_b = psi.data();
+      // One orbital at a time: scale the packed collocation by psi_j, then
+      // ONE GEMM per box against the box's auxiliary potential block, then
+      // scatter the (naux, nbf_b) result.
+      //
+      // The hand-written dot product this replaces ran at about 0.5 GFLOP/s
+      // against BLAS's 2.5 on the same product. A dot product per
+      // (auxiliary function, local function) has no reuse to exploit,
+      // whatever the loop order; a GEMM over the box's points does, and
+      // KokkosBatched gives one per team without materializing anything
+      // larger than the box's own block.
+      for (int j = 0; j < nb; ++j) {
+        Kokkos::parallel_for(
+            "Scale collocation by one orbital",
+            policy_type(nbox, Kokkos::AUTO()),
+            KOKKOS_LAMBDA(const member_type &team) {
+              const int b = b0 + team.league_rank();
+              const int n = nbf_v(b);
+              const int np = npts_v(b);
+              if (n == 0 || np == 0)
+                return;
+              const size_t cb = coll_off(b) - coll_off(b0);
+              const double *chi_b = chi.data() + cb;
+              double *X_b = X.data() + cb;
+              const int gloc = b * mppb - g0;
+              const double *p_row =
+                  psi.data() + j * psi_stride + static_cast<size_t>(gloc);
 
-            Kokkos::parallel_for(
-                Kokkos::TeamThreadMDRange<Kokkos::Rank<2>, member_type>(
-                    team, N_aux, n),
-                [&](const int a, const int i) {
-                  const double *chi_row =
-                      chi_b + static_cast<size_t>(i) * np;
-                  double acc[MAX_ORBITAL_BATCH];
-                  for (int j = 0; j < nb; ++j)
-                    acc[j] = 0.0;
+              Kokkos::parallel_for(
+                  Kokkos::TeamThreadRange(team, n), [&](const int i) {
+                    const double *src = chi_b + static_cast<size_t>(i) * np;
+                    double *dst = X_b + static_cast<size_t>(i) * np;
+                    for (int g = 0; g < np; ++g)
+                      dst[g] = src[g] * p_row[g];
+                  });
+            });
 
-                  for (int g = 0; g < np; ++g) {
-                    const double t = Vaux(a, gloc + g) * chi_row[g];
-                    const double *pg =
-                        psi_b + static_cast<size_t>(gloc + g) * nb;
-                    for (int j = 0; j < nb; ++j)
-                      acc[j] += t * pg[j];
-                  }
+        // One thread per box, each doing a register-blocked serial GEMM:
+        // the boxes are the parallel dimension and there are far more of
+        // them than threads, so a team-level GEMM buys nothing and
+        // KokkosBatched only offers its unblocked kernel at team level.
+        Kokkos::parallel_for(
+            "Three center integral, screened",
+            Kokkos::RangePolicy<ExecSpace>(b0, b1),
+            KOKKOS_LAMBDA(const int b) {
+              const int n = nbf_v(b);
+              const int np = npts_v(b);
+              if (n == 0 || np == 0)
+                return;
+              const size_t cb = coll_off(b) - coll_off(b0);
+              const size_t tb =
+                  static_cast<size_t>(N_aux) * (bf_off(b) - bf_off(b0));
+              const int gloc = b * mppb - g0;
 
-                  const int mu = l2g(base + i);
-                  for (int j = 0; j < nb; ++j)
-                    Kokkos::atomic_add(&Bten(a, mu, j), acc[j]);
-                });
-          });
+              // The box's columns of the auxiliary potential: contiguous in
+              // the point index, strided by the chunk width in the function
+              // index.
+              const Kokkos::LayoutStride vl(N_aux, aux_row_stride, np, 1);
+              Kokkos::View<double **, Kokkos::LayoutStride, MemSpace,
+                           Kokkos::MemoryTraits<Kokkos::Unmanaged>>
+                  A(&Vaux(0, gloc), vl);
+              const PackedMatrix B(X.data() + cb, n, np);
+              const PackedMatrix T(Tblk.data() + tb, N_aux, n);
+
+              KokkosBatched::SerialGemm<
+                  KokkosBatched::Trans::NoTranspose,
+                  KokkosBatched::Trans::Transpose,
+                  KokkosBatched::Algo::Gemm::Blocked>::invoke(1.0, A, B, 0.0,
+                                                              T);
+            });
+
+        Kokkos::parallel_for(
+            "Scatter three center blocks", policy_type(nbox, Kokkos::AUTO()),
+            KOKKOS_LAMBDA(const member_type &team) {
+              const int b = b0 + team.league_rank();
+              const int n = nbf_v(b);
+              if (n == 0 || npts_v(b) == 0)
+                return;
+              const size_t tb =
+                  static_cast<size_t>(N_aux) * (bf_off(b) - bf_off(b0));
+              const double *T = Tblk.data() + tb;
+              const size_t base = bf_off(b);
+
+              Kokkos::parallel_for(
+                  Kokkos::TeamThreadMDRange<Kokkos::Rank<2>, member_type>(
+                      team, N_aux, n),
+                  [&](const int a, const int i) {
+                    const double v = T[static_cast<size_t>(a) * n + i];
+                    if (v != 0.0)
+                      Kokkos::atomic_add(&Bten(a, l2g(base + i), j), v);
+                  });
+            });
+      }
+
       space.fence();
     }
 
