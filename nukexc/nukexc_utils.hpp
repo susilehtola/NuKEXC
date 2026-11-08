@@ -46,22 +46,21 @@
 
 namespace Nukexc {
 
+// Plain multiplication rather than pow(x, 2): these two are called inside the
+// partitioning kernel's natoms^2 loop and inside every screening test in the
+// library, and a call to pow for an exponent known at compile time is not
+// something to rely on the optimizer to undo (issue #5).
 KOKKOS_INLINE_FUNCTION
-double dist(const Point a, const Point b) {
-  double dist = 0;
-  dist += Kokkos::pow(a[0] - b[0], 2);
-  dist += Kokkos::pow(a[1] - b[1], 2);
-  dist += Kokkos::pow(a[2] - b[2], 2);
-  return Kokkos::sqrt(dist);
+double dist_squared(const Point a, const Point b) {
+  const double dx = a[0] - b[0];
+  const double dy = a[1] - b[1];
+  const double dz = a[2] - b[2];
+  return dx * dx + dy * dy + dz * dz;
 }
 
 KOKKOS_INLINE_FUNCTION
-double dist_squared(const Point a, const Point b) {
-  double dist = 0;
-  dist += Kokkos::pow(a[0] - b[0], 2);
-  dist += Kokkos::pow(a[1] - b[1], 2);
-  dist += Kokkos::pow(a[2] - b[2], 2);
-  return dist;
+double dist(const Point a, const Point b) {
+  return Kokkos::sqrt(dist_squared(a, b));
 }
 
 KOKKOS_INLINE_FUNCTION

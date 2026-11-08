@@ -147,7 +147,7 @@ TEST_CASE("Fuzzy cell partitioning", "[fuzzy_cells]") {
 
       Kokkos::Timer timer;
       double time;
-      partition_becke(atom_centers_device, quadrature_points_device,
+      partition_becke_exact(atom_centers_device, quadrature_points_device,
                       point_owner_device, weights_device);
       time = timer.seconds();
 
@@ -157,7 +157,7 @@ TEST_CASE("Fuzzy cell partitioning", "[fuzzy_cells]") {
                 << std::endl;
       timer.reset();
 
-      partition_becke_team(atom_centers_device, quadrature_points_device,
+      partition_lko(atom_centers_device, quadrature_points_device,
                            point_owner_device, weights_device);
       time = timer.seconds();
       std::cout << std::left << std::setw(50)
