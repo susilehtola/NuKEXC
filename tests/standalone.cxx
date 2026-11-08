@@ -85,7 +85,7 @@ struct Config {
   int charge = 0;
   int multiplicity = 1;
   int max_points_per_box = 32; // runtime via --box-size=
-  int tile_size = 32; // neighbor tile (--tile=, only used by --alg=tiled)
+  int tile_size = 32; // accepted and ignored: nothing tiled is left
   std::string xfunc = "lda_x";
   std::string cfunc = "lda_c_pw";
   double dens_thr = 1e-10; // libxc density threshold (runtime --dens-thr=)
@@ -110,12 +110,12 @@ Config parse_args(int argc, char *argv[]) {
           << cfg.basis_file << ")\n"
           << "  --method=<string>     'hf' or 'dft'              (default: "
           << cfg.method << ")\n"
-          << "  --alg=<string>        'dense','sparse' or 'tiled'(default: "
+          << "  --alg=<string>        'dense' or 'sparse'        (default: "
           << cfg.algorithm << ")\n"
           << "  --box-size=<int>      Max quadrature points/box  (default: "
           << cfg.max_points_per_box << ")  [used by --alg=sparse,tiled]\n"
           << "  --tile=<int>          Neighbor tile size         (default: "
-          << cfg.tile_size << ")  [only used by --alg=tiled]\n"
+          << cfg.tile_size << ")  [IGNORED: 'tiled' now aliases 'sparse']\n"
           << "  --nrad=<int>          Radial grid points         (default: "
           << cfg.nrad << ")\n"
           << "  --nang=<int>          Angular grid points        (default: "
@@ -214,8 +214,6 @@ void print_config(const Config &cfg) {
       {"Algorithm", cfg.algorithm},
       {"Box size (pts/box)", cfg_val(cfg.max_points_per_box)},
   };
-  if (cfg.algorithm == "tiled")
-    rows.push_back({"Neighbor tile size", cfg_val(cfg.tile_size)});
   rows.push_back({"Radial points", cfg_val(cfg.nrad)});
   rows.push_back({"Angular order", cfg_val(cfg.nang)});
   rows.push_back({"Lin. dep. threshold", cfg_val(cfg.lin_dep_threshold)});
@@ -254,12 +252,12 @@ int main(int argc, char *argv[]) {
   Kokkos::initialize();
   {
     const bool is_dft = (cfg.method == "dft");
-    const bool is_sparse = (cfg.algorithm == "sparse");
-    const bool is_tiled = (cfg.algorithm == "tiled");
-    // Both "sparse" and "tiled" use the neighbor-list quadrature path; they
-    // differ only in which integral kernels are invoked.
-    const bool use_neighbor_path = is_sparse || is_tiled;
-    const int tile = cfg.tile_size;
+    // "tiled" is a deprecated alias: the tiled kernels staged basis
+    // evaluations through a scratch cache, and the per-box packing removes
+    // the redundancy they were caching instead of bounding it. Both names now
+    // select the same screened path.
+    const bool use_neighbor_path =
+        (cfg.algorithm == "sparse") || (cfg.algorithm == "tiled");
     // The neighbor-list path evaluates the basis on the fly inside every
     // kernel it uses -- (A|B), J, K and, since the sparse XC quadrature
     // landed, the LSDA/GGA functionals too. Nothing on that path reads a
@@ -436,7 +434,7 @@ int main(int argc, char *argv[]) {
     }
 
     // ---- Auxiliary overlap (A|B), dense / sparse / tiled -------------------
-    if (is_tiled || is_sparse) {
+    if (use_neighbor_path) {
       // One matrix, built the same way for both: the metric cannot be
       // screened (the Coulomb potential has a 1/r tail), so the tiled and
       // sparse variants differed only in how they staged the evaluations.
@@ -569,8 +567,9 @@ int main(int argc, char *argv[]) {
          basis_collocation_gx, basis_collocation_gy, basis_collocation_gz,
          basis_aux_collocation, potential_collocation_scaled, h_core, X_arma,
          half_inverse_X, N_bf, E_nuc, S_arma, cfg, func_c, func_x, x_info,
-         c_info, has_separate_c, a_exx, is_dft = is_dft, is_sparse = is_sparse,
-         is_tiled = is_tiled, tile = tile, call_count, &fock_cumulative_timing](
+         c_info, has_separate_c, a_exx, is_dft = is_dft,
+         use_neighbor_path = use_neighbor_path, call_count,
+         &fock_cumulative_timing](
             const OpenOrbitalOptimizer::DensityMatrix<double, double> &dm)
         -> std::pair<double, OpenOrbitalOptimizer::FockMatrix<double>> {
       TimingRegistry fock_timing;
@@ -623,11 +622,10 @@ int main(int argc, char *argv[]) {
       {
         TIME_SCOPE(fock_timing, "Coulomb (J) build");
         DeviceView2DLeft J;
-        if (is_tiled || is_sparse) {
+        if (use_neighbor_path) {
           // compute_coulomb_tiled and compute_coulomb_sparse were the same
           // matrix reached by two routes, and both evaluated a shell once
-          // per neighbour pair. compute_coulomb_screened replaces them, so
-          // --tile now affects only the exchange build.
+          // per neighbour pair. compute_coulomb_screened replaces both.
           J = compute_coulomb_screened(space, k_C_tot, k_occ_tot, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl, half_inverse_X);
         } else {
           J = compute_coulomb(space, k_C_tot, k_occ_tot, basis_collocation,
@@ -656,11 +654,8 @@ int main(int argc, char *argv[]) {
         DeviceView2DLeft K_alpha, K_beta;
         {
           TIME_SCOPE(fock_timing, "  K alpha");
-          if (is_tiled) {
-            K_alpha = compute_exact_exchange_tiled(space, k_C_alpha, k_occ_alpha, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl,
-                half_inverse_X, tile);
-          } else if (is_sparse) {
-            K_alpha = compute_exact_exchange_sparse(space, k_C_alpha, k_occ_alpha, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl,
+          if (use_neighbor_path) {
+            K_alpha = compute_exact_exchange_screened(space, k_C_alpha, k_occ_alpha, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl,
                 half_inverse_X);
           } else {
             K_alpha = compute_exact_exchange(
@@ -671,12 +666,9 @@ int main(int argc, char *argv[]) {
         }
         {
           TIME_SCOPE(fock_timing, "  K beta");
-          if (is_tiled) {
-            K_beta = compute_exact_exchange_tiled(space, k_C_beta, k_occ_beta, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl,
-                                                  half_inverse_X, tile);
-          } else if (is_sparse) {
-            K_beta = compute_exact_exchange_sparse(space, k_C_beta, k_occ_beta, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl,
-                                                   half_inverse_X);
+          if (use_neighbor_path) {
+            K_beta = compute_exact_exchange_screened(space, k_C_beta, k_occ_beta, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl,
+                half_inverse_X);
           } else {
             K_beta = compute_exact_exchange(
                 space, k_C_beta, k_occ_beta, basis_collocation,
@@ -691,7 +683,7 @@ int main(int argc, char *argv[]) {
       } else {
         // ---- DFT exchange-correlation quadrature -------------------------
         {
-          if (is_tiled || is_sparse) {
+          if (use_neighbor_path) {
             TIME_SCOPE(fock_timing, "Exchange functional (Vx)");
             XC_result_polarized E_x = evaluate_functional_sparse(
                 x_info, func_x, basis, grid, nl, k_C_alpha, k_occ_alpha,
@@ -738,11 +730,8 @@ int main(int argc, char *argv[]) {
           DeviceView2DLeft K_alpha, K_beta;
           {
             TIME_SCOPE(fock_timing, "  K alpha");
-            if (is_tiled) {
-              K_alpha = compute_exact_exchange_tiled(space, k_C_alpha, k_occ_alpha, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl,
-                  half_inverse_X, tile);
-            } else if (is_sparse) {
-              K_alpha = compute_exact_exchange_sparse(space, k_C_alpha, k_occ_alpha, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl,
+            if (use_neighbor_path) {
+              K_alpha = compute_exact_exchange_screened(space, k_C_alpha, k_occ_alpha, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl,
                   half_inverse_X);
             } else {
               K_alpha = compute_exact_exchange(
@@ -753,11 +742,8 @@ int main(int argc, char *argv[]) {
           }
           {
             TIME_SCOPE(fock_timing, "  K beta");
-            if (is_tiled) {
-              K_beta = compute_exact_exchange_tiled(space, k_C_beta, k_occ_beta, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl,
-                                                    half_inverse_X, tile);
-            } else if (is_sparse) {
-              K_beta = compute_exact_exchange_sparse(space, k_C_beta, k_occ_beta, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl,
+            if (use_neighbor_path) {
+              K_beta = compute_exact_exchange_screened(space, k_C_beta, k_occ_beta, STOPrimitiveEvaluator(basis), STOPotentialEvaluator(basis_aux), grid, nl,
                   half_inverse_X);
             } else {
               K_beta = compute_exact_exchange(

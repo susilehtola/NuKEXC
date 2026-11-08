@@ -73,15 +73,18 @@ inline int aux_chunk_points(const int naux, const int npts,
  *  @brief V_alpha(g) for one chunk of points, as a dense (naux, ng) block.
  *
  *  One thread per (auxiliary shell, point); the shell is evaluated once and
- *  all of its functions are written. LayoutLeft, so a column range of it is
- *  contiguous and can be handed to a GEMV as a subview.
+ *  all of its functions are written.
+ *
+ *  The view's layout is the caller's choice, and the two callers want
+ *  different ones: LayoutLeft so that a column range is contiguous and can
+ *  be handed to a GEMV, LayoutRight so that the points of one auxiliary
+ *  function are contiguous for a hand-rolled dot product.
  */
-template <typename PotEvaluator>
+template <typename PotEvaluator, typename VauxView>
   requires PotentialEvaluator<PotEvaluator>
 inline void fill_aux_potential_chunk(const PotEvaluator &aux,
                                      const FlatGrid &grid, const int g0,
-                                     const int ng,
-                                     const DeviceView2DLeft &Vaux) {
+                                     const int ng, const VauxView &Vaux) {
   if (ng <= 0)
     return;
   if (static_cast<int>(Vaux.extent(0)) != aux.nbf() ||

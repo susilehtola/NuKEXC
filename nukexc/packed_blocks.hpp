@@ -143,8 +143,15 @@ struct PackedBlockLayout {
   size_t max_chunk_coll = 0;       ///< doubles per unit buffer, largest chunk
   size_t max_chunk_blk = 0;        ///< doubles per block buffer, largest chunk
   int num_boxes = 0;
-  int max_nbf = 0;  ///< largest nbf(b), for team sizing
-  int max_npts = 0; ///< largest npts(b)
+  int max_nbf = 0;        ///< largest nbf(b), for team sizing
+  int max_npts = 0;       ///< largest npts(b)
+  int max_chunk_npts = 0; ///< largest point count in one chunk
+
+  /// First grid point of box b. The boxes partition the grid into
+  /// consecutive runs, so a chunk of boxes is a contiguous point range --
+  /// which is what lets a caller pair a chunk with a per-point block of
+  /// something else, an auxiliary potential for instance.
+  int mppb = 0;
 };
 
 /**
@@ -158,12 +165,18 @@ struct PackedBlockLayout {
  *                       this plus the blocks. A chunk always holds at least
  *                       one box, so a single box larger than the budget is
  *                       processed anyway rather than silently skipped.
+ *  @param max_chunk_points  cap on the number of GRID POINTS in a chunk, or
+ *                       zero for no cap. A caller that pairs the chunk with
+ *                       a dense per-point block of its own -- RI exchange
+ *                       pairs it with an (naux, npts) potential -- needs the
+ *                       point count bounded as well as the collocation size.
  */
 template <typename Evaluator>
   requires BasisEvaluator<Evaluator>
 inline PackedBlockLayout
 build_packed_block_layout(const Evaluator &basis, const NeighborList &nl,
-                          const size_t budget_bytes = (size_t{64} << 20)) {
+                          const size_t budget_bytes = (size_t{64} << 20),
+                          const int max_chunk_points = 0) {
   const int num_boxes = static_cast<int>(nl.offsets.extent(0)) - 1;
   if (num_boxes <= 0)
     throw std::invalid_argument(
@@ -214,15 +227,22 @@ build_packed_block_layout(const Evaluator &basis, const NeighborList &nl,
 
   // Greedy chunking under the budget, at least one box per chunk.
   const size_t budget_doubles = std::max<size_t>(1, budget_bytes / sizeof(double));
+  L.mppb = nl.max_points_per_box;
   L.chunk_begin.push_back(0);
   int b0 = 0;
+  int pts_here = 0;
   for (int b = 0; b < num_boxes; ++b) {
     const size_t here = coll_off_h(b + 1) - coll_off_h(b0);
     const bool alone = (b == b0);
-    if (!alone && here > budget_doubles) {
+    const bool over_coll = here > budget_doubles;
+    const bool over_pts = max_chunk_points > 0 &&
+                          pts_here + npts_h(b) > max_chunk_points;
+    if (!alone && (over_coll || over_pts)) {
       L.chunk_begin.push_back(b);
       b0 = b;
+      pts_here = 0;
     }
+    pts_here += npts_h(b);
   }
   L.chunk_begin.push_back(num_boxes);
 
@@ -231,6 +251,10 @@ build_packed_block_layout(const Evaluator &basis, const NeighborList &nl,
     L.max_chunk_coll =
         std::max(L.max_chunk_coll, coll_off_h(hi) - coll_off_h(lo));
     L.max_chunk_blk = std::max(L.max_chunk_blk, blk_off_h(hi) - blk_off_h(lo));
+    int pts = 0;
+    for (int b = lo; b < hi; ++b)
+      pts += npts_h(b);
+    L.max_chunk_npts = std::max(L.max_chunk_npts, pts);
   }
 
   L.coll_off = Kokkos::View<size_t *>("coll_off", num_boxes + 1);
