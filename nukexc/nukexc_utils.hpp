@@ -103,13 +103,20 @@ double log_factorial_ratio(const int top, const int bottom) {
   return result;
 }
 
+/// Forward declaration: safe_pow delegates to int_pow, which is defined
+/// below because it is the longer of the two.
+KOKKOS_INLINE_FUNCTION double int_pow(const double r, const int k);
+
 KOKKOS_INLINE_FUNCTION
 double safe_pow(const double base, const int exp) {
   if (exp == 0)
     return 1.0; // always 1 regardless of base
   if (base == 0.0)
     return 0.0; // 0^positive = 0
-  return Kokkos::pow(base, (double)exp);
+  // int_pow, not pow: the value path already uses int_pow for the same
+  // radial factor, so going through libm here made the STO gradient
+  // disagree with the STO value in the last bits for no reason.
+  return int_pow(base, exp);
 }
 
 KOKKOS_INLINE_FUNCTION
@@ -141,15 +148,40 @@ double int_pow(const double r, const int k) {
   case 7:
     result = r * r * r * r * r * r * r;
     break;
-  default:
-    result = Kokkos::pow(r, (double)k);
+  default: {
+    // Binary exponentiation for the rare large exponent -- n + l + 2 reaches
+    // eleven for a 6f Slater function. Still multiplication, and still not a
+    // libm call: pow() with an integer exponent is NOT folded by the
+    // compiler at -O3 (errno semantics block even the exact square), and
+    // this function is called per grid point.
+    double base = r;
+    int e = k;
+    if (k < 0) {
+      base = 1.0 / r;
+      e = -k;
+    }
+    double acc = 1.0;
+    while (e > 0) {
+      if (e & 1)
+        acc *= base;
+      base *= base;
+      e >>= 1;
+    }
+    result = acc;
     break;
+  }
   }
   return result;
 }
 
+/// Upper incomplete gamma, with exp(-x) supplied by the caller.
+///
+/// The STO potential needs both incomplete gammas at the same argument, and
+/// each of them used to call exp(-x) itself. One libm call per grid point
+/// per auxiliary function is worth the extra parameter; the two-argument
+/// form below keeps the plain interface.
 KOKKOS_INLINE_FUNCTION
-double upper_gamma(const int n, const double x) {
+double upper_gamma(const int n, const double x, const double exp_minus_x) {
   if (n <= 0)
     return 0.0;
 
@@ -162,11 +194,17 @@ double upper_gamma(const int n, const double x) {
   }
 
   double fact = factorial(n - 1);
-  return fact * Kokkos::exp(-x) * sum;
+  return fact * exp_minus_x * sum;
 }
 
 KOKKOS_INLINE_FUNCTION
-double lower_gamma(const int n, const double x) {
+double upper_gamma(const int n, const double x) {
+  return upper_gamma(n, x, Kokkos::exp(-x));
+}
+
+/// Lower incomplete gamma, with exp(-x) supplied by the caller.
+KOKKOS_INLINE_FUNCTION
+double lower_gamma(const int n, const double x, const double exp_minus_x) {
   if (n <= 0)
     return 0.0;
 
@@ -185,13 +223,25 @@ double lower_gamma(const int n, const double x) {
         break; // Converged to machine precision
     }
 
-    double log_prefactor = n * Kokkos::log(x) - x;
+    // x^n e^-x directly, rather than exp(n log x - x). This branch has
+    // x < n, so x^n is at most n^n and cannot overflow for any n this is
+    // called with -- the guard below keeps that true for an n no caller has
+    // yet -- and the direct product is both one libm call cheaper and more
+    // accurate than composing a log with an exp.
+    if (n <= 64)
+      return int_pow(x, n) * exp_minus_x * sum;
+    const double log_prefactor = n * Kokkos::log(x) - x;
     return Kokkos::exp(log_prefactor) * sum;
 
   } else {
     double Gamma_n = factorial(n - 1);
-    return Gamma_n - upper_gamma(n, x);
+    return Gamma_n - upper_gamma(n, x, exp_minus_x);
   }
+}
+
+KOKKOS_INLINE_FUNCTION
+double lower_gamma(const int n, const double x) {
+  return lower_gamma(n, x, Kokkos::exp(-x));
 }
 
 DeviceView2DLeft compute_half_inverse(const DeviceView2DLeft &overlap_matrix,
