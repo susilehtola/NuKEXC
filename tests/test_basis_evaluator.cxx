@@ -89,17 +89,22 @@ STOPrimitiveEvaluator make_sto_primitive() {
   }));
 }
 
+// A complete p shell, for the reason the primitive fixture above gives: the
+// three m of a shell share one radial, and a contracted basis stores that
+// radial once per function, so each of them repeats the same primitive list.
 STOContractedEvaluator make_sto_contracted() {
-  const int l[2] = {0, 1};
-  const int m[2] = {0, -1};
-  const double cen[6] = {0.0, 0.0, 0.0, -0.5, 0.3, 0.2};
-  const int off[3] = {0, 3, 5};
-  const int n[5] = {1, 2, 1, 2, 3};
-  const double zeta[5] = {6.1, 2.4, 1.05, 1.9, 0.8};
-  const double c[5] = {0.31, 0.52, 0.28, 0.66, 0.41};
+  const int l[4] = {0, 1, 1, 1};
+  const int m[4] = {0, -1, 0, 1};
+  const double cen[12] = {0.0, 0.0, 0.0, -0.5, 0.3, 0.2,
+                          -0.5, 0.3, 0.2, -0.5, 0.3, 0.2};
+  const int off[5] = {0, 3, 5, 7, 9};
+  const int n[9] = {1, 2, 1, 2, 3, 2, 3, 2, 3};
+  const double zeta[9] = {6.1, 2.4, 1.05, 1.9, 0.8, 1.9, 0.8, 1.9, 0.8};
+  const double c[9] = {0.31, 0.52, 0.28, 0.66, 0.41,
+                       0.66, 0.41, 0.66, 0.41};
 
   STOContractedBasisInput in;
-  in.nbf = 2;
+  in.nbf = 4;
   in.l = l;
   in.m = m;
   in.centers = cen;
