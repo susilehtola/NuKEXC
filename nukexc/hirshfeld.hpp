@@ -36,7 +36,7 @@
 #pragma once
 
 // ============================================================================
-//  Hirshfeld partitioning
+//  Density-based partitioning: Hirshfeld and Delley
 // ============================================================================
 //
 // The stockholder partition (Hirshfeld, Theor. Chim. Acta 44 (1977) 129):
@@ -64,6 +64,26 @@
 //
 // The main use is not actually quadrature but population analysis and
 // density decomposition, where the stockholder definition is the point.
+//
+// DELLEY
+// ------
+// Delley's partition (used by DMol3; An all-electron numerical method for
+// solving the local density functional for polyatomic molecules,
+// J. Chem. Phys. 92 (1990) 508) is the same construction with
+//
+//     g_A(r) = n_A(|r - R_A|) / |r - R_A|^2
+//
+// in place of n_A alone. The extra 1/r^2 makes the function more sharply
+// peaked at the nucleus, so a point between two atoms gives a larger share
+// to the nearer one than Hirshfeld does -- by the factor (r_far/r_near)^2 in
+// the ratio -- while leaving an equidistant point split exactly as Hirshfeld
+// splits it. It is therefore a third way of building the same kind of
+// partition of unity, alongside the geometric cell functions in
+// partition_schemes.hpp and the stockholder weights above, which is why it
+// belongs beside them rather than replacing either.
+//
+// The two share everything but that one factor, so there is one driver here
+// and two weight policies.
 
 #include <stdexcept>
 #include <string>
@@ -76,8 +96,32 @@
 
 namespace Nukexc {
 
+namespace detail {
+
+/// g_A = n_A(r): the stockholder weight.
+struct HirshfeldWeight {
+  KOKKOS_INLINE_FUNCTION double operator()(double n, double) const {
+    return n;
+  }
+};
+
+/// g_A = n_A(r)/r^2: Delley's weight.
+struct DelleyWeight {
+  /// A point sitting exactly on a nucleus would divide by zero. The limit
+  /// there is well defined -- the owning atom takes everything -- so the
+  /// denominator is floored rather than special-cased, which keeps that
+  /// limit and keeps the kernel branchless. The floor is far below any
+  /// radius a quadrature places a point at.
+  static constexpr double r2_floor = 1e-24;
+  KOKKOS_INLINE_FUNCTION double operator()(double n, double r) const {
+    return n / Kokkos::max(r * r, r2_floor);
+  }
+};
+
+} // namespace detail
+
 /**
- *  @brief Multiply quadrature weights by the Hirshfeld cell function.
+ *  @brief Multiply quadrature weights by a free-atom-density cell function.
  *
  *  @param atom_centers      nuclear positions
  *  @param Z                 atomic number per nucleus
@@ -92,17 +136,18 @@ namespace Nukexc {
  *  point to its neighbours -- a wrong answer with no symptom, which is the
  *  one failure mode worth paying a host-side check to avoid.
  */
-inline void partition_hirshfeld(const Kokkos::View<Point *> &atom_centers,
-                                const Kokkos::View<unsigned *> &Z,
-                                const Kokkos::View<Point *> &quadrature_points,
-                                const Kokkos::View<int *> &point_owner,
-                                Kokkos::View<double *> &weights,
-                                const AtomicDensityTable &table) {
+template <typename Weight>
+inline void partition_density_based(
+    const Kokkos::View<Point *> &atom_centers,
+    const Kokkos::View<unsigned *> &Z,
+    const Kokkos::View<Point *> &quadrature_points,
+    const Kokkos::View<int *> &point_owner, Kokkos::View<double *> &weights,
+    const AtomicDensityTable &table, const Weight gw) {
   const int natoms = static_cast<int>(atom_centers.extent(0));
   const size_t npts = quadrature_points.extent(0);
   if (static_cast<int>(Z.extent(0)) != natoms)
     throw std::invalid_argument(
-        "partition_hirshfeld: atom_centers and Z have different lengths");
+        "partition_density_based: atom_centers and Z have different lengths");
   if (natoms == 0 || npts == 0)
     return;
 
@@ -110,7 +155,7 @@ inline void partition_hirshfeld(const Kokkos::View<Point *> &atom_centers,
   // kernel there is nowhere to report it to.
   if (table.max_Z <= 0)
     throw std::invalid_argument(
-        "partition_hirshfeld: empty density table; build one with "
+        "partition_density_based: empty density table; build one with "
         "make_thakkar_density_table()");
   {
     auto Z_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, Z);
@@ -122,7 +167,7 @@ inline void partition_hirshfeld(const Kokkos::View<Point *> &atom_centers,
           z >= 1 && z <= table.max_Z && off_h(z + 1) > off_h(z);
       if (!ok)
         throw std::runtime_error(
-            "partition_hirshfeld: no free-atom density for Z = " +
+            "partition_density_based: no free-atom density for Z = " +
             std::to_string(z) + " (atom " + std::to_string(i) +
             "); the table covers Z = 1.." + std::to_string(table.max_Z));
     }
@@ -139,7 +184,7 @@ inline void partition_hirshfeld(const Kokkos::View<Point *> &atom_centers,
   auto Zv = Z;
 
   Kokkos::parallel_for(
-      "hirshfeld weights", Kokkos::RangePolicy<ExecSpace>(0, npts),
+      "density based weights", Kokkos::RangePolicy<ExecSpace>(0, npts),
       KOKKOS_LAMBDA(const size_t ip) {
         const Point p = pts(ip);
         const int me = own(ip);
@@ -149,16 +194,38 @@ inline void partition_hirshfeld(const Kokkos::View<Point *> &atom_centers,
           const double dy = p[1] - cen(ia)[1];
           const double dz = p[2] - cen(ia)[2];
           const double r = Kokkos::sqrt(dx * dx + dy * dy + dz * dz);
-          const double n = t.density(static_cast<int>(Zv(ia)), r);
-          sum += n;
+          const double g = gw(t.density(static_cast<int>(Zv(ia)), r), r);
+          sum += g;
           if (ia == me)
-            mine = n;
+            mine = g;
         }
         // Far from every nucleus both numerator and denominator have
         // underflowed and the quotient is meaningless; drop the point.
         w(ip) *= (sum > 0.0) ? mine / sum : 0.0;
       });
   Kokkos::fence();
+}
+
+/// Hirshfeld stockholder partitioning, g_A = n_A(r).
+inline void partition_hirshfeld(const Kokkos::View<Point *> &atom_centers,
+                                const Kokkos::View<unsigned *> &Z,
+                                const Kokkos::View<Point *> &quadrature_points,
+                                const Kokkos::View<int *> &point_owner,
+                                Kokkos::View<double *> &weights,
+                                const AtomicDensityTable &table) {
+  partition_density_based(atom_centers, Z, quadrature_points, point_owner,
+                          weights, table, detail::HirshfeldWeight{});
+}
+
+/// Delley partitioning, g_A = n_A(r)/r^2.
+inline void partition_delley(const Kokkos::View<Point *> &atom_centers,
+                             const Kokkos::View<unsigned *> &Z,
+                             const Kokkos::View<Point *> &quadrature_points,
+                             const Kokkos::View<int *> &point_owner,
+                             Kokkos::View<double *> &weights,
+                             const AtomicDensityTable &table) {
+  partition_density_based(atom_centers, Z, quadrature_points, point_owner,
+                          weights, table, detail::DelleyWeight{});
 }
 
 } // namespace Nukexc

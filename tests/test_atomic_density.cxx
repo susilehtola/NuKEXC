@@ -290,6 +290,122 @@ TEST_CASE("Hirshfeld weights are a partition of unity", "[hirshfeld]") {
   REQUIRE(checked > static_cast<int>(npts) / 2);
 }
 
+TEST_CASE("Delley partitioning is a partition of unity too",
+          "[delley][hirshfeld]") {
+  // Same check as for Hirshfeld, on the same geometry: the 1/r^2 factor
+  // cancels between numerator and denominator only where it is common, so a
+  // misplaced factor would break normalization rather than just shift the
+  // shares.
+  Molecule mol;
+  read_xyz("input/water.xyz", mol);
+  const auto t = make_thakkar_density_table();
+
+  FixedGridSpec spec;
+  spec.nrad = 20;
+  spec.lmax = 11;
+  spec.weight_threshold = 0.0;
+
+  const int natoms = static_cast<int>(mol.natoms);
+  std::vector<std::vector<double>> shares;
+  size_t npts = 0;
+  for (int owner = 0; owner < natoms; ++owner) {
+    FixedGridSpec s = spec;
+    auto grid = make_fixed_grid(mol, s);
+    Kokkos::deep_copy(grid.weights, 1.0);
+    Kokkos::deep_copy(grid.point_owner, owner);
+    partition_delley(grid.atom_centers, grid.Z, grid.quad_points,
+                     grid.point_owner, grid.weights, t);
+    auto w = Kokkos::create_mirror_view_and_copy(HostSpace{}, grid.weights);
+    shares.emplace_back(w.data(), w.data() + w.extent(0));
+    npts = w.extent(0);
+  }
+
+  REQUIRE(npts > 0);
+  int checked = 0;
+  for (size_t ip = 0; ip < npts; ++ip) {
+    double sum = 0.0;
+    for (int a = 0; a < natoms; ++a)
+      sum += shares[a][ip];
+    if (sum == 0.0)
+      continue; // beyond every free-atom density, as for Hirshfeld
+    INFO("point " << ip << ", shares sum to " << sum);
+    REQUIRE_THAT(sum, Catch::Matchers::WithinAbs(1.0, 1e-13));
+    ++checked;
+  }
+  INFO("checked " << checked << " of " << npts << " points");
+  REQUIRE(checked > static_cast<int>(npts) / 2);
+}
+
+TEST_CASE("Delley peaks more sharply at the nucleus than Hirshfeld",
+          "[delley][hirshfeld]") {
+  // The property that distinguishes the two, and the one a dropped 1/r^2
+  // would silently remove. For a point nearer atom A than atom B,
+  //
+  //     g_A/g_B = (n_A/n_B) (r_B/r_A)^2
+  //
+  // so Delley gives A a strictly larger share than Hirshfeld does. At an
+  // equidistant point between two LIKE atoms the factor is one and the two
+  // schemes must agree exactly.
+  const auto t = make_thakkar_density_table();
+
+  // Two hydrogens 2 bohr apart: equidistant points are symmetric, so the
+  // comparison at the midpoint is exact rather than approximate.
+  Kokkos::View<Point *> centers("centers", 2);
+  auto ch = Kokkos::create_mirror_view(centers);
+  ch(0)[0] = 0.0; ch(0)[1] = 0.0; ch(0)[2] = 0.0;
+  ch(1)[0] = 2.0; ch(1)[1] = 0.0; ch(1)[2] = 0.0;
+  Kokkos::deep_copy(centers, ch);
+
+  Kokkos::View<unsigned *> Z("Z", 2);
+  auto zh = Kokkos::create_mirror_view(Z);
+  zh(0) = 1u;
+  zh(1) = 1u;
+  Kokkos::deep_copy(Z, zh);
+
+  // Points along the bond: the midpoint, then three nearer atom 0.
+  const double xs[4] = {1.0, 0.8, 0.5, 0.25};
+  const int n = 4;
+  Kokkos::View<Point *> pts("pts", n);
+  auto ph = Kokkos::create_mirror_view(pts);
+  for (int i = 0; i < n; ++i) {
+    ph(i)[0] = xs[i];
+    ph(i)[1] = 0.0;
+    ph(i)[2] = 0.0;
+  }
+  Kokkos::deep_copy(pts, ph);
+
+  Kokkos::View<int *> own("own", n);
+  Kokkos::deep_copy(own, 0); // atom 0's share everywhere
+
+  Kokkos::View<double *> wh_("w hirshfeld", n), wd("w delley", n);
+  Kokkos::deep_copy(wh_, 1.0);
+  Kokkos::deep_copy(wd, 1.0);
+  partition_hirshfeld(centers, Z, pts, own, wh_, t);
+  partition_delley(centers, Z, pts, own, wd, t);
+
+  auto h = Kokkos::create_mirror_view_and_copy(HostSpace{}, wh_);
+  auto d = Kokkos::create_mirror_view_and_copy(HostSpace{}, wd);
+
+  // The midpoint: equidistant, like atoms, so both give exactly one half.
+  INFO("midpoint: Hirshfeld " << h(0) << ", Delley " << d(0));
+  REQUIRE_THAT(h(0), Catch::Matchers::WithinAbs(0.5, 1e-14));
+  REQUIRE_THAT(d(0), Catch::Matchers::WithinAbs(0.5, 1e-14));
+
+  // Nearer atom 0: Delley hands it more, and by the predicted factor.
+  for (int i = 1; i < n; ++i) {
+    const double rA = xs[i];
+    const double rB = 2.0 - xs[i];
+    // ratio_H = g_A/g_B for Hirshfeld, recovered from the share
+    const double ratio_h = h(i) / (1.0 - h(i));
+    const double ratio_d = d(i) / (1.0 - d(i));
+    const double predicted = ratio_h * (rB * rB) / (rA * rA);
+    INFO("x = " << rA << ": Hirshfeld share " << h(i) << ", Delley " << d(i)
+                << ", ratio " << ratio_d << " vs predicted " << predicted);
+    REQUIRE(d(i) > h(i));
+    REQUIRE_THAT(ratio_d, Catch::Matchers::WithinRel(predicted, 1e-12));
+  }
+}
+
 TEST_CASE("A Hirshfeld grid integrates the promolecular density",
           "[hirshfeld][grid]") {
   // End-to-end: the superposition of free-atom densities over a

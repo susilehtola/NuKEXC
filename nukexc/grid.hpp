@@ -300,7 +300,11 @@ make_flat_grid(const Molecule &mol, const size_t nrad = 50,
   Kokkos::deep_copy(owner_flat, Kokkos::View<int *, HostSpace>(
                                     owner_host.data(), total_points));
 
-  partition_becke_team(ac_dev, qp_flat, owner_flat, wt_flat);
+  // partition_lko, not Becke: this is the distance-capped cell function the
+  // routine formerly called partition_becke_team computed, kept as the
+  // default so the grids this produces do not change. Pass a FixedGridSpec
+  // with PartitionScheme::Becke for the uncapped one.
+  partition_lko(ac_dev, qp_flat, owner_flat, wt_flat);
 
   // Remove all weights below the weight threshold, compacting points, weights
   // and owners together so the surviving grid stays self-consistent.

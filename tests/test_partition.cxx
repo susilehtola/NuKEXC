@@ -128,7 +128,7 @@ TEST_CASE("H20", "[h20_weights]") {
   Kokkos::deep_copy(weights_device, weights_h);
 
   // Compute the adjusted weights
-  partition_becke_team(atom_centers_device, quadrature_points_device,
+  partition_lko(atom_centers_device, quadrature_points_device,
                        point_owner_device, weights_device);
 
   Kokkos::deep_copy(weights_h, weights_device);
@@ -183,7 +183,7 @@ TEST_CASE("one-half", "[weights_one_half]") {
   Kokkos::deep_copy(weights_device, weights_h);
 
   // Compute the adjusted weights
-  partition_becke(atom_centers_device, quadrature_points_device,
+  partition_becke_exact(atom_centers_device, quadrature_points_device,
                   point_owner_device, weights_device);
 
   // Copy weights back to the host device
@@ -241,7 +241,7 @@ TEST_CASE("SUM_TO_ONE", "[weights_sum_to_one]") {
   Kokkos::deep_copy(weights_device, weights_h);
 
   // Compute the adjusted weights
-  partition_becke_team(atom_centers_device, quadrature_points_device,
+  partition_lko(atom_centers_device, quadrature_points_device,
                        point_owner_device, weights_device);
 
   // Copy weights back to the host device

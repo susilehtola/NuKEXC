@@ -14,7 +14,7 @@
 // downstream silently assumes and which no single-scheme test can check.
 //
 // The third thing measured here is what the LKO distance cap in
-// partition_becke_team actually costs, since "it is an approximation" is not
+// partition_lko actually costs, since "it is an approximation" is not
 // a useful statement without a number.
 
 #include <cmath>
@@ -149,6 +149,49 @@ TEST_CASE("Becke's cell function saturates only asymptotically",
                  Catch::Matchers::WithinAbs(1.0 - detail::becke_s(m), 1e-15));
 }
 
+TEST_CASE("The Stratmann cell function saturates with flat derivatives",
+          "[partition][stratmann]") {
+  const double a = 0.64;
+
+  // z saturates exactly at the ends and stays there.
+  REQUIRE(detail::stratmann_z(1.0) == 1.0);
+  REQUIRE(detail::stratmann_z(-1.0) == -1.0);
+  REQUIRE(detail::stratmann_z(1.5) == 1.0);
+  REQUIRE(detail::stratmann_z(-2.0) == -1.0);
+
+  // The identity that defines the polynomial: z'(x) = 35 (1 - x^2)^3 / 16.
+  // The cubed factor is why the first three derivatives vanish at +-1, which
+  // is the whole reason for degree seven -- and checking it numerically
+  // catches a mistyped coefficient, which inspection does not.
+  for (double x : {-0.9, -0.5, -0.1, 0.0, 0.3, 0.75, 0.95}) {
+    const double h = 1e-5;
+    const double num =
+        (detail::stratmann_z(x + h) - detail::stratmann_z(x - h)) / (2.0 * h);
+    const double ana = 35.0 * std::pow(1.0 - x * x, 3) / 16.0;
+    INFO("x = " << x << ": numerical " << num << ", analytic " << ana);
+    REQUIRE_THAT(num, Catch::Matchers::WithinRel(ana, 1e-6));
+  }
+
+  // The cell function: saturated outside |mu| > a, one half at the midpoint,
+  // antisymmetric -- the same three properties the ERKALE one has.
+  REQUIRE(detail::stratmann_s(-0.7, a) == 1.0);
+  REQUIRE(detail::stratmann_s(0.7, a) == 0.0);
+  REQUIRE_THAT(detail::stratmann_s(0.0, a),
+               Catch::Matchers::WithinAbs(0.5, 1e-15));
+  for (double m : {-0.5, -0.2, 0.1, 0.4, 0.6})
+    REQUIRE_THAT(detail::stratmann_s(-m, a),
+                 Catch::Matchers::WithinAbs(
+                     1.0 - detail::stratmann_s(m, a), 1e-15));
+
+  // And it is a different function from ERKALE's, which is the point of
+  // having both: same saturation property, different polynomial and
+  // different a, so they are not interchangeable at the digits that matter.
+  const double d = std::abs(detail::stratmann_s(0.3, a) -
+                            detail::erkale_s(0.3, 0.7));
+  INFO("|s_SSF(0.3) - s_ERKALE(0.3)| = " << d);
+  REQUIRE(d > 1e-3);
+}
+
 TEST_CASE("Every scheme is a partition of unity", "[partition]") {
   // The property everything downstream assumes: summing the weight a point
   // receives over all possible owners must give back the original weight.
@@ -158,18 +201,29 @@ TEST_CASE("Every scheme is a partition of unity", "[partition]") {
   const int npts = 400;
   const auto pts = make_points(npts);
 
-  for (int scheme = 0; scheme < 2; ++scheme) {
-    INFO((scheme == 0 ? "ERKALE" : "Becke"));
+  const char *names[] = {"Becke", "ERKALE", "Stratmann", "LKO"};
+  for (int scheme = 0; scheme < 4; ++scheme) {
+    INFO(names[scheme]);
     std::vector<double> total(npts, 0.0);
 
     for (int owner = 0; owner < natoms; ++owner) {
       Kokkos::View<int *> own("own", npts);
       Kokkos::deep_copy(own, owner);
       auto w = ones(npts);
-      if (scheme == 0)
-        partition_erkale(centers, pts, own, w);
-      else
+      switch (scheme) {
+      case 0:
         partition_becke_exact(centers, pts, own, w);
+        break;
+      case 1:
+        partition_erkale(centers, pts, own, w);
+        break;
+      case 2:
+        partition_stratmann(centers, pts, own, w);
+        break;
+      default:
+        partition_lko(centers, pts, own, w);
+        break;
+      }
       const auto wh = host(w);
       for (int g = 0; g < npts; ++g)
         total[g] += wh[g];
@@ -193,8 +247,8 @@ TEST_CASE("The Stratmann prescreen is exact, not approximate",
   auto ch = Kokkos::create_mirror_view_and_copy(HostSpace{}, centers);
 
   // nearest neighbour of atom 0 is atom 1 at 1.8 bohr
-  const double a = 0.7;
   const double Rin = 1.8;
+  const double a = 0.7;
   const double screen = 0.5 * (1.0 - a) * Rin;
 
   // points straddling the screening radius along a direction away from all
@@ -217,11 +271,83 @@ TEST_CASE("The Stratmann prescreen is exact, not approximate",
   // Just outside, the full evaluation must also give (essentially) 1 --
   // otherwise the prescreen would introduce a discontinuity.
   REQUIRE_THAT(wh[1], Catch::Matchers::WithinAbs(1.0, 1e-12));
+
+  // The same for Stratmann, whose a is 0.64 and whose radius is therefore
+  // larger. The shortcut is a property of saturation, not of one scheme.
+  const double a_ssf = 0.64;
+  const double screen_ssf = 0.5 * (1.0 - a_ssf) * Rin;
+  REQUIRE(screen_ssf > screen); // more points take the shortcut
+  auto ph2 = Kokkos::create_mirror_view(pts);
+  ph2(0)[0] = -(screen_ssf * 0.99);
+  ph2(0)[1] = 0.0;
+  ph2(0)[2] = 0.0;
+  ph2(1)[0] = -(screen_ssf * 1.01);
+  ph2(1)[1] = 0.0;
+  ph2(1)[2] = 0.0;
+  Kokkos::deep_copy(pts, ph2);
+  auto w2 = ones(n);
+  partition_stratmann(centers, pts, own, w2);
+  const auto wh2 = host(w2);
+  INFO("SSF inside " << wh2[0] << ", outside " << wh2[1]);
+  REQUIRE_THAT(wh2[0], Catch::Matchers::WithinAbs(1.0, 1e-15));
+  REQUIRE_THAT(wh2[1], Catch::Matchers::WithinAbs(1.0, 1e-12));
+}
+
+TEST_CASE("The capped scheme survives separations far beyond the cap",
+          "[partition][lko]") {
+  // The cap puts the TRUE separation in the numerator of mu and a capped one
+  // in the denominator, so mu is no longer bounded by one: on a chain whose
+  // ends are 26 bohr apart and a cap of 5, it reaches five. Becke's cell
+  // function is an iterated cubic, and p(x) for x beyond about two is
+  // chaotic and then divergent -- p(6) = -99, p(-99) = 4.8e5, and the third
+  // iteration overflows. The clamp on mu is what keeps that from happening,
+  // and nothing in a short-geometry test exercises it: four centres spanning
+  // 7.5 bohr only reach mu = 1.5, where the iteration still converges.
+  const int natoms = 12;
+  Kokkos::View<Point *> centers("centers", natoms);
+  auto ch = Kokkos::create_mirror_view(centers);
+  for (int i = 0; i < natoms; ++i) {
+    ch(i)[0] = 2.4 * i; // a 26 bohr line, five times the 5 bohr cap
+    ch(i)[1] = 0.0;
+    ch(i)[2] = 0.0;
+  }
+  Kokkos::deep_copy(centers, ch);
+
+  const int npts = 200;
+  Kokkos::View<Point *> pts("pts", npts);
+  auto ph = Kokkos::create_mirror_view(pts);
+  for (int i = 0; i < npts; ++i) {
+    const double t = static_cast<double>(i);
+    ph(i)[0] = 0.13 * t;                      // along the chain
+    ph(i)[1] = 2.0 * std::sin(0.41 * t);      // and off it
+    ph(i)[2] = 1.5 * std::cos(0.23 * t + 0.7);
+  }
+  Kokkos::deep_copy(pts, ph);
+
+  std::vector<double> total(npts, 0.0);
+  for (int owner = 0; owner < natoms; ++owner) {
+    Kokkos::View<int *> own("own", npts);
+    Kokkos::deep_copy(own, owner);
+    auto w = ones(npts);
+    partition_lko(centers, pts, own, w);
+    const auto wh = host(w);
+    for (int g = 0; g < npts; ++g) {
+      INFO("point " << g << ", owner " << owner << ", weight " << wh[g]);
+      REQUIRE(std::isfinite(wh[g]));
+      REQUIRE(wh[g] >= 0.0);
+      REQUIRE(wh[g] <= 1.0);
+      total[g] += wh[g];
+    }
+  }
+  for (int g = 0; g < npts; ++g) {
+    INFO("point " << g);
+    REQUIRE_THAT(total[g], Catch::Matchers::WithinAbs(1.0, 1e-12));
+  }
 }
 
 TEST_CASE("The LKO distance cap changes the answer measurably",
           "[partition][lko]") {
-  // partition_becke_team caps the internuclear distance at 5 bohr. This puts
+  // partition_lko caps the internuclear distance at 5 bohr. This puts
   // a number on what that costs, using a geometry with one centre at 7.5
   // bohr so the cap actually engages.
   const auto centers = make_centers();
@@ -233,7 +359,7 @@ TEST_CASE("The LKO distance cap changes the answer measurably",
   partition_becke_exact(centers, pts, own, w_exact);
 
   auto w_lko = ones(npts);
-  partition_becke_team(centers, pts, own, w_lko);
+  partition_lko(centers, pts, own, w_lko);
 
   const auto a = host(w_exact);
   const auto b = host(w_lko);

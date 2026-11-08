@@ -146,7 +146,8 @@ struct FixedGridSpec {
   PartitionScheme partition = PartitionScheme::ERKALE;
   /// Points below this weight are discarded after partitioning.
   double weight_threshold = 1e-15;
-  /// Free-atom densities, required only by PartitionScheme::Hirshfeld.
+  /// Free-atom densities, required by PartitionScheme::Hirshfeld and
+  /// PartitionScheme::Delley.
   /// Build once with make_thakkar_density_table() and reuse: it allocates.
   AtomicDensityTable atomic_densities;
 };
@@ -232,14 +233,22 @@ inline FlatGrid make_fixed_grid(const Molecule &mol, const FixedGridSpec &spec) 
     partition_becke_exact(grid.atom_centers, grid.quad_points,
                           grid.point_owner, grid.weights);
     break;
+  case PartitionScheme::Stratmann:
+    partition_stratmann(grid.atom_centers, grid.quad_points, grid.point_owner,
+                        grid.weights);
+    break;
   case PartitionScheme::LKO:
-    partition_becke_team(grid.atom_centers, grid.quad_points,
-                         grid.point_owner, grid.weights);
+    partition_lko(grid.atom_centers, grid.quad_points, grid.point_owner,
+                  grid.weights);
     break;
   case PartitionScheme::Hirshfeld:
     partition_hirshfeld(grid.atom_centers, grid.Z, grid.quad_points,
                         grid.point_owner, grid.weights,
                         spec.atomic_densities);
+    break;
+  case PartitionScheme::Delley:
+    partition_delley(grid.atom_centers, grid.Z, grid.quad_points,
+                     grid.point_owner, grid.weights, spec.atomic_densities);
     break;
   }
 
