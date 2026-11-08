@@ -401,46 +401,6 @@ double basis_eval_fast(const ShellParams &sh, double x, double y, double z) {
   return radial * angular_part;
 } // namespace Nukexc
 
-KOKKOS_INLINE_FUNCTION
-void basis_eval_grad(const STOBasisSet basis, const int basis_idx,
-                     const double x, const double y, const double z, double &gx,
-                     double &gy, double &gz) {
-
-  const int n_val = basis.n(basis_idx);
-  const int l_val = basis.l(basis_idx);
-  const int m_val = basis.m(basis_idx);
-  const double norm = basis.norm(basis_idx);
-  const double zeta = basis.zeta(basis_idx);
-
-  const double dx = x - basis.O(basis_idx)[0];
-  const double dy = y - basis.O(basis_idx)[1];
-  const double dz = z - basis.O(basis_idx)[2];
-  const double r = Kokkos::sqrt(dx * dx + dy * dy + dz * dz);
-
-  // Angular part
-  double S_val;
-  S_val = real_solid_harmonic_cart(l_val, m_val, dx, dy, dz);
-
-  double dS_dx;
-  double dS_dy;
-  double dS_dz;
-
-  grad_real_solid_harmonic_cart(l_val, m_val, dx, dy, dz, dS_dx, dS_dy, dS_dz);
-
-  // Radial part
-  double pow_term = int_pow(r, n_val - l_val - 1);
-  double exp_term = Kokkos::exp(-zeta * r);
-  double R_pre = norm * pow_term * exp_term;
-
-  double dR_dr = ((n_val - l_val - 1) / r - zeta) * R_pre;
-
-  double common_R = dR_dr / r;
-
-  gx = R_pre * dS_dx + S_val * (dx * common_R);
-  gy = R_pre * dS_dy + S_val * (dy * common_R);
-  gz = R_pre * dS_dz + S_val * (dz * common_R);
-}
-
 template <typename PointsView, typename ValuesView>
 void fill_collocation(
     ExecSpace &space, const STOBasisSet &basis, PointsView collocation_points,
