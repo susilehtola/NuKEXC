@@ -57,7 +57,7 @@ inline STOBasisSet load_adf_basis(const Molecule &mol,
   auto Z_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, mol.Z);
 
   for (size_t i = 0; i < mol.natoms; ++i) {
-    std::string element_symbol = detail::symbols[Z_h(i)];
+    std::string element_symbol = Nukexc::detail::symbols[Z_h(i)];
     element_symbol[0] = std::toupper(element_symbol[0]);
 
     std::string filename = data_dir + "/" + element_symbol;
@@ -138,7 +138,7 @@ load_thakkar_primitives(const Molecule &mol,
 
   auto Z_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, mol.Z);
   for (size_t i = 0; i < mol.natoms; ++i) {
-    std::string element_symbol = detail::symbols[Z_h(i)];
+    std::string element_symbol = Nukexc::detail::symbols[Z_h(i)];
     element_symbol[0] = std::tolower(element_symbol[0]);
 
     std::string filename = data_dir + "/" + element_symbol;
@@ -243,7 +243,7 @@ load_thakkar_contracted(const Molecule &mol, const std::string &data_dir,
       Kokkos::create_mirror_view_and_copy(HostSpace{}, mol.atom_centers);
 
   for (size_t iat = 0; iat < mol.natoms; ++iat) {
-    std::string symbol = detail::symbols[Z_h(iat)];
+    std::string symbol = Nukexc::detail::symbols[Z_h(iat)];
     for (auto &c : symbol)
       c = static_cast<char>(std::tolower(c));
 
