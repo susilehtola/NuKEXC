@@ -94,6 +94,7 @@
 #include "basis_evaluator.hpp"
 #include "nukexc_config.hpp"
 #include "solid_harmonics_transform.hpp"
+#include "spherical_harmonics.hpp"
 
 namespace Nukexc {
 
@@ -377,6 +378,71 @@ gto_eval_contraction(const GTOBasisDevice &b, int ishell, int ictr, double px,
   const double y = py - b.O(ishell)[1];
   const double z = pz - b.O(ishell)[2];
   const double r2 = x * x + y * y + z * z;
+
+  // ------------------------------------------------------------------
+  //  A spherical shell is R(r) S_lm. Build it that way.
+  // ------------------------------------------------------------------
+  //
+  // The Cartesian route below builds cart_size(l) = (l+1)(l+2)/2 components
+  // where the shell has 2l+1, renormalizes each, and then applies a
+  // (2l+1) x cart_size(l) transform per derivative component per point. None
+  // of that buys anything here: the separability the Cartesian form exists
+  // for is an INTEGRAL property, and this is an evaluation at a point --
+  // r2 is formed once and exp called once per primitive either way.
+  //
+  // It factors because a spherical shell's relnorm is one number for the
+  // whole shell: gto_shell.hpp sets every Cartesian component's relative
+  // normalization to unity over sqrt(S[0]) (see its normalization notes,
+  // step 3), so
+  //
+  //     chi_m = sum_c T[m][c] rho (x^i y^j z^k) R(r) = rho R(r) S_lm,
+  //
+  // and solid_harmonics_transform.hpp's T emits exactly the normalized real
+  // solid harmonic r^l Y_lm that spherical_harmonics.hpp's precomputed
+  // switch returns. Measured on benzene, this is worth 1.3x to 2x on values
+  // and 1.8x to 4.3x on gradients, growing with l -- see
+  // benchmarking/benchmark_collocation.cxx, which also checks that the two
+  // routes agree up to that single scalar.
+  //
+  // Cartesian shells cannot take this path: a Cartesian Gaussian is not one
+  // R(r) S_lm. Neither can derivatives above the gradient, because the
+  // precomputed harmonic switches stop at value-and-gradient.
+  if constexpr (Deriv == GTODeriv::Value || Deriv == GTODeriv::Gradient) {
+    if (b.spherical(ishell)) {
+      const double rho = b.relnorm(n0);
+      double R = 0.0, dR_over_r = 0.0;
+      for (int ip = 0; ip < np; ++ip) {
+        const double zeta = b.alpha(p0 + ip);
+        const double e = b.coeff(c0 + ip) * Kokkos::exp(-zeta * r2);
+        R += e;
+        // dR/dr = -2 zeta r e, so dR/dr / r needs no square root at all --
+        // and the gradient only ever wants it divided by r.
+        dR_over_r += -2.0 * zeta * e;
+      }
+      R *= rho;
+      dR_over_r *= rho;
+
+      const int nlm = 2 * l + 1;
+      if constexpr (Deriv == GTODeriv::Value) {
+        for (int m = 0; m < nlm; ++m) {
+          double S;
+          real_solid_harmonic_cart_precomputed(l, m - l, x, y, z, S);
+          out[BF_VAL * out_stride + m] = R * S;
+        }
+      } else {
+        for (int m = 0; m < nlm; ++m) {
+          double S, dSx, dSy, dSz;
+          real_solid_harmonic_cart_and_grad_precomputed(l, m - l, x, y, z, S,
+                                                        dSx, dSy, dSz);
+          out[BF_VAL * out_stride + m] = R * S;
+          out[BF_DX * out_stride + m] = R * dSx + S * x * dR_over_r;
+          out[BF_DY * out_stride + m] = R * dSy + S * y * dR_over_r;
+          out[BF_DZ * out_stride + m] = R * dSz + S * z * dR_over_r;
+        }
+      }
+      return;
+    }
+  }
 
   // Power tables to degree l + order.
   const int pmax = l + static_cast<int>(Deriv);
