@@ -63,6 +63,7 @@
 #include <tuple>
 #include <vector>
 
+#include "alkane.hpp"
 #include "sto_basis_reader.hpp"
 
 using namespace Nukexc;
@@ -75,6 +76,12 @@ using ll_type = IntegratorXX::LebedevLaikov<double>;
 // ===========================================================================
 struct Config {
   std::string xyz_file = "input/water.xyz";
+  /// Build C_n H_(2n+2) instead of reading a file, when positive. The
+  /// canonical screening system: the molecule grows in one direction, so a
+  /// box's non-negligible shell count saturates while the basis keeps
+  /// growing, which is the only regime where screening can pay.
+  int alkane = 0;
+  bool alkane_diagonal = false;
   std::string basis_file = "input/zorabasis_cholesky/TZ2P.cholesky";
   std::string method = "hf";       // "hf" or "dft"
   std::string algorithm = "dense"; // "dense", "sparse" or "tiled"
@@ -106,6 +113,10 @@ Config parse_args(int argc, char *argv[]) {
           << "Usage: " << argv[0] << " [options]\n"
           << "  --xyz=<file>          Molecule XYZ file          (default: "
           << cfg.xyz_file << ")\n"
+          << "  --alkane=<int>        Build C_nH_(2n+2) instead     (default: "
+             "off; overrides --xyz)\n"
+          << "  --alkane-diagonal     Run the chain along (1,1,1) rather than "
+             "x\n"
           << "  --basis=<file>        Basis set file             (default: "
           << cfg.basis_file << ")\n"
           << "  --method=<string>     'hf' or 'dft'              (default: "
@@ -156,7 +167,10 @@ Config parse_args(int argc, char *argv[]) {
       std::exit(0);
     } else if (p.arg == "--nl-histogram") {
       cfg.nl_histogram = true;
-    } else if (!p.string_opt("--xyz=", cfg.xyz_file) &&
+    } else if (p.arg == "--alkane-diagonal") {
+      cfg.alkane_diagonal = true;
+    } else if (!p.int_opt("--alkane=", cfg.alkane) &&
+               !p.string_opt("--xyz=", cfg.xyz_file) &&
                !p.string_opt("--basis=", cfg.basis_file) &&
                !p.string_opt("--method=", cfg.method) &&
                !p.string_opt("--alg=", cfg.algorithm) &&
@@ -208,7 +222,11 @@ Config parse_args(int argc, char *argv[]) {
 
 void print_config(const Config &cfg) {
   std::vector<std::pair<std::string, std::string>> rows = {
-      {"Molecule file", cfg.xyz_file},
+      {"Molecule", cfg.alkane > 0
+                       ? ("C" + std::to_string(cfg.alkane) + "H" +
+                          std::to_string(2 * cfg.alkane + 2) +
+                          (cfg.alkane_diagonal ? " (diagonal)" : " (along x)"))
+                       : cfg.xyz_file},
       {"Basis file", cfg.basis_file},
       {"Method", cfg.method},
       {"Algorithm", cfg.algorithm},
@@ -270,7 +288,12 @@ int main(int argc, char *argv[]) {
     const bool need_grad_colloc = is_dft && !use_neighbor_path;
 
     Molecule mol;
-    {
+    if (cfg.alkane > 0) {
+      TIME_SCOPE(startup_timing, "Build alkane");
+      mol = test::alkane(cfg.alkane, cfg.alkane_diagonal
+                                         ? test::ChainAxis::Diagonal
+                                         : test::ChainAxis::Aligned);
+    } else {
       TIME_SCOPE(startup_timing, "Read XYZ");
       read_xyz(cfg.xyz_file, mol);
     }
