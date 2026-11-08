@@ -243,14 +243,16 @@ TEST_CASE("The screened GGA matches the dense one for a Gaussian basis",
 
 TEST_CASE("The screened XC quadrature also serves a Slater basis",
           "[xc][screened][sto]") {
-  // What the SCF driver actually runs. One function per shell, so this
-  // cannot catch a shell/function confusion -- it is here because the
-  // driver's basis should not be the untested one.
+  // What the SCF driver actually runs -- and, since the Slater evaluator
+  // became shell-based, a case that CAN catch a shell/function confusion:
+  // TZP on water is 17 shells carrying 31 functions. It used to be 31
+  // single-function shells, where the two indexings coincide and any
+  // confusion between them hides.
   Molecule mol;
   read_xyz("input/water.xyz", mol);
   const auto basis = test::load_adf_basis(mol, "input/zorabasis/TZP", 1e-10);
   const STOPrimitiveEvaluator ev(basis);
-  REQUIRE(ev.nblock() == ev.nbf());
+  REQUIRE(ev.nblock() < ev.nbf());
 
   const auto f = make_fixture(mol, ev, 50, 21, 5, 4);
 

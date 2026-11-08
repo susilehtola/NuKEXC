@@ -222,78 +222,16 @@ concept PotentialEvaluator =
       e.eval_potential_block(p, 0.0, 0.0, 0.0, out, 1);
     };
 
-/**
- *  @brief Potential of one auxiliary basis function, by function index.
- *
- *  The density-fitting loops index the auxiliary basis by function, and for
- *  any evaluator whose blocks hold a single function -- which is every Slater
- *  basis, primitive or contracted -- function and block indices coincide.
- *
- *  A Gaussian auxiliary basis has multi-function blocks, so those loops will
- *  need to iterate blocks instead. That is the same restructuring its
- *  shell-wise potential evaluation wants anyway, so it is deferred to
- *  whenever GTO density fitting is actually wired up rather than guessed at
- *  now.
- */
-template <typename E>
-  requires PotentialEvaluator<E>
-KOKKOS_INLINE_FUNCTION double eval_aux_potential(const E &e, int ibf,
-                                                 const Point &pt) {
-  static_assert(E::max_block_size == 1,
-                "eval_aux_potential indexes the auxiliary basis by function; "
-                "an evaluator with multi-function blocks needs the "
-                "density-fitting loops restructured to iterate blocks");
-  double out[1];
-  e.eval_potential_block(e.load_block(ibf), pt[0], pt[1], pt[2], out, 1);
-  return out[0];
-}
-
-// ---------------------------------------------------------------------------
-//  Single-function convenience shims
-// ---------------------------------------------------------------------------
-//
-// The density-fitting kernels index the basis by function and evaluate one
-// function at a time. These overloads let those bodies keep their shape while
-// going through the concept, for any evaluator whose blocks hold a single
-// function. They deliberately do not exist for multi-function blocks: a GTO
-// there should be evaluated a shell at a time, not 2l+1 times over.
-
-template <typename E>
-  requires BasisEvaluator<E>
-struct SingleBfHandle {
-  typename E::block_params p;
-  const E *ev;
-};
-
-template <typename E>
-  requires BasisEvaluator<E>
-KOKKOS_INLINE_FUNCTION SingleBfHandle<E> load_shell(const E &e, int ibf) {
-  static_assert(E::max_block_size == 1,
-                "load_shell evaluates one function at a time; an evaluator "
-                "with multi-function blocks should use eval_block");
-  return SingleBfHandle<E>{e.load_block(ibf), &e};
-}
-
-template <typename E>
-KOKKOS_INLINE_FUNCTION double basis_eval_fast(const SingleBfHandle<E> &h,
-                                              double x, double y, double z) {
-  double out[1];
-  h.ev->template eval_block<BasisDeriv::Value>(h.p, x, y, z, out, 1);
-  return out[0];
-}
-
-template <typename E>
-KOKKOS_INLINE_FUNCTION void
-basis_eval_with_grad(const SingleBfHandle<E> &h, const Point &pt, double &val,
-                     double &gx, double &gy, double &gz) {
-  double out[basis_ncomp(BasisDeriv::Gradient)];
-  h.ev->template eval_block<BasisDeriv::Gradient>(h.p, pt[0], pt[1], pt[2],
-                                                  out, 1);
-  val = out[BF_VAL];
-  gx = out[BF_DX];
-  gy = out[BF_DY];
-  gz = out[BF_DZ];
-}
+// The single-function shims that used to live here -- eval_aux_potential,
+// SingleBfHandle, and the load_shell/basis_eval_fast pair over an evaluator
+// -- are gone. They existed so that kernels indexing the basis by FUNCTION
+// could keep their shape while going through the evaluator concept, and they
+// static_asserted max_block_size == 1 to stop a Gaussian basis reaching
+// them. Every such kernel has since been rewritten to walk shells (issue
+// #6), so the shims had no callers left, and keeping them would invite the
+// indexing they were built to tolerate. stobasis.hpp keeps its own
+// ShellParams and basis_eval_fast, which the Slater evaluator uses
+// internally for its single-function blocks.
 
 // ============================================================================
 //  Generic collocation

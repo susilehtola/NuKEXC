@@ -46,6 +46,7 @@
 #include "nukexc_config.hpp"
 #include "nukexc_utils.hpp"
 #include "basis_evaluator.hpp"
+#include "radial_shell.hpp"
 #include "spherical_harmonics.hpp"
 
 namespace Nukexc {
@@ -554,55 +555,157 @@ void basis_eval_with_grad(const ScratchBasisParams &basis, const Point &p,
 // One basis function per block: each primitive STO is independent, so there
 // is no shared work to amortize across a block.
 
-class STOPrimitiveEvaluator {
+/**
+ *  @brief Group an STOBasisSet's per-function layout into shells.
+ *
+ *  STOBasisSet stores one entry per (n, l, m) function; a shell is the 2l+1
+ *  of them that share (n, l, zeta, centre). Every reader in the project
+ *  emits those consecutively with m running -l .. +l -- load_adf_basis,
+ *  load_thakkar_primitives and the contracted reader all expand with
+ *  `for (int m = -l; m <= l; ++m)` -- so the grouping preserves the basis
+ *  FUNCTION ORDER exactly, and matrices from the shell-based evaluator are
+ *  comparable element by element with everything recorded before it.
+ *
+ *  That is a property of the readers rather than of the format, so it is
+ *  checked here rather than assumed: a group that is not exactly 2l+1
+ *  consecutive functions with ascending m throws, because the alternative
+ *  is a silently permuted basis.
+ */
+inline SlaterRadial make_slater_radial(const STOBasisSet &b) {
+  const int nbf = static_cast<int>(b.nbf());
+  if (nbf == 0)
+    throw std::invalid_argument("make_slater_radial: empty basis");
+
+  auto n_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, b.n);
+  auto l_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, b.l);
+  auto m_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, b.m);
+  auto z_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, b.zeta);
+  auto norm_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, b.norm);
+  auto o_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, b.O);
+  auto cut_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, b.cutoff_radii);
+
+  std::vector<int> sh_l, sh_n;
+  std::vector<Point> sh_center;
+  std::vector<double> sh_radius, sh_zeta, sh_coeff;
+
+  int i = 0;
+  while (i < nbf) {
+    const int l = l_h(i);
+    const int nf = 2 * l + 1;
+    if (i + nf > nbf)
+      throw std::runtime_error(
+          "make_slater_radial: basis function " + std::to_string(i) +
+          " starts an l = " + std::to_string(l) + " shell with only " +
+          std::to_string(nbf - i) + " functions left");
+    double radius = 0.0;
+    for (int k = 0; k < nf; ++k) {
+      const int j = i + k;
+      const bool same = l_h(j) == l && n_h(j) == n_h(i) &&
+                        z_h(j) == z_h(i) && norm_h(j) == norm_h(i) &&
+                        o_h(j)[0] == o_h(i)[0] && o_h(j)[1] == o_h(i)[1] &&
+                        o_h(j)[2] == o_h(i)[2];
+      if (!same || m_h(j) != -l + k)
+        throw std::runtime_error(
+            "make_slater_radial: functions " + std::to_string(i) + ".." +
+            std::to_string(i + nf - 1) +
+            " do not form one shell with m = -l..+l in order; this basis is "
+            "not laid out shell by shell and grouping it would permute it");
+      radius = Kokkos::max(radius, cut_h(j));
+    }
+    sh_l.push_back(l);
+    sh_n.push_back(n_h(i));
+    sh_zeta.push_back(z_h(i));
+    sh_coeff.push_back(norm_h(i));
+    sh_center.push_back(o_h(i));
+    sh_radius.push_back(radius);
+    i += nf;
+  }
+
+  const int nshell = static_cast<int>(sh_l.size());
+  SlaterRadial rad;
+  ShellTable &t = rad.sh;
+  t.nshell = nshell;
+  t.nbf = nbf;
+  t.l = Kokkos::View<int *>("sto shell l", nshell);
+  t.first_bf = Kokkos::View<int *>("sto shell first bf", nshell + 1);
+  t.prim_offset = Kokkos::View<int *>("sto shell prim offset", nshell + 1);
+  t.center = Kokkos::View<Point *>("sto shell center", nshell);
+  t.radius = Kokkos::View<double *>("sto shell radius", nshell);
+  rad.zeta = Kokkos::View<double *>("sto zeta", nshell);
+  rad.coeff = Kokkos::View<double *>("sto coeff", nshell);
+  rad.n = Kokkos::View<int *>("sto n", nshell);
+
+  auto tl = Kokkos::create_mirror_view(t.l);
+  auto tf = Kokkos::create_mirror_view(t.first_bf);
+  auto tp = Kokkos::create_mirror_view(t.prim_offset);
+  auto tc = Kokkos::create_mirror_view(t.center);
+  auto tr = Kokkos::create_mirror_view(t.radius);
+  auto rz = Kokkos::create_mirror_view(rad.zeta);
+  auto rc = Kokkos::create_mirror_view(rad.coeff);
+  auto rn = Kokkos::create_mirror_view(rad.n);
+
+  int bf = 0;
+  for (int s = 0; s < nshell; ++s) {
+    tl(s) = sh_l[s];
+    tf(s) = bf;
+    tp(s) = s; // one primitive per shell
+    tc(s) = sh_center[s];
+    tr(s) = sh_radius[s];
+    rz(s) = sh_zeta[s];
+    rc(s) = sh_coeff[s];
+    rn(s) = sh_n[s];
+    bf += 2 * sh_l[s] + 1;
+  }
+  tf(nshell) = bf;
+  tp(nshell) = nshell;
+
+  Kokkos::deep_copy(t.l, tl);
+  Kokkos::deep_copy(t.first_bf, tf);
+  Kokkos::deep_copy(t.prim_offset, tp);
+  Kokkos::deep_copy(t.center, tc);
+  Kokkos::deep_copy(t.radius, tr);
+  Kokkos::deep_copy(rad.zeta, rz);
+  Kokkos::deep_copy(rad.coeff, rc);
+  Kokkos::deep_copy(rad.n, rn);
+  return rad;
+}
+
+/**
+ *  @brief The primitive Slater evaluator: shells of 2l+1, radial once each.
+ *
+ *  A thin layer over SolidHarmonicEvaluator<SlaterRadial> that keeps the
+ *  constructor every call site uses and the STOBasisSet accessor some tests
+ *  want. The evaluation itself is the generic one -- which is the point:
+ *  this family differs from the Gaussian one in R(r) alone.
+ *
+ *  It used to hand out one basis FUNCTION per block, which meant evaluating
+ *  r^(n-l-1) e^(-zeta r) once per (function, point) rather than once per
+ *  (shell, point): 2l+1 times over for a p, d or f shell.
+ */
+class STOPrimitiveEvaluator : public SolidHarmonicEvaluator<SlaterRadial> {
 public:
-  using block_params = ScratchBasisParams;
-  static constexpr int max_block_size = 1;
+  using base = SolidHarmonicEvaluator<SlaterRadial>;
+  using block_params = base::block_params;
 
   STOPrimitiveEvaluator() = default;
-  explicit STOPrimitiveEvaluator(STOBasisSet b) : b_(std::move(b)) {}
+  explicit STOPrimitiveEvaluator(STOBasisSet b)
+      : base(make_slater_radial(b)), b_(std::move(b)) {}
 
-  int nbf() const { return static_cast<int>(b_.nbf()); }
-  int nblock() const { return static_cast<int>(b_.nbf()); }
-  KOKKOS_INLINE_FUNCTION int block_first_bf(int i) const { return i; }
-  KOKKOS_INLINE_FUNCTION int block_size(int) const { return 1; }
-
-  Kokkos::View<Point *> centers() const { return b_.O; }
-  Kokkos::View<double *> radii() const { return b_.cutoff_radii; }
-
+  /// The per-function basis this was built from, for callers that still
+  /// index by function -- the dense collocation fills, mostly.
   const STOBasisSet &basis() const { return b_; }
-
-  KOKKOS_INLINE_FUNCTION block_params load_block(int i) const {
-    return ScratchBasisParams{b_.zeta(i), b_.norm(i), b_.O(i),
-                              b_.n(i),    b_.l(i),    b_.m(i)};
-  }
-
-  /// Highest derivative order eval_block implements. Slater functions
-  /// have no second derivatives derived here yet; see the static_assert in
-  /// eval_block, which this keeps callers from ever reaching.
-  static constexpr BasisDeriv max_deriv = BasisDeriv::Gradient;
-
-  template <BasisDeriv D>
-  KOKKOS_INLINE_FUNCTION void eval_block(const block_params &p, double x,
-                                         double y, double z, double *out,
-                                         int stride) const {
-    static_assert(D == BasisDeriv::Value || D == BasisDeriv::Gradient,
-                  "the primitive STO path implements values and gradients; "
-                  "higher orders are not yet derived for Slater functions");
-    if constexpr (D == BasisDeriv::Value) {
-      const ShellParams sh{p.l,    p.m,    p.n - p.l - 1, p.zeta,
-                           p.norm, p.O[0], p.O[1],        p.O[2]};
-      out[BF_VAL * stride] = basis_eval_fast(sh, x, y, z);
-    } else {
-      const Point pt{x, y, z};
-      basis_eval_with_grad(p, pt, out[BF_VAL * stride], out[BF_DX * stride],
-                           out[BF_DY * stride], out[BF_DZ * stride]);
-    }
-  }
 
 private:
   STOBasisSet b_;
 };
+
+// The per-function Slater evaluator that used to live here is gone: it gave
+// out one basis FUNCTION per block, so a p, d or f shell evaluated its
+// radial 2l+1 times per point instead of once. It survives as a reference
+// implementation in tests/test_radial_shell.cxx, where it pins the
+// shell-based one element by element -- the Slater path has no external
+// oracle of that kind otherwise, since the ERKALE comparisons use Gaussian
+// bases.
 
 static_assert(BasisEvaluator<STOPrimitiveEvaluator>);
 

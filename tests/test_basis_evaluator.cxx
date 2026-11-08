@@ -64,11 +64,27 @@ Kokkos::View<double ***, HostSpace> collocate(const E &ev,
 //  The three evaluators under test
 // ---------------------------------------------------------------------------
 
+// COMPLETE shells, m = -l .. +l, which this fixture did not have before the
+// Slater evaluator became shell-based: it carried two of the three 2p
+// components and one of the five 3d. A list of independent (n, l, m)
+// functions was a legitimate STOBasisSet for a per-function evaluator, and
+// is not a basis a shell-based one can represent -- a shell is all 2l+1 of
+// its components or it is not a shell. make_slater_radial says so with an
+// exception rather than grouping whatever it finds, since the alternative is
+// a silently permuted basis.
+//
+// Every reader in the project emits complete shells in this order, and an
+// incomplete one is not rotationally invariant, so nothing real is lost.
 STOPrimitiveEvaluator make_sto_primitive() {
   return STOPrimitiveEvaluator(make_manual_basis({
       {1, 0, 0, 1.4, 0.0, 0.0, 0.0},
       {2, 1, -1, 0.9, 0.0, 0.0, 0.0},
       {2, 1, 0, 0.9, 0.0, 0.0, 0.0},
+      {2, 1, 1, 0.9, 0.0, 0.0, 0.0},
+      {3, 2, -2, 1.1, -0.5, 0.3, 0.2},
+      {3, 2, -1, 1.1, -0.5, 0.3, 0.2},
+      {3, 2, 0, 1.1, -0.5, 0.3, 0.2},
+      {3, 2, 1, 1.1, -0.5, 0.3, 0.2},
       {3, 2, 2, 1.1, -0.5, 0.3, 0.2},
   }));
 }
