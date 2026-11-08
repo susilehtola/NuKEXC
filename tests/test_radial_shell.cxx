@@ -221,6 +221,63 @@ std::vector<double> matrix_to_host(const DeviceView2DLeft &m) {
   return out;
 }
 
+/**
+ *  The per-function Slater evaluator, as the library had it before the
+ *  shell-based one replaced it. One basis FUNCTION per block, so the radial
+ *  is evaluated 2l+1 times per point for a shell of 2l+1 -- which is what
+ *  the replacement fixes.
+ *
+ *  It lives here because it is this file's oracle. The Slater path has no
+ *  external element-wise reference: ERKALE's are Gaussian, and the analytic
+ *  Slater checks (hydrogen's 5/8 self-repulsion, the convergence studies)
+ *  pin integrated quantities rather than matrices. Deleting it from the
+ *  library and keeping it here is the same arrangement the solid harmonics
+ *  use -- the slow, obviously correct version is what the fast one is
+ *  measured against.
+ */
+class PerFunctionSlaterEvaluator {
+public:
+  using block_params = ScratchBasisParams;
+  static constexpr int max_block_size = 1;
+  static constexpr BasisDeriv max_deriv = BasisDeriv::Gradient;
+
+  explicit PerFunctionSlaterEvaluator(STOBasisSet b) : b_(std::move(b)) {}
+
+  int nbf() const { return static_cast<int>(b_.nbf()); }
+  int nblock() const { return static_cast<int>(b_.nbf()); }
+  KOKKOS_INLINE_FUNCTION int block_first_bf(int i) const { return i; }
+  KOKKOS_INLINE_FUNCTION int block_size(int) const { return 1; }
+  Kokkos::View<Point *> centers() const { return b_.O; }
+  Kokkos::View<double *> radii() const { return b_.cutoff_radii; }
+
+  KOKKOS_INLINE_FUNCTION block_params load_block(int i) const {
+    return ScratchBasisParams{b_.zeta(i), b_.norm(i), b_.O(i),
+                              b_.n(i),    b_.l(i),    b_.m(i)};
+  }
+
+  template <BasisDeriv D>
+  KOKKOS_INLINE_FUNCTION void eval_block(const block_params &p, double x,
+                                         double y, double z, double *out,
+                                         int stride) const {
+    if constexpr (D == BasisDeriv::Value) {
+      const ShellParams sh{p.l,    p.m,    p.n - p.l - 1, p.zeta,
+                           p.norm, p.O[0], p.O[1],        p.O[2]};
+      out[BF_VAL * stride] = basis_eval_fast(sh, x, y, z);
+    } else {
+      const Point pt{x, y, z};
+      basis_eval_with_grad(p, pt, out[BF_VAL * stride], out[BF_DX * stride],
+                           out[BF_DY * stride], out[BF_DZ * stride]);
+    }
+  }
+
+private:
+  STOBasisSet b_;
+};
+
+static_assert(BasisEvaluator<PerFunctionSlaterEvaluator>);
+static_assert(
+    BasisEvaluatorWith<PerFunctionSlaterEvaluator, BasisDeriv::Gradient>);
+
 } // namespace
 
 TEST_CASE("The templated Slater path reproduces the Slater path",
@@ -256,6 +313,12 @@ TEST_CASE("The templated Slater path reproduces the Slater path",
   }
   const SlaterShellEvaluator ev(make_slater(shells));
   REQUIRE(ev.nbf() == static_cast<int>(sto.nbf()));
+  // The library's own Slater evaluator is this template over the same
+  // policy, built straight from the per-function basis -- so it has to
+  // agree with both of the above.
+  const STOPrimitiveEvaluator shipped(sto);
+  REQUIRE(shipped.nbf() == ev.nbf());
+  REQUIRE(shipped.nblock() == ev.nblock());
   REQUIRE(ev.nblock() == 4);
   REQUIRE(ev.block_size(1) == 3);
 
@@ -264,16 +327,22 @@ TEST_CASE("The templated Slater path reproduces the Slater path",
                std::vector<unsigned>{1u, 1u});
   const auto grid = make_flat_grid<ta_type, ll_type>(mol, 90, 29);
 
-  const auto ref = compute_core_hamiltonian(STOPrimitiveEvaluator(sto), grid);
+  const auto ref =
+      compute_core_hamiltonian(PerFunctionSlaterEvaluator(sto), grid);
   const auto got = compute_core_hamiltonian(ev, grid);
 
   struct Pair {
     const char *name;
     DeviceView2DLeft a, b;
   };
-  for (const auto &pr : {Pair{"overlap", got.overlap, ref.overlap},
-                         Pair{"kinetic", got.kinetic, ref.kinetic},
-                         Pair{"nuclear", got.nuclear, ref.nuclear}}) {
+  const auto shipped_core = compute_core_hamiltonian(shipped, grid);
+  for (const auto &pr :
+       {Pair{"overlap", got.overlap, ref.overlap},
+        Pair{"kinetic", got.kinetic, ref.kinetic},
+        Pair{"nuclear", got.nuclear, ref.nuclear},
+        Pair{"overlap (shipped)", shipped_core.overlap, ref.overlap},
+        Pair{"kinetic (shipped)", shipped_core.kinetic, ref.kinetic},
+        Pair{"nuclear (shipped)", shipped_core.nuclear, ref.nuclear}}) {
     const auto a = matrix_to_host(pr.a);
     const auto b = matrix_to_host(pr.b);
     double worst = 0.0, scale = 0.0;
@@ -427,27 +496,40 @@ TEST_CASE("Gradients match finite differences, for both families",
   }
 }
 
-TEST_CASE("The cutoff is honoured exactly as a zero", "[radial]") {
-  // Whatever the family, past r_cut the shell contributes nothing -- which
-  // is what makes the neighbour list and the per-box packing mean the same
-  // thing for every basis.
+TEST_CASE("The cutoff screens boxes, it does not truncate points",
+          "[radial]") {
+  // r_cut is what the neighbour list screens BOXES with; it is not a
+  // pointwise truncation. An analytic radial keeps the small value it
+  // actually has beyond its cutoff radius, because zeroing it would throw
+  // away a contribution of exactly the size of the tolerance that defined
+  // the radius -- and that showed up as hydrogen's 1s self-repulsion
+  // drifting 3e-10 off 5/8 when an earlier version of this evaluator did
+  // truncate.
+  //
+  // A radial with genuinely compact support returns zero out there on its
+  // own, which is the property a confined numerical radial has and an
+  // analytic one cannot be given from the outside.
   const std::vector<ShellSpec> shells = {
       ShellSpec{1, Point{0.0, 0.0, 0.0}, 3.0, {0.5}, {1.0}, {}}};
   const GaussianShellEvaluator ev(make_gaussian(shells));
 
-  const auto inside = eval_block_host(ev, 0, 2.99, 0.0, 0.0);
-  REQUIRE(std::abs(inside.val[2]) > 0.0);
+  auto radii = Kokkos::create_mirror_view_and_copy(HostSpace{}, ev.radii());
+  REQUIRE_THAT(radii(0), Catch::Matchers::WithinAbs(3.0, 1e-15));
 
-  for (double r : {3.0, 3.0001, 50.0}) {
-    const auto out = eval_block_host(ev, 0, r, 0.0, 0.0);
-    INFO("r = " << r);
-    for (int i = 0; i < 3; ++i) {
-      REQUIRE(out.val[i] == 0.0);
-      REQUIRE(out.gx[i] == 0.0);
-      REQUIRE(out.gy[i] == 0.0);
-      REQUIRE(out.gz[i] == 0.0);
-    }
-  }
+  // Just inside and just outside: both the true value, continuous across
+  // the radius rather than stepping to zero at it.
+  const auto in = eval_block_host(ev, 0, 2.99, 0.0, 0.0);
+  const auto out = eval_block_host(ev, 0, 3.01, 0.0, 0.0);
+  const double ratio = out.val[2] / in.val[2];
+  INFO("inside " << in.val[2] << ", outside " << out.val[2]);
+  REQUIRE(std::abs(in.val[2]) > 0.0);
+  REQUIRE(std::abs(out.val[2]) > 0.0);
+  // exp(-0.5 (3.01^2 - 2.99^2)) = exp(-0.06) for the radial, times 3.01/2.99
+  // for the solid harmonic.
+  REQUIRE_THAT(ratio,
+               Catch::Matchers::WithinRel(
+                   std::exp(-0.5 * (3.01 * 3.01 - 2.99 * 2.99)) * 3.01 / 2.99,
+                   1e-12));
 }
 
 int main(int argc, char *argv[]) {

@@ -196,16 +196,20 @@ TEST_CASE("Kinetic and nuclear energies have the right sign and scale",
 
 TEST_CASE("Slater and Gaussian paths both go through the shell abstraction",
           "[coreh][shells]") {
-  // Both evaluators must drive the same routine. The Slater one has one
-  // function per shell, so nblock == nbf; the Gaussian one does not. That
-  // the same code serves both is the property the abstraction is for.
+  // Both evaluators must drive the same routine. Neither has one function
+  // per shell any more: the Slater path used to, which is exactly why a
+  // kernel that confused shells with functions looked correct on it and was
+  // wrong on a Gaussian basis. Now both group their 2l+1 components, and
+  // the same code serves both -- which is the property the abstraction is
+  // for, and one the Slater path can finally demonstrate rather than merely
+  // tolerate.
   Molecule mol;
   read_xyz("input/water.xyz", mol);
   const auto grid = make_flat_grid<ta_type, ll_type>(mol, 50, 21);
 
   const auto sto = test::load_adf_basis(mol, "input/zorabasis/TZP", 1e-10);
   const STOPrimitiveEvaluator sev(sto);
-  REQUIRE(sev.nblock() == sev.nbf()); // single-function shells
+  REQUIRE(sev.nblock() < sev.nbf()); // 17 shells, 31 functions
 
   const auto gto = test::sto3g_basis(mol);
   const GTOEvaluator gev(make_gto_device_basis(gto));

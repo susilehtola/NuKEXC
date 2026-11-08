@@ -186,7 +186,9 @@ public:
   }
   Kokkos::View<Point *> centers() const { return sh_.center; }
   Kokkos::View<double *> radii() const { return sh_.radius; }
-  const Radial &radial() const { return rad_; }
+  /// The radial family itself, for a derived evaluator that needs the
+  /// per-primitive parameters -- the electrostatic potential does.
+  KOKKOS_INLINE_FUNCTION const Radial &radial() const { return rad_; }
 
   KOKKOS_INLINE_FUNCTION block_params load_block(int i) const {
     return rad_.load_shell(i);
@@ -206,23 +208,22 @@ public:
     const double dz = z - p.O[2];
     const double r2 = dx * dx + dy * dy + dz * dz;
 
-    // Beyond the cutoff the shell contributes nothing. Whether that is
-    // exact or an approximation is the radial's business: a confined
-    // numerical radial is identically zero out here, an analytic one is
-    // merely small, and the cutoff radius is where the family's own
-    // threshold put it.
-    if (r2 >= p.r_cut * p.r_cut) {
-      for (int i = 0; i < nfunc; ++i) {
-        out[BF_VAL * stride + i] = 0.0;
-        if constexpr (D == BasisDeriv::Gradient) {
-          out[BF_DX * stride + i] = 0.0;
-          out[BF_DY * stride + i] = 0.0;
-          out[BF_DZ * stride + i] = 0.0;
-        }
-      }
-      return;
-    }
-
+    // No cutoff test here, deliberately. Whether a shell is zero beyond
+    // r_cut is the RADIAL's property, not the evaluator's: a confined
+    // numerical radial returns exactly zero out there because that is what
+    // it is, while an analytic one returns the small value it actually has.
+    // Truncating an analytic radial at its cutoff radius would throw away a
+    // contribution of the size of the tolerance that defined the radius --
+    // which is small, but it is the difference between a quadrature that
+    // reproduces the analytic answer and one that reproduces it to the
+    // basis's screening tolerance. Measured: zeroing beyond r_cut moved
+    // hydrogen's 1s self-repulsion by 3e-10 on a basis built with a 1e-10
+    // cutoff tolerance.
+    //
+    // radii() still reports r_cut, because that is what the neighbour list
+    // screens boxes with. Dropping a whole box is a different decision from
+    // zeroing a point inside one.
+    //
     // A point on the nucleus: the radial is evaluated at a floor, and the
     // angular part handles the origin itself -- every solid harmonic but
     // l = 0 vanishes there.

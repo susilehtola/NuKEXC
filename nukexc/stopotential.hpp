@@ -149,9 +149,26 @@ class STOPotentialEvaluator : public STOPrimitiveEvaluator {
 public:
   using STOPrimitiveEvaluator::STOPrimitiveEvaluator;
 
-  /// Electrostatic potential of the block's single basis function, at an
-  /// ABSOLUTE point. The evaluator subtracts the center itself, matching
-  /// eval_block, which is why callers no longer compute dx/dy/dz/r by hand.
+  /**
+   *  @brief Electrostatic potential of every function in the shell, at an
+   *         ABSOLUTE point. The evaluator subtracts the centre itself,
+   *         matching eval_block.
+   *
+   *  The radial factor C(n, l, zeta) I(n, l, r, zeta) is the same for all
+   *  2l+1 functions of the shell -- only the solid harmonic differs -- so
+   *  it is computed ONCE here. That matters more than anywhere else in the
+   *  library: I_tilde evaluates two incomplete gamma functions, this runs
+   *  once per (auxiliary function, grid point) on every Coulomb and
+   *  exchange build, and the per-function version computed it 2l+1 times
+   *  over for a p or d shell.
+   *
+   *  One primitive per shell, which is what make_slater_radial produces
+   *  from a primitive Slater basis and what every caller passes. A
+   *  contracted fitting basis would need its coefficients threaded through
+   *  here, and would have needed that before this too: C_prefactor carries
+   *  the normalization the potential assumes, so the contraction cannot
+   *  simply multiply it.
+   */
   KOKKOS_INLINE_FUNCTION void
   eval_potential_block(const block_params &p, double x, double y, double z,
                        double *out, int stride) const {
@@ -160,7 +177,19 @@ public:
     const double dy = y - p.O[1];
     const double dz = z - p.O[2];
     const double r = Kokkos::sqrt(dx * dx + dy * dy + dz * dz);
-    out[0] = sto_potential(p.n, p.l, p.m, dx, dy, dz, r, p.zeta);
+
+    const auto &rad = radial();
+    const int n = rad.n(p.p0);
+    const double zeta = rad.zeta(p.p0);
+    const double radial_part =
+        C_prefactor(n, p.l, zeta) * I_tilde(n, p.l, r, zeta);
+
+    const int nfunc = 2 * p.l + 1;
+    for (int i = 0; i < nfunc; ++i) {
+      double S;
+      real_solid_harmonic_cart_precomputed(p.l, i - p.l, dx, dy, dz, S);
+      out[i] = radial_part * S;
+    }
   }
 };
 
