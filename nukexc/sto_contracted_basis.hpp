@@ -86,6 +86,7 @@
 
 #include "basis_evaluator.hpp"
 #include "nukexc_config.hpp"
+#include "radial_shell.hpp"
 #include "nukexc_utils.hpp"
 #include "spherical_harmonics.hpp"
 #include "stobasis.hpp"
@@ -437,49 +438,156 @@ void contracted_basis_eval_with_grad(const STOContractedBasisSet &basis,
 // summed inside a single eval_block call, so the shared work is already
 // amortized without grouping functions together.
 
-class STOContractedEvaluator {
+/**
+ *  @brief Group a contracted STO basis into shells, as a SlaterRadial.
+ *
+ *  STOContractedBasisSet stores one CSR row of primitives per (l, m)
+ *  FUNCTION, so the 2l+1 functions of a shell each carry their own copy of
+ *  the same radial. A shell needs one, so the primitives are compacted here:
+ *  the result holds each distinct radial once.
+ *
+ *  The grouping is checked rather than assumed, as for the primitive basis:
+ *  the 2l+1 functions must share l, their centre and their primitive list
+ *  exactly, with m running -l .. +l in order. Every reader emits that; a
+ *  basis that does not is rejected rather than silently permuted.
+ */
+inline SlaterRadial make_slater_radial(const STOContractedBasisSet &b) {
+  const int nbf = static_cast<int>(b.nbf());
+  if (nbf == 0)
+    throw std::invalid_argument("make_slater_radial: empty contracted basis");
+
+  auto l_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, b.l);
+  auto m_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, b.m);
+  auto o_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, b.O);
+  auto cut_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, b.cutoff_radii);
+  auto po_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, b.prim_offset);
+  auto n_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, b.n);
+  auto z_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, b.zeta);
+  auto c_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, b.coeff);
+
+  std::vector<int> sh_l, sh_np, sh_n;
+  std::vector<Point> sh_center;
+  std::vector<double> sh_radius, sh_zeta, sh_coeff;
+
+  int i = 0;
+  while (i < nbf) {
+    const int l = l_h(i);
+    const int nf = 2 * l + 1;
+    if (i + nf > nbf)
+      throw std::runtime_error(
+          "make_slater_radial: contracted function " + std::to_string(i) +
+          " starts an l = " + std::to_string(l) + " shell with only " +
+          std::to_string(nbf - i) + " functions left");
+
+    const int p0 = po_h(i), np = po_h(i + 1) - po_h(i);
+    double radius = 0.0;
+    for (int k = 0; k < nf; ++k) {
+      const int j = i + k;
+      bool same = l_h(j) == l && m_h(j) == -l + k &&
+                  o_h(j)[0] == o_h(i)[0] && o_h(j)[1] == o_h(i)[1] &&
+                  o_h(j)[2] == o_h(i)[2] &&
+                  (po_h(j + 1) - po_h(j)) == np;
+      for (int q = 0; same && q < np; ++q)
+        same = n_h(po_h(j) + q) == n_h(p0 + q) &&
+               z_h(po_h(j) + q) == z_h(p0 + q) &&
+               c_h(po_h(j) + q) == c_h(p0 + q);
+      if (!same)
+        throw std::runtime_error(
+            "make_slater_radial: contracted functions " + std::to_string(i) +
+            ".." + std::to_string(i + nf - 1) +
+            " do not form one shell -- they must share l, centre and "
+            "primitive list with m = -l..+l in order, or grouping them "
+            "would permute the basis");
+      radius = Kokkos::max(radius, cut_h(j));
+    }
+
+    sh_l.push_back(l);
+    sh_np.push_back(np);
+    sh_center.push_back(o_h(i));
+    sh_radius.push_back(radius);
+    for (int q = 0; q < np; ++q) {
+      sh_n.push_back(n_h(p0 + q));
+      sh_zeta.push_back(z_h(p0 + q));
+      sh_coeff.push_back(c_h(p0 + q));
+    }
+    i += nf;
+  }
+
+  const int nshell = static_cast<int>(sh_l.size());
+  const int nprim = static_cast<int>(sh_zeta.size());
+  SlaterRadial rad;
+  ShellTable &t = rad.sh;
+  t.nshell = nshell;
+  t.nbf = nbf;
+  t.l = Kokkos::View<int *>("csto shell l", nshell);
+  t.first_bf = Kokkos::View<int *>("csto shell first bf", nshell + 1);
+  t.prim_offset = Kokkos::View<int *>("csto shell prim offset", nshell + 1);
+  t.center = Kokkos::View<Point *>("csto shell center", nshell);
+  t.radius = Kokkos::View<double *>("csto shell radius", nshell);
+  rad.zeta = Kokkos::View<double *>("csto zeta", nprim);
+  rad.coeff = Kokkos::View<double *>("csto coeff", nprim);
+  rad.n = Kokkos::View<int *>("csto n", nprim);
+
+  auto tl = Kokkos::create_mirror_view(t.l);
+  auto tf = Kokkos::create_mirror_view(t.first_bf);
+  auto tp = Kokkos::create_mirror_view(t.prim_offset);
+  auto tc = Kokkos::create_mirror_view(t.center);
+  auto tr = Kokkos::create_mirror_view(t.radius);
+  auto rz = Kokkos::create_mirror_view(rad.zeta);
+  auto rc = Kokkos::create_mirror_view(rad.coeff);
+  auto rn = Kokkos::create_mirror_view(rad.n);
+
+  int bf = 0, prim = 0;
+  for (int s = 0; s < nshell; ++s) {
+    tl(s) = sh_l[s];
+    tf(s) = bf;
+    tp(s) = prim;
+    tc(s) = sh_center[s];
+    tr(s) = sh_radius[s];
+    bf += 2 * sh_l[s] + 1;
+    prim += sh_np[s];
+  }
+  tf(nshell) = bf;
+  tp(nshell) = prim;
+  for (int q = 0; q < nprim; ++q) {
+    rz(q) = sh_zeta[q];
+    rc(q) = sh_coeff[q];
+    rn(q) = sh_n[q];
+  }
+
+  Kokkos::deep_copy(t.l, tl);
+  Kokkos::deep_copy(t.first_bf, tf);
+  Kokkos::deep_copy(t.prim_offset, tp);
+  Kokkos::deep_copy(t.center, tc);
+  Kokkos::deep_copy(t.radius, tr);
+  Kokkos::deep_copy(rad.zeta, rz);
+  Kokkos::deep_copy(rad.coeff, rc);
+  Kokkos::deep_copy(rad.n, rn);
+  return rad;
+}
+
+/**
+ *  @brief The contracted Slater evaluator: shells of 2l+1, radial once each.
+ *
+ *  The same template as the primitive path, over the same policy -- a
+ *  contraction is SlaterRadial with more than one primitive per shell, which
+ *  is what the policy was written to take. What used to be here was a third
+ *  Slater evaluator with its own ContractedShellParams, its own
+ *  value-and-gradient routine and its own single-function blocks.
+ *
+ *  load_contracted_shell and contracted_basis_eval stay above: they are the
+ *  per-function reference this is checked against.
+ */
+class STOContractedEvaluator : public SolidHarmonicEvaluator<SlaterRadial> {
 public:
-  struct block_params {
-    ContractedShellParams sh;
-  };
-  static constexpr int max_block_size = 1;
+  using base = SolidHarmonicEvaluator<SlaterRadial>;
+  using block_params = base::block_params;
 
   STOContractedEvaluator() = default;
-  explicit STOContractedEvaluator(STOContractedBasisSet b) : b_(std::move(b)) {}
-
-  int nbf() const { return static_cast<int>(b_.nbf()); }
-  int nblock() const { return static_cast<int>(b_.nbf()); }
-  KOKKOS_INLINE_FUNCTION int block_first_bf(int i) const { return i; }
-  KOKKOS_INLINE_FUNCTION int block_size(int) const { return 1; }
-
-  Kokkos::View<Point *> centers() const { return b_.O; }
-  Kokkos::View<double *> radii() const { return b_.cutoff_radii; }
+  explicit STOContractedEvaluator(STOContractedBasisSet b)
+      : base(make_slater_radial(b)), b_(std::move(b)) {}
 
   const STOContractedBasisSet &basis() const { return b_; }
-
-  KOKKOS_INLINE_FUNCTION block_params load_block(int i) const {
-    return block_params{load_contracted_shell(b_, i)};
-  }
-
-  /// Highest derivative order eval_block implements, as for the
-  /// primitive Slater path.
-  static constexpr BasisDeriv max_deriv = BasisDeriv::Gradient;
-
-  template <BasisDeriv D>
-  KOKKOS_INLINE_FUNCTION void eval_block(const block_params &p, double x,
-                                         double y, double z, double *out,
-                                         int stride) const {
-    static_assert(D == BasisDeriv::Value || D == BasisDeriv::Gradient,
-                  "the contracted STO path implements values and gradients; "
-                  "higher orders are not yet derived for Slater functions");
-    if constexpr (D == BasisDeriv::Value) {
-      out[BF_VAL * stride] = contracted_basis_eval(b_, p.sh, x, y, z);
-    } else {
-      contracted_basis_eval_with_grad(b_, p.sh, x, y, z, out[BF_VAL * stride],
-                                      out[BF_DX * stride], out[BF_DY * stride],
-                                      out[BF_DZ * stride]);
-    }
-  }
 
 private:
   STOContractedBasisSet b_;
