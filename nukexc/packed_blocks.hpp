@@ -46,6 +46,36 @@
 // correct on any Slater basis and silently does O(max_block_size) redundant
 // work on anything else.
 //
+// WHAT THE SCREENED PATH IS FOR, MEASURED
+// ---------------------------------------
+// Memory, not time. Wherever the dense path's tables fit it is the faster
+// one: it evaluates the collocation and the auxiliary potential ONCE into
+// (nbf, npts) and (naux, npts) arrays and then does BLAS on them, while
+// every routine built on this header re-evaluates both on every build.
+//
+// C6H14, nrad 25, lmax 10, LDA, seconds per Fock build, screened against
+// dense:
+//
+//     basis             nbf   naux        J              XC
+//     zorabasis/DZ       88    954   2.73 / 0.34    0.99 / 0.55
+//     DZ.cholesky        88    288   0.96 / 0.25    0.94 / 0.49
+//     zorabasis/TZ2P    310    954   5.33 / 2.16   10.66 / 4.79
+//     TZ2P.cholesky     310   1884   7.23 / 1.56    8.83 / 4.47
+//
+// The XC ratio is about two throughout, and the XC does not touch the
+// auxiliary basis at all: that gap is the collocation, re-packed per build
+// against a table the dense path keeps. The Coulomb ratio runs from 2.5 to 8
+// and tracks naux/nbf, the auxiliary potential being what it re-evaluates
+// twice per build.
+//
+// So the only question is ever whether the tables fit -- (nbf + naux) * npts
+// doubles. On C10H22 in TZ2P.cholesky that is 1.1 GB, dense runs and wins by
+// a factor of two per build; at a hundred atoms it is tens of gigabytes and
+// dense cannot run at all. Caching the tables HERE was measured, costed and
+// declined: it would turn this path into the dense one, which already
+// exists. Do not re-derive this -- measure it again if the machine or the
+// basis changes, but the shape of the answer is not in doubt.
+//
 // MEMORY, AND WHY THE BOXES COME IN CHUNKS
 // ----------------------------------------
 // The packed collocation for the whole grid is sum_b nbe_b * npts_b doubles,

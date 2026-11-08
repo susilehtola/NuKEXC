@@ -132,6 +132,10 @@ compute_coulomb(const ExecSpace space, const DeviceView2DLeft mo_orbitals,
 // aux_potential.hpp's chunked GEMVs, and the matrix itself through the
 // per-box collocation blocks of packed_blocks.hpp.
 //
+// This is the memory-frugal route, not the fast one: the dense path stores
+// the collocation and the auxiliary potential and is about twice as quick
+// per build wherever those tables fit. packed_blocks.hpp has the numbers.
+//
 // WHAT THIS REPLACES
 // ------------------
 // compute_coulomb_sparse and compute_coulomb_tiled, which between them had

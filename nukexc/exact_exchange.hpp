@@ -146,6 +146,10 @@ DeviceView2DLeft compute_exact_exchange(
 // the Coulomb potential has a 1/r tail, so every auxiliary function reaches
 // every box.
 //
+// This is the memory-frugal route, not the fast one: the dense path stores
+// the collocation and the auxiliary potential and is about twice as quick
+// per build wherever those tables fit. packed_blocks.hpp has the numbers.
+//
 // WHAT THIS FIXES, AND WHAT IT DOES NOT
 // -------------------------------------
 // It does not change the formalism, so the occupied-orbital loop that issue
