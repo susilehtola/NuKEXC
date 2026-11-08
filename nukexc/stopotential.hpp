@@ -42,6 +42,15 @@
 
 namespace Nukexc {
 
+// int_pow throughout, and one shared exp(-zr).
+//
+// This is called once per (auxiliary function, grid point) on every Coulomb
+// and exchange build, and it used to make five libm calls per evaluation:
+// three pow() with integer exponents, which the compiler does not fold, plus
+// an exp inside each of the two incomplete gammas at the same argument. What
+// is left is one exp and one sqrt. Measured on water in TZ2P with its
+// Cholesky fitting basis: the fitting metric and the Coulomb build (see the
+// commit that introduced this).
 KOKKOS_INLINE_FUNCTION
 double I_tilde(const int n, const int l, const double r, const double zeta) {
   int a = n + l + 2;
@@ -53,18 +62,23 @@ double I_tilde(const int n, const int l, const double r, const double zeta) {
     double fact_b_minus_1 = 1.0;
     for (int i = 2; i < b; ++i)
       fact_b_minus_1 *= i;
-    return fact_b_minus_1 / Kokkos::pow(zeta, b);
+    return fact_b_minus_1 / int_pow(zeta, b);
   }
 
-  double zr = zeta * r;
-  return lower_gamma(a, zr) /
-             (Kokkos::pow(zeta, a) * Kokkos::pow(r, 2 * l + 1)) +
-         upper_gamma(b, zr) / Kokkos::pow(zeta, b);
+  const double zr = zeta * r;
+  const double exp_minus_zr = Kokkos::exp(-zr);
+  return lower_gamma(a, zr, exp_minus_zr) /
+             (int_pow(zeta, a) * int_pow(r, 2 * l + 1)) +
+         upper_gamma(b, zr, exp_minus_zr) / int_pow(zeta, b);
 }
 
+/// (2 zeta)^(n + 1/2) is the one genuinely fractional power here, and it
+/// factors: (2 zeta)^n sqrt(2 zeta). That leaves a hardware sqrt where there
+/// was a libm pow.
 KOKKOS_INLINE_FUNCTION
 double C_prefactor(const int n, const int l, const double zeta) {
-  return 4 * M_PI * Kokkos::pow(2 * zeta, n + 0.5) /
+  const double two_zeta = 2 * zeta;
+  return 4 * M_PI * int_pow(two_zeta, n) * Kokkos::sqrt(two_zeta) /
          (Kokkos::sqrt(factorial(2 * n)) * (2 * l + 1));
 }
 
