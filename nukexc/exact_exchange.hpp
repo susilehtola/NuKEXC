@@ -179,7 +179,7 @@ inline DeviceView2DLeft compute_exact_exchange_screened(
     const ExecSpace space, const DeviceView2DLeft mo_orbitals,
     const DeviceView1D mo_coeff, const Evaluator basis,
     const PotEvaluator basis_aux, const FlatGrid grid, const NeighborList nl,
-    const DeviceView2DLeft half_inverse_X) {
+    const DeviceView2DLeft half_inverse_X, const int orbital_batch = 8) {
 
   Kokkos::Profiling::pushRegion("Compute Exact Exchange Integral Screened");
 
@@ -197,12 +197,42 @@ inline DeviceView2DLeft compute_exact_exchange_screened(
   if (N_occ == 0 || N_aux == 0)
     return result;
 
-  // Orbitals are done in batches: the three-centre block is (naux, nbf) per
-  // orbital, and one dot product accumulates the whole batch, so the batch
-  // amortizes the packing and the potential over several orbitals. The bound
-  // is a compile-time constant because the accumulator lives in registers.
-  constexpr int MAX_ORBITAL_BATCH = 8;
-  const int batch = std::min(N_occ, MAX_ORBITAL_BATCH);
+  // Orbitals are done in batches, and the batch size is the one structural
+  // knob this loop has. Everything outside the orbital loop -- packing the
+  // collocation and, far more expensively, evaluating the auxiliary
+  // potential -- is paid once per BATCH; the three-centre GEMM is paid once
+  // per orbital. So the cost is passes * P + N_occ * Q with
+  // passes = ceil(N_occ / batch). benchmark_exchange sweeps it; benzene, 72
+  // functions, 642 auxiliaries, 22 occupied, 14670 points, three runs back
+  // to back:
+  //
+  //     batch      1     2     4     8    16    32
+  //     passes    22    11     6     3     2     1
+  //     run 1   8.89  6.15  5.42  4.59  5.19  4.91
+  //     run 2   7.79  4.85  4.71  4.17  4.02  3.81
+  //     run 3   6.55  5.02  5.27  4.21  3.85  4.01
+  //
+  // Batching at all is worth about 1.6 to 2, so this is not a
+  // micro-optimization. Past four the curve is FLAT to within this
+  // machine's spread -- the first run alone looked like a minimum at eight
+  // and a penalty beyond it, and the next two did not reproduce either.
+  // Eight is therefore the default because it is on the flat part with the
+  // smaller working set, not because it is optimal; the three-centre tensor
+  // is (naux, nbf, batch) and nothing is measurably gained by growing it.
+  //
+  // Do not replace this with a memory budget. A budget would pick the
+  // largest batch that fits, which buys fewer auxiliary-potential passes
+  // than eight already does and costs a working set several times larger,
+  // for a difference this machine cannot resolve. That was tried first.
+  //
+  // The parameter exists so the sweep above can be re-measured rather than
+  // believed. The cap is a compile-time constant because the per-point
+  // accumulator lives in registers.
+  constexpr int MAX_ORBITAL_BATCH = 32;
+  if (orbital_batch < 1)
+    throw std::invalid_argument(
+        "compute_exact_exchange_screened: orbital_batch must be positive");
+  const int batch = std::min({N_occ, MAX_ORBITAL_BATCH, orbital_batch});
 
   // The chunk's point count is capped as well as its collocation size: the
   // auxiliary potential block is (naux, chunk points).

@@ -229,21 +229,26 @@ struct LKOCell {
  *  the normalization and multiplies the owner's share into the weight in
  *  place.
  *
- *  Two screenings, both from issue #5. A point closer to its owner than the
+ *  One screening, issue #5's first: a point closer to its owner than the
  *  policy's screening radius takes weight exactly 1 and the whole
- *  O(natoms^2) product is skipped; and a cell product that has fallen below
- *  1e-13 stops early, since the remaining factors cannot lift it.
+ *  O(natoms^2) product is skipped. For a saturating cell function that is
+ *  not an approximation but an identity -- inside that radius every mu_ab
+ *  with b != a is below -a, so every s is exactly 1, every other centre's
+ *  product contains an exact zero, and the normalized weight is exactly 1.
+ *  A policy whose cell function does not saturate returns a zero radius and
+ *  pays the full product everywhere.
  *
- *  Not done here: the pairwise trick of evaluating s(mu_ij) once and using
- *  s(-mu) = 1 - s(mu) for the transposed pair. It halves the polynomial
- *  evaluations in a serial loop over pairs, but this loop gives one THREAD
- *  per centre i, and the transposed update lands on another thread's
- *  accumulator. The factor two would cost the parallel decomposition, so it
- *  is not free here even though it is free on a CPU written serially. For a
- *  saturating cell function that is not an approximation: inside that radius
- *  every mu_ab with b != a is below -a, so every s is exactly 1 and the
- *  normalized weight is exactly 1. A policy whose cell function does not
- *  saturate returns a zero radius and pays the full product everywhere.
+ *  Issue #5's third screening, stopping a cell product below 1e-13, is NOT
+ *  done and must not be: see the comment at the break below for the alkane
+ *  chain it destroys. The product ends on an exact zero instead.
+ *
+ *  Nor is its fourth, the pairwise trick of evaluating s(mu_ij) once and
+ *  using s(-mu) = 1 - s(mu) for the transposed pair. It halves the
+ *  polynomial evaluations in a serial loop over pairs, but this loop gives
+ *  one THREAD per centre i and the transposed update lands on another
+ *  thread's accumulator. The factor two would cost the parallel
+ *  decomposition, so it is not free here even though it is free on a CPU
+ *  written serially.
  *
  *  No atomic size adjustment, matching ERKALE.
  */
