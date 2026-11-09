@@ -10,7 +10,7 @@
 //
 // WHY THIS TEST EXISTS
 // --------------------
-// compute_lsda_sparse and compute_gga_lsda_sparse had no test at all: their
+// The screened polarized quadrature had no test at all: its
 // only caller was the standalone SCF driver, which checks a converged total
 // energy and so cannot say whether the screened quadrature is right, only
 // whether it is close enough not to break convergence. That left the whole
@@ -37,10 +37,18 @@
 // WHAT THE TOLERANCE MEANS
 // ------------------------
 // Screening drops contributions from shells whose cutoff radius does not
-// reach a box, so the two paths are not expected to agree to round-off.
-// The tolerance measures those cutoffs; it is relative to the largest
-// element of the reference matrix, since the small elements of V are
-// differences of larger numbers.
+// reach a box, so the two paths need not agree bit for bit -- but on these
+// fixtures the dropped tails turn out to be below round-off: the worst
+// relative difference measured is 9e-14, so the tolerance is 1e-11 and not
+// the 1e-8 that was here when the number had never been looked at. It is
+// relative to the largest element of the reference matrix, since the small
+// elements of V are differences of larger numbers.
+//
+// The comparison also got stronger than it was. The screened path now takes
+// its potential from libxckernel's generated contraction while the dense one
+// still has the chain rule written out by hand, so this is a parity test
+// between two independent derivations of the same functional derivative --
+// not, as it was, between two spellings of one.
 
 #include <catch2/catch_all.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
@@ -58,6 +66,7 @@
 #include <nukexc/octree.hpp>
 #include <nukexc/stobasis.hpp>
 #include <nukexc/xc_integrals.hpp>
+#include <nukexc/xc_screened.hpp>
 
 #include <xc.h>
 #include <xc_funcs.h>
@@ -214,9 +223,9 @@ TEST_CASE("The screened LSDA matches the dense one for a Gaussian basis",
 
   const auto dense = compute_lsda(f.chi, f.grid.weights, f.Ca, f.occa, f.Cb,
                                   f.occb, fn.func);
-  const auto scr = compute_lsda_sparse(ev, f.grid, f.nl, f.Ca, f.occa, f.Cb,
+  const auto scr = compute_xc_polarized_sparse(ev, f.grid, f.nl, f.Ca, f.occa, f.Cb,
                                        f.occb, fn.func);
-  compare(scr, dense, 1e-8);
+  compare(scr, dense, 1e-11);
 }
 
 TEST_CASE("The screened GGA matches the dense one for a Gaussian basis",
@@ -236,9 +245,9 @@ TEST_CASE("The screened GGA matches the dense one for a Gaussian basis",
 
   const auto dense = compute_gga_lsda(f.chi, f.gx, f.gy, f.gz, f.grid.weights,
                                       f.Ca, f.occa, f.Cb, f.occb, fn.func);
-  const auto scr = compute_gga_lsda_sparse(ev, f.grid, f.nl, f.Ca, f.occa,
+  const auto scr = compute_xc_polarized_sparse(ev, f.grid, f.nl, f.Ca, f.occa,
                                            f.Cb, f.occb, fn.func);
-  compare(scr, dense, 1e-8);
+  compare(scr, dense, 1e-11);
 }
 
 TEST_CASE("The screened XC quadrature also serves a Slater basis",
@@ -257,18 +266,18 @@ TEST_CASE("The screened XC quadrature also serves a Slater basis",
   const auto f = make_fixture(mol, ev, 50, 21, 5, 4);
 
   const Functional lda(XC_LDA_X);
-  compare(compute_lsda_sparse(ev, f.grid, f.nl, f.Ca, f.occa, f.Cb, f.occb,
+  compare(compute_xc_polarized_sparse(ev, f.grid, f.nl, f.Ca, f.occa, f.Cb, f.occb,
                               lda.func),
           compute_lsda(f.chi, f.grid.weights, f.Ca, f.occa, f.Cb, f.occb,
                        lda.func),
-          1e-8);
+          1e-11);
 
   const Functional gga(XC_GGA_X_PBE);
-  compare(compute_gga_lsda_sparse(ev, f.grid, f.nl, f.Ca, f.occa, f.Cb,
+  compare(compute_xc_polarized_sparse(ev, f.grid, f.nl, f.Ca, f.occa, f.Cb,
                                   f.occb, gga.func),
           compute_gga_lsda(f.chi, f.gx, f.gy, f.gz, f.grid.weights, f.Ca,
                            f.occa, f.Cb, f.occb, gga.func),
-          1e-8);
+          1e-11);
 }
 
 TEST_CASE("The screened density is the same density the dense path uses",

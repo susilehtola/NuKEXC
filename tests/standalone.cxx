@@ -284,7 +284,7 @@ int main(int argc, char *argv[]) {
     const bool need_dense_aux_colloc = !use_neighbor_path; // dense (A|B) + J/K
     const bool need_basis_colloc = !use_neighbor_path;
     // Only the dense GGA quadrature consumes the gradient collocation;
-    // compute_gga_lsda_sparse differentiates the basis pointwise instead.
+    // the screened quadrature differentiates the basis pointwise instead.
     const bool need_grad_colloc = is_dft && !use_neighbor_path;
 
     Molecule mol;

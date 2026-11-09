@@ -35,6 +35,7 @@
 #include <nukexc/stobasis.hpp>
 #include <nukexc/xc_integrals.hpp>
 #include <nukexc/xc_kernel_session.hpp>
+#include <nukexc/xc_screened.hpp>
 
 #include <xc.h>
 #include <xc_funcs.h>
@@ -320,14 +321,16 @@ int main(int argc, char *argv[]) {
 
         t.reset();
         const auto res_lda =
-            compute_lsda_sparse(ev, grid, nl, Ca, occa, Cb, occb, lda);
+            compute_xc_polarized_sparse(ev, grid, nl, Ca, occa, Cb, occb,
+                                        lda);
         Kokkos::fence();
         r.t_lda = t.seconds();
         r.e_lda = res_lda.energy;
 
         t.reset();
         const auto res_gga =
-            compute_gga_lsda_sparse(ev, grid, nl, Ca, occa, Cb, occb, gga);
+            compute_xc_polarized_sparse(ev, grid, nl, Ca, occa, Cb, occb,
+                                        gga);
         Kokkos::fence();
         r.t_gga = t.seconds();
         r.e_gga = res_gga.energy;
