@@ -39,7 +39,7 @@
 // Screening drops contributions from shells whose cutoff radius does not
 // reach a box, so the two paths need not agree bit for bit -- but on these
 // fixtures the dropped tails turn out to be below round-off: the worst
-// relative difference measured is 9e-14, so the tolerance is 1e-11 and not
+// relative difference measured is 2.1e-13, so the tolerance is 1e-11 and not
 // the 1e-8 that was here when the number had never been looked at. It is
 // relative to the largest element of the reference matrix, since the small
 // elements of V are differences of larger numbers.

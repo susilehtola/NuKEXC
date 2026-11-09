@@ -24,8 +24,8 @@ Only the kinds NuKEXC uses are generated. `exc` is the energy
 (Exc = sum_g w_g rho_g zk_g) and `matrix` is the Fock matrix; everything
 else in the catalog -- gradients, Hessians, MO-projected response, GIAO
 -- belongs to phases NuKEXC has not reached. For the four families at
-order 1 that is 16 kernels and 240 KiB, against 60 and 1.5 MiB for all
-kinds.
+order 1 that is 16 kernels and 74 KiB as the generator reports it, against
+60 and 1.5 MiB for all kinds.
 
 Usage
 -----
@@ -55,8 +55,11 @@ KINDS = "exc,matrix"
 
 #: The release this tree was generated from. Bump deliberately: the
 #: operand-name constants the binding static_asserts against arrived in
-#: 0.5.0, so anything older will not compile.
-WANT_TAG = "v0.5.0"
+#: 0.5.0, so anything older will not compile. 0.7.0 is where the symmetric
+#: matrix kernels stopped paying a GEMM for both members of a transposed
+#: pattern pair -- gga o1 went from four products to one -- which is worth
+#: re-measuring after, not just rebuilding.
+WANT_TAG = "v0.7.0"
 
 
 def libxckernel_version(src):
@@ -126,9 +129,15 @@ establish these kernels reproduce NuKEXC's own XC assembly.
   Libxc's declaration order;
 * the `constexpr` counts `_n_fields` / `_n_xc`, which
   `nukexc/xc_kernels.hpp` static_asserts so a regeneration that changed
-  a kernel's arity fails to compile instead of reading past an array.
+  a kernel's arity fails to compile instead of reading past an array;
+* `xck_<name>_work(npts, nbf)`, asked rather than bounded. 0.7.0 grew it
+  by nbf^2 per part for the half product its symmetric kernels now
+  accumulate, and NuKEXC sizes a work slice PER SPATIAL BOX from it
+  (`PackedCollocationStore`), so a hand-rolled bound would have silently
+  started overlapping those slices.
 
-The last two arrived in 0.5.0; older releases will not compile.
+The named structs and the counts arrived in 0.5.0; older releases will not
+compile.
 """
 
 

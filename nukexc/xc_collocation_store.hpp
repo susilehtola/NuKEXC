@@ -69,34 +69,46 @@
 // table): where the dense store fits it is the faster one, and the packed
 // store is for the molecule whose tower does not fit. Per Fock build on
 // benzene, 150 functions, 35360 points, three runs back to back from
-// benchmark_xc --sessions --nrad=35 --nang=15 --box-size=128:
+// benchmark_xc --sessions --nrad=35 --nang=15 --box-size=128, at
+// libxckernel 0.7.0:
 //
 //     family      dense               screened            MiB D / S
-//     LDA         0.35 / 0.18 / 0.16  0.57 / 0.40 / 0.35   82.1 / 111.4
-//     GGA         0.79 / 0.47 / 0.38  1.22 / 1.01 / 0.97  324.9 / 220.2
-//     mGGA-tau    1.07 / 0.90 / 0.80  1.71 / 1.28 / 1.34  324.9 / 220.2
+//     LDA         0.16 / 0.18 / 0.20  0.34 / 0.46 / 0.45   82.1 / 111.4
+//     GGA         0.18 / 0.23 / 0.23  0.44 / 0.67 / 0.72  325.1 / 258.6
+//     mGGA-tau    0.80 / 0.80 / 0.54  1.45 / 1.24 / 1.26  324.9 / 220.2
 //
-// Dense runs about one and a half to two times faster, because it hands the
-// whole contraction to one large GEMM while the packed store hands BLAS
-// thousands of small ones -- n of order 60, k of order 128 -- where there
-// is nothing to amortize.
+// Dense runs about two to three times faster, because it hands the whole
+// contraction to one large GEMM while the packed store hands BLAS thousands
+// of small ones -- n of order 60, k of order 128 -- where there is nothing
+// to amortize.
 //
-// THAT ANSWER DEPENDS ON THE KERNELS HAVING A BLAS, WHICH IS A BUILD FLAG
-// ----------------------------------------------------------------------
-// libxckernel's Stage B is its own loop nest unless XCKERNEL_USE_BLAS is
-// defined, and the top-level CMakeLists defines it. Without it the table
-// above reads the other way round -- dense GGA 3.6-6.6 s against screened
-// 2.1-2.3 -- because the flop counts then decide and they are nbf^2 * npts
-// against sum_b nbe_b^2 * npts_b. Four to thirteen times on the dense GGA
-// is a large number to find behind a macro, and the reason it is that large
-// is the shape of the generated kernels: xck_gga_r_o1 writes the potential
-// as four rank updates where a hand-derived form that exploits the symmetry
-// of the result needs one. There are four times the GEMM flops to hide, and
-// only a real GEMM can hide them.
+// THE NUMBERS MOVE WITH THE KERNELS AND WITH ONE BUILD FLAG
+// ---------------------------------------------------------
+// Two things outside this header set that table, and both have already
+// moved it once:
 //
-// So: measure this again if the kernels are regenerated or the flag moves.
-// The conclusion is not a property of the layouts, it is a property of the
-// layouts AND what contracts them.
+// libxckernel 0.7.0 stopped paying a GEMM for both members of a transposed
+// pattern pair: gga o1 went from four matrix products to one, mgga from
+// five to four, lda and mgga_tau unchanged. The dense GGA build above was
+// 0.38-0.79 s at 0.5.0 and the screened one 0.97-1.22, so that release is
+// worth two about everywhere it applies -- and it also brought the kernel's
+// summation order into line with the hand-written assembly, which now
+// agrees to one or two ulp rather than fifty (tests/reference/
+// libxckernel-upstream.md).
+//
+// XCKERNEL_USE_BLAS, which the top-level CMakeLists defines, decides
+// whether Stage B is a real GEMM or libxckernel's own loop nest. Without it,
+// still at 0.7.0: dense LDA 0.77-0.94, GGA 1.05, mGGA-tau 5.4-5.7; screened
+// 0.63-0.75, 0.77-0.93, 2.4-2.5. So the flag is worth five on a dense GGA
+// and seven to ten on a dense mGGA-tau -- which is now the worst case, being
+// the family 0.7.0 left at four products. Without the flag the table above
+// reads the other way round for everything above an LDA, dense losing to
+// screened, because the flop counts then decide and they are nbf^2 * npts
+// against sum_b nbe_b^2 * npts_b.
+//
+// Measure this again after a regeneration or a flag change. The conclusion
+// is not a property of the layouts; it is a property of the layouts AND
+// what contracts them.
 //
 // The memory column is a budget, not a measurement of need: the packed
 // store's footprint is set by build_packed_block_layout's chunk budget
@@ -104,6 +116,10 @@
 // the dense store on a small problem -- water, and benzene at LDA, where
 // the whole tower is smaller than one chunk. What it does not do is grow
 // with nbf * npts, which is the only thing that matters at a hundred atoms.
+// The packed GGA figure grew from 220.2 MiB at 0.5.0 because 0.7.0's half
+// product needs nbf_b^2 more scratch per box; xc_fock_work_size reports it,
+// which is why the per-box work prefix asks that function rather than
+// bounding the answer itself.
 //
 #include <algorithm>
 #include <stdexcept>
