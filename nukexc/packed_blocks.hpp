@@ -55,11 +55,13 @@
 //
 // Note what that turns on, because it is easy to lose: the dense side wins
 // by handing one large GEMM to BLAS. A dense path WITHOUT a BLAS loses to
-// this one, by a factor of several -- see xc_collocation_store.hpp, where
-// enabling libxckernel's BLAS Stage B moved a dense GGA Fock build from 3.6
-// seconds to 0.5 and turned that comparison around. The question is never
-// which layout is denser; it is which side's flop count the library it
-// contracts through can hide.
+// this one, by a factor of several -- see xc_collocation_store.hpp, where a
+// dense GGA Fock build goes from 0.18-0.23 s to 1.05 and a dense tau
+// meta-GGA from 0.54-0.80 to 5.4-5.7 when libxckernel's BLAS Stage B is
+// switched off, which turns that comparison around for everything above an
+// LDA. The question is never which layout is
+// denser; it is which side's flop count the library it contracts through
+// can hide.
 //
 // C6H14, nrad 25, lmax 10, LDA, seconds per Fock build, screened against
 // dense:

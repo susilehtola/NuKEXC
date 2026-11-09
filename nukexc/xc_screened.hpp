@@ -76,27 +76,32 @@
 //
 // WHAT IT COST, MEASURED
 // ----------------------
-// Nothing, and the LDA got faster. Per polarized Fock build on benzene, 150
-// functions, 35360 points, three runs back to back from benchmark_xc
-// --nrad=35 --nang=15 --box-size=128:
+// Nothing, and both families got faster. Per polarized Fock build on
+// benzene, 150 functions, 35360 points, three runs back to back from
+// benchmark_xc --nrad=35 --nang=15 --box-size=128:
 //
 //     path                              LSDA                GGA
 //     hand-written (deleted)      1.62 / 1.69 / 1.82  2.47 / 1.79 / 2.88
-//     through the kernels         1.14 / 1.17 / 1.15  1.93 / 2.03 / 1.96
+//     kernels, libxckernel 0.5.0  1.14 / 1.17 / 1.15  1.93 / 2.03 / 1.96
+//     kernels, libxckernel 0.7.0  1.11 / 1.01 / 1.03  1.70 / 1.55 / 1.52
 //
-// The LSDA is a clear one and a half times; the GGA lands inside the spread
-// the hand-written path showed on three runs of the same input, with a
-// narrower spread of its own. The energies agree to all eight printed
-// digits.
+// The energies agree with the deleted path to all eight printed digits, and
+// the whole water PBE SCF converges to the same -76.3833763115 Eh through
+// this path and the dense hand-written one -- ten digits, not a tolerance.
 //
-// That is only true because the vendored kernels contract through BLAS --
-// the top-level CMakeLists defines XCKERNEL_USE_BLAS. Without it the same
-// GGA build takes 5.1-5.2 s, twice the path it replaced, because
-// xck_gga_ua_o1 writes the potential as four rank updates where the
+// The GGA row is the one worth reading twice. At 0.5.0 it was a wash:
+// xck_gga_ua_o1 wrote the potential as four rank updates where the
 // hand-derived form above exploited the symmetry of the result and needed
-// one. Four times the GEMM flops is affordable when a real GEMM hides them
-// and not otherwise, so if that flag ever moves, this is one of the places
-// to re-measure.
+// one, and four times the GEMM flops ate the whole saving. 0.7.0's shared
+// product planner emits exactly that one product -- accumulate the half
+// product, then add it to its own transpose -- so the generated kernel now
+// does the same algebra the deleted code did, and is faster than it.
+//
+// What is left of the dependency is the BLAS flag: without
+// XCKERNEL_USE_BLAS the 0.7.0 GGA build takes 2.1-2.3 s and the LSDA
+// 1.5-1.7, i.e. back to roughly the path it replaced. The LSDA is the
+// family libxckernel has always emitted as one product, so what the flag
+// buys there is purely GEMM quality.
 //
 // WHY IT LIVES IN ITS OWN HEADER
 // ------------------------------

@@ -257,3 +257,49 @@ at order 1 that is 16 kernels and 240 KiB rather than 60 and 1.5 MiB.
 The `xck_kernel_info`
 layout change in the same release does not affect a header-only
 consumer, which never sees the index.
+
+---
+
+## Status after v0.7.0
+
+v0.7.0 (`5ae8376`, 2026-11-09) changed the emitted matrix kernels rather
+than their interface: one product planner, shared with the NumPy
+emitter, now accumulates one member of each transposed pattern pair into
+a half product X and completes it as X + X^T. Per call that is `gga`
+`o1` four matrix products down to one and `mgga` five down to four;
+`lda` and `mgga_tau` are unchanged. The C ABI, the operand structs and
+the `_n_fields`/`_n_xc` counts are all unchanged, so NuKEXC's
+static_asserts and its binding needed no edit at all. `<name>_work`
+grows by nbf^2 per part for the half product -- which costs a caller
+nothing as long as it asks `xck_*_work` for the size, as
+`xc_fock_work_size` does and as `PackedCollocationStore`'s per-box work
+prefix does through it.
+
+**The agreement got three orders of magnitude tighter**, which is the
+part worth recording. Re-measured exactly as above -- water/TZP, 31
+basis functions, NuKEXC screening disabled, against the hand-written
+assembly ERKALE validates:
+
+| functional | worst abs | relative | was (v0.5.0) |
+|---|---|---|---|
+| `XC_LDA_X` | 1.11e-16 | 8.2e-17 | 1.5e-14 |
+| `XC_GGA_X_PBE` | 2.22e-16 | 1.2e-16 | 8.5e-15 |
+| `XC_GGA_C_PBE` | 6.94e-18 | 2.1e-16 | -- |
+
+One or two ulp, from fifty. That is not a numerical improvement in the
+kernel so much as a structural coincidence worth understanding: the
+hand-written GGA assembly formed `Z = w(1/2 chi vrho + vec . grad chi)`,
+took one product `Z chi^T`, and added the transpose. v0.7.0's planner
+emits precisely that -- accumulate the half product, complete it with
+`add_sym` -- so the two now sum the same terms in the same order, where
+v0.5.0's four rank updates did not.
+
+NuKEXC has since deleted its hand-written SCREENED copy of that algebra
+in favour of the kernels (`nukexc/xc_screened.hpp`); the dense one stays,
+because it is the oracle this table is measured against.
+
+Timings for both are in `nukexc/xc_collocation_store.hpp`. In short:
+0.7.0 is worth about two on every GGA path here, and the comparison
+between the dense and the packed collocation store still depends on
+`XCKERNEL_USE_BLAS`, which the top-level CMakeLists now defines.
+

@@ -9,7 +9,7 @@ GENERATED -- do not edit. Regenerate with:
 | | |
 |---|---|
 | source | https://github.com/susilehtola/libxckernel |
-| version | `v0.5.0` (`5d84d7a`) |
+| version | `v0.7.0` (`5ae8376`) |
 | families | `lda,gga,mgga_tau,mgga` |
 | max order | `1` |
 | kinds | `exc,matrix` |
@@ -34,6 +34,12 @@ establish these kernels reproduce NuKEXC's own XC assembly.
   Libxc's declaration order;
 * the `constexpr` counts `_n_fields` / `_n_xc`, which
   `nukexc/xc_kernels.hpp` static_asserts so a regeneration that changed
-  a kernel's arity fails to compile instead of reading past an array.
+  a kernel's arity fails to compile instead of reading past an array;
+* `xck_<name>_work(npts, nbf)`, asked rather than bounded. 0.7.0 grew it
+  by nbf^2 per part for the half product its symmetric kernels now
+  accumulate, and NuKEXC sizes a work slice PER SPATIAL BOX from it
+  (`PackedCollocationStore`), so a hand-rolled bound would have silently
+  started overlapping those slices.
 
-The last two arrived in 0.5.0; older releases will not compile.
+The named structs and the counts arrived in 0.5.0; older releases will not
+compile.

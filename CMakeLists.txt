@@ -69,13 +69,21 @@ target_include_directories(
 )
 
 # Let the vendored kernels send their Stage B contraction to BLAS instead of
-# their own loop nest. This is not a small difference: on benzene at nrad 35,
-# lmax 15, one dense GGA Fock build through XCKernelSession goes from 3.6-6.6
-# seconds to 0.5-0.8, and the screened one from 2.1-2.3 to 1.0-1.2. The
-# reason it matters so much here is the shape of the generated kernels -- the
-# GGA writes its potential as four rank updates where a hand-derived form
-# exploiting the symmetry needs one, so there are four times the GEMM flops
-# to hide and a hand-rolled GEMM cannot hide them.
+# their own loop nest. This is not a small difference. Per Fock build on
+# benzene at nrad 35, lmax 15, through XCKernelSession, at libxckernel 0.7.0:
+#
+#                    dense                screened
+#     family    with BLAS   without    with BLAS   without
+#     LDA       0.16-0.20   0.77-0.94  0.34-0.46   0.63-0.75   seconds
+#     GGA       0.18-0.23   1.05       0.44-0.72   0.77-0.93
+#     mGGA-tau  0.54-0.80   5.4-5.7    1.24-1.45   2.4-2.5
+#
+# (three runs back to back with the flag, two without.)
+#
+# So five times on a dense GGA and seven to ten on a dense mGGA-tau. The
+# worst case is mgga_tau because it is the family 0.7.0's product planner
+# left at four matrix products; gga came down to one, which is why its gap
+# is now the narrowest of the three rather than the widest.
 #
 # dgemm_ is already an undefined symbol in every binary here (KokkosKernels
 # and Armadillo both want a BLAS; this machine resolves it through
