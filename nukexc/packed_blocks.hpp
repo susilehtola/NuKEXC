@@ -354,6 +354,25 @@ inline Kokkos::View<double *> nuclear_potential_on_grid(const FlatGrid &grid) {
 }
 
 /**
+ *  @brief Where pack_collocation puts a box's derivative components.
+ *
+ *  Two consumers want the same numbers in two different orders, and the
+ *  shell evaluation is far too expensive to do twice, so the order is a
+ *  parameter of the packing rather than a transpose afterwards.
+ */
+enum class PackedLayout {
+  /// chi as (nbf_b, npts_b) and grad as (nbf_b, 3 * npts_b), the Cartesian
+  /// components along each row's point axis. The block GEMMs contract over
+  /// all three at once, which is why the components sit inside the row.
+  Blocks,
+  /// One (ncomp, nbf_b, npts_b) tower per box, component-major, which is
+  /// what libxckernel indexes as chi + k*nbf*npts + u*npts + g. Everything
+  /// goes in the `chi` buffer, which must therefore be ncomp times the size
+  /// a Blocks packing needs; `grad` is unused.
+  Tower,
+};
+
+/**
  *  @brief Pack collocation for one chunk of boxes.
  *
  *  One thread per (box, shell, point): the shell is evaluated once and all
@@ -362,15 +381,15 @@ inline Kokkos::View<double *> nuclear_potential_on_grid(const FlatGrid &grid) {
  *  function-pair kernel pays.
  *
  *  @tparam Deriv  Value packs only chi; Gradient also packs grad.
- *  @param chi   packed (nbf_b, npts_b) blocks, row-major per box
- *  @param grad  packed (nbf_b, 3 * npts_b) blocks, component-major within
- *               the point axis: component c of point g at column
- *               c * npts_b + g. That layout makes the kinetic energy ONE
- *               GEMM over 3 * npts columns instead of three over npts.
- *               Ignored, and may be a default-constructed View, when
- *               Deriv is Value.
+ *  @tparam Layout which of the two orders above to write.
+ *  @param chi   packed (nbf_b, npts_b) blocks, row-major per box -- or the
+ *               whole (ncomp, nbf_b, npts_b) tower under PackedLayout::Tower
+ *  @param grad  packed (nbf_b, 3 * npts_b) blocks; ignored, and may be a
+ *               default-constructed View, when Deriv is Value or the layout
+ *               is Tower
  */
-template <BasisDeriv Deriv, typename Evaluator>
+template <BasisDeriv Deriv, PackedLayout Layout = PackedLayout::Blocks,
+          typename Evaluator>
   requires BasisEvaluatorWith<Evaluator, Deriv>
 inline void pack_collocation(const Evaluator &basis, const FlatGrid &grid,
                              const NeighborList &nl,
@@ -410,9 +429,14 @@ inline void pack_collocation(const Evaluator &basis, const FlatGrid &grid,
           return;
 
         const size_t cb = coll_off(b) - coll_off(box_begin);
-        double *chi_b = chi.data() + cb;
-        double *grad_b =
-            (Deriv == BasisDeriv::Gradient) ? grad.data() + 3 * cb : nullptr;
+        constexpr bool tower = (Layout == PackedLayout::Tower);
+        // Under Tower every component lives in `chi`, so the box's base
+        // offset carries the component factor and the component stride is
+        // one whole (nbf_b, npts_b) block.
+        double *chi_b = chi.data() + (tower ? NC * cb : cb);
+        double *grad_b = (Deriv == BasisDeriv::Gradient && !tower)
+                             ? grad.data() + 3 * cb
+                             : nullptr;
         const int g0 = b * mppb;
 
         Kokkos::parallel_for(
@@ -432,10 +456,20 @@ inline void pack_collocation(const Evaluator &basis, const FlatGrid &grid,
                 const size_t row = static_cast<size_t>(l0 + i);
                 chi_b[row * np + g] = local[BF_VAL * MBS + i];
                 if constexpr (Deriv == BasisDeriv::Gradient) {
-                  double *gr = grad_b + row * 3 * static_cast<size_t>(np);
-                  gr[0 * np + g] = local[BF_DX * MBS + i];
-                  gr[1 * np + g] = local[BF_DY * MBS + i];
-                  gr[2 * np + g] = local[BF_DZ * MBS + i];
+                  if constexpr (Layout == PackedLayout::Tower) {
+                    // One whole (nbf_b, npts_b) block between components.
+                    const size_t comp_stride =
+                        static_cast<size_t>(nbf_b) * np;
+                    double *t = chi_b + row * np + g;
+                    t[1 * comp_stride] = local[BF_DX * MBS + i];
+                    t[2 * comp_stride] = local[BF_DY * MBS + i];
+                    t[3 * comp_stride] = local[BF_DZ * MBS + i];
+                  } else {
+                    double *gr = grad_b + row * 3 * static_cast<size_t>(np);
+                    gr[0 * np + g] = local[BF_DX * MBS + i];
+                    gr[1 * np + g] = local[BF_DY * MBS + i];
+                    gr[2 * np + g] = local[BF_DZ * MBS + i];
+                  }
                 }
               }
             });
