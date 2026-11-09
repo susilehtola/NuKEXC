@@ -48,18 +48,18 @@
 //
 // WHAT THE SCREENED PATH IS FOR, MEASURED
 // ---------------------------------------
-// Memory, not time, for the routines in THIS library's own hand: wherever
-// the dense path's tables fit it is the faster one, because it evaluates
-// the collocation and the auxiliary potential ONCE into (nbf, npts) and
-// (naux, npts) arrays and then does BLAS on them, while every routine built
-// on this header re-evaluates both on every build.
+// Memory, not time. Wherever the dense path's tables fit it is the faster
+// one: it evaluates the collocation and the auxiliary potential ONCE into
+// (nbf, npts) and (naux, npts) arrays and then does BLAS on them, while
+// every routine built on this header re-evaluates both on every build.
 //
-// That reasoning turns on the dense side having BLAS, so it does not carry
-// over to a contraction that has none. The kernel-backed XC path is exactly
-// that case -- libxckernel's Stage B is its own loop nest -- and there the
-// packed store is both smaller AND faster; see xc_collocation_store.hpp for
-// the measurement. The question is always which side's flop count the
-// library it contracts through can hide, not which layout is denser.
+// Note what that turns on, because it is easy to lose: the dense side wins
+// by handing one large GEMM to BLAS. A dense path WITHOUT a BLAS loses to
+// this one, by a factor of several -- see xc_collocation_store.hpp, where
+// enabling libxckernel's BLAS Stage B moved a dense GGA Fock build from 3.6
+// seconds to 0.5 and turned that comparison around. The question is never
+// which layout is denser; it is which side's flop count the library it
+// contracts through can hide.
 //
 // C6H14, nrad 25, lmax 10, LDA, seconds per Fock build, screened against
 // dense:

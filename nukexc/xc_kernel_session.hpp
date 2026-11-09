@@ -572,11 +572,11 @@ private:
  *  @brief The kernel-backed session on a dense collocation tower.
  *
  *  Memory is ncomp * nbf * npts doubles and the basis is evaluated once in
- *  the constructor -- but the kernel then contracts over the whole basis at
- *  every point, which measures SLOWER than the screened session as well as
- *  larger; xc_collocation_store.hpp has the table. What this one is for is
- *  a Laplacian meta-GGA, which a packed block cannot carry, and being the
- *  validated oracle for the other.
+ *  the constructor. Where that fits it is the faster path, by one and a
+ *  half to two -- one large GEMM beats thousands of small ones -- and it is
+ *  also what a Laplacian meta-GGA needs, since a packed block stops at the
+ *  gradient. xc_collocation_store.hpp has the table, and the build flag the
+ *  comparison turns on.
  */
 template <typename Evaluator>
 class XCKernelSession
@@ -595,11 +595,11 @@ public:
  *
  *  Memory is one chunk of boxes at a time instead of the whole tower, and
  *  the basis is evaluated once per pass rather than once per session. That
- *  is the same trade every other screened path in this library makes, but
- *  unlike them this one also wins on time -- each kernel call contracts
- *  over a box's local functions instead of the whole basis, and
- *  libxckernel's contraction is not BLAS, so there is no dense advantage to
- *  give back. Measured in xc_collocation_store.hpp.
+ *  is the same trade every other screened path in this library makes, and
+ *  it costs the same thing: about one and a half to two times the time per
+ *  build, measured in xc_collocation_store.hpp. What it buys is a footprint
+ *  that does not grow with nbf * npts, which is what lets a molecule run
+ *  whose tower would not fit at all.
  *
  *  Covers LDA, GGA and tau meta-GGAs. A Laplacian meta-GGA throws from the
  *  store's constructor, since a packed block stops at the gradient.

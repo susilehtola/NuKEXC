@@ -63,31 +63,40 @@
 // point: the dense store is validated against ERKALE and so serves as the
 // oracle for the packed one (tests/test_xc_kernel_session.cxx).
 //
-// WHICH ONE IS FASTER, MEASURED -- AND IT IS NOT THE DENSE ONE
-// ------------------------------------------------------------
-// This is the opposite of the answer for the hand-written screened paths,
-// where dense wins by about two (packed_blocks.hpp has that table), and the
-// reason the answer flips is worth keeping: the hand-written dense path
-// contracts through KokkosBlas, while libxckernel's Stage B is its own loop
-// nest -- the vendored kernels are built without XCKERNEL_USE_BLAS. With no
-// BLAS advantage left on the dense side, the flop counts decide, and they
-// are nbf^2 * npts against sum_b nbe_b^2 * npts_b.
+// WHICH ONE TO USE, MEASURED
+// --------------------------
+// The same answer the hand-written paths give (packed_blocks.hpp has that
+// table): where the dense store fits it is the faster one, and the packed
+// store is for the molecule whose tower does not fit. Per Fock build on
+// benzene, 150 functions, 35360 points, three runs back to back from
+// benchmark_xc --sessions --nrad=35 --nang=15 --box-size=128:
 //
-// benchmark_xc --sessions --nrad=35 --nang=15 --box-size=128, seconds per
-// Fock build, dense against screened, two runs back to back:
+//     family      dense               screened            MiB D / S
+//     LDA         0.35 / 0.18 / 0.16  0.57 / 0.40 / 0.35   82.1 / 111.4
+//     GGA         0.79 / 0.47 / 0.38  1.22 / 1.01 / 0.97  324.9 / 220.2
+//     mGGA-tau    1.07 / 0.90 / 0.80  1.71 / 1.28 / 1.34  324.9 / 220.2
 //
-//     molecule  nbf  grid     family      dense        screened   MiB D / S
-//     water      31   9012    LDA       0.018/0.014   0.016/0.019   4.5/4.7
-//     water      31   9012    GGA       0.067/0.077   0.038/0.039  17.3/11.0
-//     water      31   9012    mGGA-tau  0.086/0.086   0.052/0.056  17.3/11.0
-//     benzene   150  35360    LDA       1.41/1.18     0.97/0.95    82.1/111.4
-//     benzene   150  35360    GGA       3.64/6.61     2.12/2.32   324.9/220.2
-//     benzene   150  35360    mGGA-tau  4.61/5.54     3.02/2.76   324.9/220.2
+// Dense runs about one and a half to two times faster, because it hands the
+// whole contraction to one large GEMM while the packed store hands BLAS
+// thousands of small ones -- n of order 60, k of order 128 -- where there
+// is nothing to amortize.
 //
-// So the packed store is the one to reach for at a gradient or above, and
-// the dense one is still what a Laplacian meta-GGA needs. Note also which
-// column is the noisier: the dense GGA build ran 3.64 s and then 6.61 s on
-// the same input, the screened one 2.12 and 2.32.
+// THAT ANSWER DEPENDS ON THE KERNELS HAVING A BLAS, WHICH IS A BUILD FLAG
+// ----------------------------------------------------------------------
+// libxckernel's Stage B is its own loop nest unless XCKERNEL_USE_BLAS is
+// defined, and the top-level CMakeLists defines it. Without it the table
+// above reads the other way round -- dense GGA 3.6-6.6 s against screened
+// 2.1-2.3 -- because the flop counts then decide and they are nbf^2 * npts
+// against sum_b nbe_b^2 * npts_b. Four to thirteen times on the dense GGA
+// is a large number to find behind a macro, and the reason it is that large
+// is the shape of the generated kernels: xck_gga_r_o1 writes the potential
+// as four rank updates where a hand-derived form that exploits the symmetry
+// of the result needs one. There are four times the GEMM flops to hide, and
+// only a real GEMM can hide them.
+//
+// So: measure this again if the kernels are regenerated or the flag moves.
+// The conclusion is not a property of the layouts, it is a property of the
+// layouts AND what contracts them.
 //
 // The memory column is a budget, not a measurement of need: the packed
 // store's footprint is set by build_packed_block_layout's chunk budget
@@ -96,24 +105,6 @@
 // the whole tower is smaller than one chunk. What it does not do is grow
 // with nbf * npts, which is the only thing that matters at a hundred atoms.
 //
-// WHY THE FOCK ASSEMBLY RUNS ON THE HOST
-// --------------------------------------
-// libxckernel marks its PRIMITIVES XCK_HD but not its generated entry
-// points, so xck_*_o1_t is a host function. Both stores therefore mirror
-// the tower to the host and call the kernel there; on a host backend the
-// mirror is the same memory and the copy is skipped. Moving the entry
-// points to the device is Step 2 of the integration, and when it happens
-// only these two classes change.
-//
-// THE OPERAND SLICING, WHICH IS THE WHOLE TRICK
-// ---------------------------------------------
-// The kernels index every field and derivative array by the same point
-// index as the collocation they are given. A box owns the CONSECUTIVE grid
-// range [b*mppb, b*mppb + npts_b) -- build_packed_block_layout says so and
-// every other consumer relies on it -- so a box's operands are the global
-// arrays offset by b*mppb, with nothing gathered and nothing copied. That
-// is what makes a per-box kernel call possible at all.
-
 #include <algorithm>
 #include <stdexcept>
 #include <string>

@@ -68,6 +68,22 @@ target_include_directories(
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
+# Let the vendored kernels send their Stage B contraction to BLAS instead of
+# their own loop nest. This is not a small difference: on benzene at nrad 35,
+# lmax 15, one dense GGA Fock build through XCKernelSession goes from 3.6-6.6
+# seconds to 0.5-0.8, and the screened one from 2.1-2.3 to 1.0-1.2. The
+# reason it matters so much here is the shape of the generated kernels -- the
+# GGA writes its potential as four rank updates where a hand-derived form
+# exploiting the symmetry needs one, so there are four times the GEMM flops
+# to hide and a hand-rolled GEMM cannot hide them.
+#
+# dgemm_ is already an undefined symbol in every binary here (KokkosKernels
+# and Armadillo both want a BLAS; this machine resolves it through
+# FlexiBLAS), so this adds no dependency. The kernels fall back to their own
+# loops for any type BLAS does not have, and for dimensions that overflow the
+# BLAS integer.
+target_compile_definitions(libnukexc INTERFACE XCKERNEL_USE_BLAS)
+
 add_library(${nxc}::NuKEXC ALIAS libnukexc)
 
 include( nukexc-integratorxx ) # finds package integratorxx
