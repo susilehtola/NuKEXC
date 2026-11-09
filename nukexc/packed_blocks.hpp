@@ -48,10 +48,18 @@
 //
 // WHAT THE SCREENED PATH IS FOR, MEASURED
 // ---------------------------------------
-// Memory, not time. Wherever the dense path's tables fit it is the faster
-// one: it evaluates the collocation and the auxiliary potential ONCE into
-// (nbf, npts) and (naux, npts) arrays and then does BLAS on them, while
-// every routine built on this header re-evaluates both on every build.
+// Memory, not time, for the routines in THIS library's own hand: wherever
+// the dense path's tables fit it is the faster one, because it evaluates
+// the collocation and the auxiliary potential ONCE into (nbf, npts) and
+// (naux, npts) arrays and then does BLAS on them, while every routine built
+// on this header re-evaluates both on every build.
+//
+// That reasoning turns on the dense side having BLAS, so it does not carry
+// over to a contraction that has none. The kernel-backed XC path is exactly
+// that case -- libxckernel's Stage B is its own loop nest -- and there the
+// packed store is both smaller AND faster; see xc_collocation_store.hpp for
+// the measurement. The question is always which side's flop count the
+// library it contracts through can hide, not which layout is denser.
 //
 // C6H14, nrad 25, lmax 10, LDA, seconds per Fock build, screened against
 // dense:
