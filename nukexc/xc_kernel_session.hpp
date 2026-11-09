@@ -33,6 +33,7 @@
  *    OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+
 #pragma once
 
 // ============================================================================
@@ -54,26 +55,31 @@
 // Once meta-GGA parity against ERKALE is established the two can be merged
 // the other way round, with the kernels backing XCSession.
 //
+// DENSE AND SCREENED IN ONE CLASS
+// -------------------------------
+// Where the collocation lives is a policy -- xc_collocation_store.hpp --
+// and everything else is this file:
+//
+//     XCKernelSession          dense, one (ncomp, nbf, npts) tower kept
+//     XCScreenedKernelSession  packed per-box blocks, re-packed per build
+//
+// The two have the same interface down to the last accessor, which is what
+// lets the dense one serve as the oracle for the packed one. Everything
+// between the two -- Libxc's interleaved layouts, the energy expression,
+// the spin bookkeeping, the operand plumbing -- is written once here, so a
+// screened meta-GGA reaches exactly the kernel a dense one does.
+//
 // RESTRICTED AND UNRESTRICTED IN ONE SESSION
 // ------------------------------------------
-// Spin is a property of the density, not of the basis: the collocation tower
-// is the same for both channels, and it is the expensive thing the session
-// exists to hold. So there is one class with two set_density overloads rather
-// than a restricted and an unrestricted class sharing a base, and an
-// unrestricted evaluation builds the tower exactly once. Which overload was
-// called last is remembered, and the ingredient accessors of the other spin
-// case then throw -- otherwise rho() after set_density(Pa, Pb) would hand
-// back whatever the previous restricted call left behind.
-//
-// The collocation tower is kept rather than split and discarded. XCSession
-// builds the (ncomp, nbf, npts) tower, copies the components into separate
-// LayoutLeft views for the density contraction, and lets the tower die; the
-// kernels want exactly that tower, contiguous, component-major. So it is
-// held here and the split views alias nothing -- they are a genuine second
-// copy, because KokkosBlas::gemm wants LayoutLeft for the density
-// contraction while the kernels index chi + k*nbf*npts, i.e. LayoutRight
-// within each component. One copy of the tower is far cheaper than
-// evaluating the basis twice, which is the alternative.
+// Spin is a property of the density, not of the basis: the collocation is
+// the same for both channels, and it is the expensive thing the session
+// exists to hold. So there is one class with two set_density overloads
+// rather than a restricted and an unrestricted class sharing a base, and an
+// unrestricted evaluation builds the collocation exactly once. Which
+// overload was called last is remembered, and the ingredient accessors of
+// the other spin case then throw -- otherwise rho() after
+// set_density(Pa, Pb) would hand back whatever the previous restricted call
+// left behind.
 
 #include <algorithm>
 #include <stdexcept>
@@ -86,6 +92,8 @@
 #include "grid.hpp"
 #include "host_interface.hpp"
 #include "nukexc_config.hpp"
+#include "octree.hpp"
+#include "xc_collocation_store.hpp"
 #include "xc_kernels.hpp"
 
 namespace Nukexc {
@@ -138,74 +146,49 @@ inline XCFamily xc_family_of(const xc_func_type &func) {
  *      // caller evaluates the functional at s.rho(), s.sigma(), s.tau()
  *      auto out = s.accumulate_fock(derivs, zk, Vxc);
  *
- *  The collocation is built once in the constructor and the kernel scratch
- *  once with it, so an SCF loop allocates nothing per iteration.
+ *  The collocation store and the kernel scratch are built once in the
+ *  constructor, so an SCF loop allocates nothing per iteration.
+ *
+ *  @tparam Store where the collocation lives; see xc_collocation_store.hpp
  */
-template <typename Evaluator>
-  requires BasisEvaluatorWith<Evaluator, BasisDeriv::Gradient>
-class XCKernelSession {
+template <typename Store>
+  requires XCCollocationStore<Store>
+class XCKernelSessionT {
 public:
-  XCKernelSession(const Evaluator &basis, const FlatGrid &grid, XCFamily family)
-      : family_(family), deriv_(collocation_deriv(family)), n_(basis.nbf()),
-        npts_(static_cast<int>(grid.quad_points.extent(0))), grid_(grid) {
-    if (n_ <= 0)
-      throw std::invalid_argument("XCKernelSession: empty basis");
-    if (family_ == XCFamily::MetaGGALapl &&
-        !BasisEvaluatorWith<Evaluator, BasisDeriv::Hessian>)
-      throw std::invalid_argument(
-          "XCKernelSession: a Laplacian meta-GGA needs an evaluator that "
-          "provides second derivatives");
-
-    build_tower(basis, grid);
-    work_.resize(static_cast<size_t>(
-        xc_fock_work_size(family_, npts_, n_)));
-  }
+  XCKernelSessionT(Store store, const FlatGrid &grid, const char *name)
+      : store_(std::move(store)), family_(store_.family()),
+        deriv_(store_.order()), n_(store_.nbf()), npts_(store_.npoints()),
+        grid_(grid), name_(name) {}
 
   int nbf() const { return n_; }
   int npoints() const { return npts_; }
   XCFamily family() const { return family_; }
-  /// Derivative order of the collocation tower this session holds.
+  /// Derivative order of the collocation this session holds.
   BasisDeriv collocation_order() const { return deriv_; }
+  /// Doubles the collocation store holds between builds. The whole reason
+  /// there are two stores, so it is reportable rather than inferred.
+  size_t collocation_doubles() const {
+    return store_.collocation_doubles();
+  }
 
   /// Contract a density matrix onto the grid. Must precede the accumulators.
   void set_density(const HostMatrixView &P) {
     const auto Pd = detail::upload_matrix(P, n_, "P");
-    rho_d_ = DeviceView1D("rho", npts_);
-    gx_ = DeviceView1D("rho_x", npts_);
-    gy_ = DeviceView1D("rho_y", npts_);
-    gz_ = DeviceView1D("rho_z", npts_);
-    sigma_d_ = DeviceView1D("sigma", npts_);
-
-    if (family_ == XCFamily::LDA) {
-      rho_d_ = compute_density_dm(chi_, Pd);
-    } else {
-      compute_density_and_sigma_dm(chi_, gx_chi_, gy_chi_, gz_chi_, Pd, rho_d_,
-                                   gx_, gy_, gz_, sigma_d_);
-    }
-
-    if (needs_tau()) {
-      tau_d_ = DeviceView1D("tau", npts_);
-      lapl_d_ = DeviceView1D("lapl_rho", npts_);
-      // lapl_chi_ is empty unless the family needs the Laplacian, and
-      // compute_meta_fields_dm then computes tau alone. Passing something
-      // else of the right shape would give a wrong Laplacian instead of
-      // none, which is the failure worth designing out.
-      compute_meta_fields_dm(chi_, gx_chi_, gy_chi_, gz_chi_, lapl_chi_, Pd,
-                             tau_d_, lapl_d_);
-    }
+    ing_.resize(family_, npts_);
+    store_.contract(Pd, ing_);
     Kokkos::fence();
 
-    rho_h_ = detail::to_host(rho_d_);
+    rho_h_ = detail::to_host(ing_.rho);
     if (family_ != XCFamily::LDA) {
-      sigma_h_ = detail::to_host(sigma_d_);
-      gx_h_ = detail::to_host(gx_);
-      gy_h_ = detail::to_host(gy_);
-      gz_h_ = detail::to_host(gz_);
+      sigma_h_ = detail::to_host(ing_.sigma);
+      gx_h_ = detail::to_host(ing_.rho_x);
+      gy_h_ = detail::to_host(ing_.rho_y);
+      gz_h_ = detail::to_host(ing_.rho_z);
     }
     if (needs_tau())
-      tau_h_ = detail::to_host(tau_d_);
+      tau_h_ = detail::to_host(ing_.tau);
     if (family_ == XCFamily::MetaGGALapl)
-      lapl_h_ = detail::to_host(lapl_d_);
+      lapl_h_ = detail::to_host(ing_.lapl);
     spin_ = SpinState::Restricted;
   }
 
@@ -257,7 +240,7 @@ public:
   /// Integrated electron count for the density currently set.
   double nel() const {
     need("nel");
-    return detail::integrate(rho_d_, grid_.weights);
+    return detail::integrate(ing_.rho, grid_.weights);
   }
 
   /// Exc = sum_g w_g rho_g zk_g, with zk Libxc's energy per particle.
@@ -279,14 +262,14 @@ public:
     need("accumulate_fock");
 
     XCOutput out;
-    out.Nel = detail::integrate(rho_d_, grid_.weights);
+    out.Nel = detail::integrate(ing_.rho, grid_.weights);
     if (zk)
       out.Exc = energy(zk);
 
     if (!Vxc.data)
       return out;
 
-    // The kernel accumulates into a dense (nbf, nbf) block of its own. The
+    // The store accumulates into a dense (nbf, nbf) block of its own. The
     // XC Fock matrix is symmetric, so which of the two orderings the kernel
     // writes does not matter here -- but that is a property worth asserting
     // rather than assuming, which test_xc_kernel_session.cxx does.
@@ -295,8 +278,7 @@ public:
                             .rho_x = gx_h_.empty() ? nullptr : gx_h_.data(),
                             .rho_y = gy_h_.empty() ? nullptr : gy_h_.data(),
                             .rho_z = gz_h_.empty() ? nullptr : gz_h_.data()};
-    const int rc = xc_fock_restricted(family_, npts_, n_, tower_h_.data(), fl,
-                                      d, V.data(), work_.data());
+    const int rc = store_.fock(fl, d, V.data());
     if (rc != 0)
       throw std::runtime_error("xc kernel returned " + std::to_string(rc));
 
@@ -316,59 +298,28 @@ public:
    *  evaluation.
    *
    *  sigma_ab = grad rho_a . grad rho_b is formed here: it is not something
-   *  compute_density_and_sigma_dm can produce from one density matrix, and
-   *  both spin channels' Fock matrices depend on it.
+   *  one density matrix can produce, and both spin channels' Fock matrices
+   *  depend on it.
    */
   void set_density(const HostMatrixView &Pa, const HostMatrixView &Pb) {
     const auto Pad = detail::upload_matrix(Pa, n_, "Pa");
     const auto Pbd = detail::upload_matrix(Pb, n_, "Pb");
 
-    ra_ = DeviceView1D("rho_a", npts_);
-    rb_ = DeviceView1D("rho_b", npts_);
+    ing_a_.resize(family_, npts_);
+    ing_b_.resize(family_, npts_);
+    store_.contract(Pad, ing_a_);
+    store_.contract(Pbd, ing_b_);
 
-    if (family_ == XCFamily::LDA) {
-      ra_ = compute_density_dm(chi_, Pad);
-      rb_ = compute_density_dm(chi_, Pbd);
-    } else {
-      saa_ = DeviceView1D("sigma_aa", npts_);
-      sab_ = DeviceView1D("sigma_ab", npts_);
-      sbb_ = DeviceView1D("sigma_bb", npts_);
-      gax_ = DeviceView1D("rho_a_x", npts_);
-      gay_ = DeviceView1D("rho_a_y", npts_);
-      gaz_ = DeviceView1D("rho_a_z", npts_);
-      gbx_ = DeviceView1D("rho_b_x", npts_);
-      gby_ = DeviceView1D("rho_b_y", npts_);
-      gbz_ = DeviceView1D("rho_b_z", npts_);
-      compute_density_and_sigma_dm(chi_, gx_chi_, gy_chi_, gz_chi_, Pad, ra_,
-                                   gax_, gay_, gaz_, saa_);
-      compute_density_and_sigma_dm(chi_, gx_chi_, gy_chi_, gz_chi_, Pbd, rb_,
-                                   gbx_, gby_, gbz_, sbb_);
-      auto ax = gax_, ay = gay_, az = gaz_, bx = gbx_, by = gby_, bz = gbz_,
-           ab = sab_;
-      Kokkos::parallel_for(
-          "sigma_ab", Kokkos::RangePolicy<ExecSpace>(0, npts_),
-          KOKKOS_LAMBDA(const int g) {
-            ab(g) = ax(g) * bx(g) + ay(g) * by(g) + az(g) * bz(g);
-          });
-    }
-
-    if (needs_tau()) {
-      taua_ = DeviceView1D("tau_a", npts_);
-      taub_ = DeviceView1D("tau_b", npts_);
-      lapla_ = DeviceView1D("lapl_rho_a", npts_);
-      laplb_ = DeviceView1D("lapl_rho_b", npts_);
-      // Spin-resolved by construction: compute_meta_fields_dm halves the
-      // raw gradient sum of whichever density matrix it is given, so with
-      // P^alpha it returns Libxc's tau_a rather than half the total.
-      compute_meta_fields_dm(chi_, gx_chi_, gy_chi_, gz_chi_, lapl_chi_, Pad,
-                             taua_, lapla_);
-      compute_meta_fields_dm(chi_, gx_chi_, gy_chi_, gz_chi_, lapl_chi_, Pbd,
-                             taub_, laplb_);
+    if (family_ != XCFamily::LDA) {
+      if (static_cast<int>(sab_.extent(0)) != npts_)
+        sab_ = DeviceView1D("sigma_ab", npts_);
+      dot_gradients(ing_a_.rho_x, ing_a_.rho_y, ing_a_.rho_z, ing_b_.rho_x,
+                    ing_b_.rho_y, ing_b_.rho_z, sab_);
     }
     Kokkos::fence();
 
-    const auto ra_h = detail::to_host(ra_);
-    const auto rb_h = detail::to_host(rb_);
+    const auto ra_h = detail::to_host(ing_a_.rho);
+    const auto rb_h = detail::to_host(ing_b_.rho);
     rho_tot_h_.resize(static_cast<size_t>(npts_));
     rho_u_h_.resize(2 * static_cast<size_t>(npts_));
     for (int g = 0; g < npts_; ++g) {
@@ -378,26 +329,31 @@ public:
     }
 
     if (family_ != XCFamily::LDA) {
-      const auto aa = detail::to_host(saa_), ab = detail::to_host(sab_),
-                 bb = detail::to_host(sbb_);
+      const auto aa = detail::to_host(ing_a_.sigma),
+                 ab = detail::to_host(sab_),
+                 bb = detail::to_host(ing_b_.sigma);
       sigma_u_h_.resize(3 * static_cast<size_t>(npts_));
       for (int g = 0; g < npts_; ++g) {
         sigma_u_h_[3 * static_cast<size_t>(g)] = aa[g];
         sigma_u_h_[3 * static_cast<size_t>(g) + 1] = ab[g];
         sigma_u_h_[3 * static_cast<size_t>(g) + 2] = bb[g];
       }
-      gax_h_u_ = detail::to_host(gax_);
-      gay_h_u_ = detail::to_host(gay_);
-      gaz_h_u_ = detail::to_host(gaz_);
-      gbx_h_u_ = detail::to_host(gbx_);
-      gby_h_u_ = detail::to_host(gby_);
-      gbz_h_u_ = detail::to_host(gbz_);
+      gax_h_u_ = detail::to_host(ing_a_.rho_x);
+      gay_h_u_ = detail::to_host(ing_a_.rho_y);
+      gaz_h_u_ = detail::to_host(ing_a_.rho_z);
+      gbx_h_u_ = detail::to_host(ing_b_.rho_x);
+      gby_h_u_ = detail::to_host(ing_b_.rho_y);
+      gbz_h_u_ = detail::to_host(ing_b_.rho_z);
     } else {
       sigma_u_h_.clear();
     }
 
     if (needs_tau()) {
-      const auto ta = detail::to_host(taua_), tb = detail::to_host(taub_);
+      // Spin-resolved by construction: the kinetic energy density of
+      // whichever density matrix was contracted, so P^alpha in gives
+      // Libxc's tau_a rather than half the total.
+      const auto ta = detail::to_host(ing_a_.tau),
+                 tb = detail::to_host(ing_b_.tau);
       tau_u_h_.resize(2 * static_cast<size_t>(npts_));
       for (int g = 0; g < npts_; ++g) {
         tau_u_h_[2 * static_cast<size_t>(g)] = ta[g];
@@ -408,7 +364,8 @@ public:
     }
 
     if (family_ == XCFamily::MetaGGALapl) {
-      const auto la = detail::to_host(lapla_), lb = detail::to_host(laplb_);
+      const auto la = detail::to_host(ing_a_.lapl),
+                 lb = detail::to_host(ing_b_.lapl);
       lapl_u_h_.resize(2 * static_cast<size_t>(npts_));
       for (int g = 0; g < npts_; ++g) {
         lapl_u_h_[2 * static_cast<size_t>(g)] = la[g];
@@ -418,12 +375,10 @@ public:
       lapl_u_h_.clear();
     }
 
-    // Sized here rather than in the constructor, which does not know whether
-    // this session will ever be used spin-polarized. Both are no-ops from
+    // Sized here rather than in the constructor, which does not know
+    // whether this session will ever be used spin-polarized. A no-op from
     // the second call on, so an SCF loop still allocates nothing.
     unpacked_.resize(family_, npts_);
-    work_u_.resize(static_cast<size_t>(
-        xc_fock_work_size_unrestricted(family_, npts_, n_)));
 
     spin_ = SpinState::Unrestricted;
   }
@@ -454,11 +409,11 @@ public:
   /// Electron count per channel, for the density currently set.
   double nel_alpha() const {
     need_u("nel_alpha");
-    return detail::integrate(ra_, grid_.weights);
+    return detail::integrate(ing_a_.rho, grid_.weights);
   }
   double nel_beta() const {
     need_u("nel_beta");
-    return detail::integrate(rb_, grid_.weights);
+    return detail::integrate(ing_b_.rho, grid_.weights);
   }
 
   /**
@@ -483,8 +438,8 @@ public:
     need_u("accumulate_fock");
 
     XCOutputPolarized out;
-    out.Nel_alpha = detail::integrate(ra_, grid_.weights);
-    out.Nel_beta = detail::integrate(rb_, grid_.weights);
+    out.Nel_alpha = detail::integrate(ing_a_.rho, grid_.weights);
+    out.Nel_beta = detail::integrate(ing_b_.rho, grid_.weights);
     out.Nel = out.Nel_alpha + out.Nel_beta;
     // The energy expression does not know about spin: it is the total
     // density against zk either way, so the restricted kernel is the right
@@ -497,7 +452,8 @@ public:
       return out;
     if (!Vxc_a.data || !Vxc_b.data)
       throw std::invalid_argument(
-          "XCKernelSession::accumulate_fock: one of Vxc_a and Vxc_b is null. "
+          std::string(name_) +
+          "::accumulate_fock: one of Vxc_a and Vxc_b is null. "
           "Pass both to assemble both channels, or neither for the energy "
           "alone -- a single channel of an unrestricted XC potential is not "
           "a meaningful quantity on its own");
@@ -517,9 +473,7 @@ public:
     std::vector<double> V(static_cast<size_t>(n_) * n_);
     const auto channel = [&](XCSpin sp, const HostMatrixRef &M) {
       std::fill(V.begin(), V.end(), 0.0);
-      const int rc =
-          xc_fock_unrestricted(family_, sp, npts_, n_, tower_h_.data(), fl, d,
-                               V.data(), work_u_.data());
+      const int rc = store_.fock_spin(sp, fl, d, V.data());
       if (rc != 0)
         throw std::runtime_error(std::string("xc kernel returned ") +
                                  std::to_string(rc) + " for the " +
@@ -531,6 +485,11 @@ public:
     return out;
   }
 
+protected:
+  /// The collocation store, for a derived class that wants to reach past
+  /// the session -- the packed one's layout, for instance.
+  const Store &store() const { return store_; }
+
 private:
   bool needs_tau() const {
     return family_ == XCFamily::MetaGGATau ||
@@ -539,27 +498,27 @@ private:
 
   void need(const char *what) const {
     if (spin_ == SpinState::None)
-      throw std::logic_error(std::string("XCKernelSession::") + what +
+      throw std::logic_error(std::string(name_) + "::" + what +
                              ": set_density has not been called");
     if (spin_ != SpinState::Restricted)
       throw std::logic_error(
-          std::string("XCKernelSession::") + what +
+          std::string(name_) + "::" + what +
           ": the density currently set is spin-polarized; use the "
           "spin-resolved accessors and the (Vxc_a, Vxc_b) overload");
   }
 
   void need_u(const char *what) const {
     if (spin_ == SpinState::None)
-      throw std::logic_error(std::string("XCKernelSession::") + what +
+      throw std::logic_error(std::string(name_) + "::" + what +
                              ": set_density has not been called");
     if (spin_ != SpinState::Unrestricted)
       throw std::logic_error(
-          std::string("XCKernelSession::") + what +
+          std::string(name_) + "::" + what +
           ": the density currently set is spin-restricted; use rho(), "
           "sigma() and the single-matrix overload");
   }
 
-  /// Copy the kernel's dense (nbf, nbf) block into the caller's matrix,
+  /// Copy the store's dense (nbf, nbf) block into the caller's matrix,
   /// accumulating and honouring its layout and leading dimension. Shared by
   /// the restricted path and both spin channels.
   void scatter(const std::vector<double> &V, const HostMatrixRef &M) const {
@@ -578,104 +537,27 @@ private:
 
   void have(const std::vector<double> &v, const char *what) const {
     if (v.empty())
-      throw std::logic_error(std::string("XCKernelSession::") + what +
+      throw std::logic_error(std::string(name_) + "::" + what +
                              ": not computed for a " +
                              xc_family_name(family_) + " functional");
   }
 
-  void build_tower(const Evaluator &basis, const FlatGrid &grid) {
-    const int nc = basis_ncomp(deriv_);
-    tower_ = Kokkos::View<double ***>("chi tower", nc, n_, npts_);
-    switch (deriv_) {
-    case BasisDeriv::Value:
-      fill_collocation<BasisDeriv::Value>(ExecSpace{}, basis, grid.quad_points,
-                                          tower_);
-      break;
-    case BasisDeriv::Gradient:
-      fill_collocation<BasisDeriv::Gradient>(ExecSpace{}, basis,
-                                             grid.quad_points, tower_);
-      break;
-    case BasisDeriv::Hessian:
-      if constexpr (BasisEvaluatorWith<Evaluator, BasisDeriv::Hessian>)
-        fill_collocation<BasisDeriv::Hessian>(ExecSpace{}, basis,
-                                              grid.quad_points, tower_);
-      else
-        throw std::invalid_argument(
-            "XCKernelSession: evaluator provides no second derivatives");
-      break;
-    default:
-      throw std::invalid_argument("XCKernelSession: unsupported order");
-    }
-    Kokkos::fence();
-
-    // Split for the density contraction, which goes through
-    // KokkosBlas::gemm and therefore wants LayoutLeft.
-    chi_ = DeviceView2DLeft("chi", n_, npts_);
-    auto tw = tower_;
-    auto chi = chi_;
-    if (deriv_ == BasisDeriv::Value) {
-      Kokkos::parallel_for(
-          "split value",
-          Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0},
-                                                            {n_, npts_}),
-          KOKKOS_LAMBDA(const int u, const int g) {
-            chi(u, g) = tw(BF_VAL, u, g);
-          });
-    } else {
-      gx_chi_ = DeviceView2DLeft("dchi_x", n_, npts_);
-      gy_chi_ = DeviceView2DLeft("dchi_y", n_, npts_);
-      gz_chi_ = DeviceView2DLeft("dchi_z", n_, npts_);
-      auto gxc = gx_chi_, gyc = gy_chi_, gzc = gz_chi_;
-      const bool hess = (deriv_ == BasisDeriv::Hessian);
-      if (hess)
-        lapl_chi_ = DeviceView2DLeft("lapl_chi", n_, npts_);
-      auto lp = lapl_chi_;
-      Kokkos::parallel_for(
-          "split tower",
-          Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0},
-                                                            {n_, npts_}),
-          KOKKOS_LAMBDA(const int u, const int g) {
-            chi(u, g) = tw(BF_VAL, u, g);
-            gxc(u, g) = tw(BF_DX, u, g);
-            gyc(u, g) = tw(BF_DY, u, g);
-            gzc(u, g) = tw(BF_DZ, u, g);
-            if (hess)
-              lp(u, g) = tw(BF_DXX, u, g) + tw(BF_DYY, u, g) +
-                         tw(BF_DZZ, u, g);
-          });
-    }
-    Kokkos::fence();
-
-    // The kernels take a raw pointer. On a host backend the tower's own
-    // memory would serve, but mirroring keeps this correct when the
-    // execution space is a device: the kernels are XCK_HD and could be
-    // launched there, which is Step 2 of the integration, not this one.
-    auto m = Kokkos::create_mirror_view_and_copy(HostSpace{}, tower_);
-    tower_h_ = std::vector<double>(m.data(), m.data() + m.size());
-  }
-
+  Store store_;
   XCFamily family_;
   BasisDeriv deriv_;
   int n_, npts_;
   FlatGrid grid_;
+  const char *name_;
 
-  Kokkos::View<double ***> tower_;
-  std::vector<double> tower_h_;
-  DeviceView2DLeft chi_, gx_chi_, gy_chi_, gz_chi_, lapl_chi_;
-
-  DeviceView1D rho_d_, gx_, gy_, gz_, sigma_d_, tau_d_, lapl_d_;
+  XCIngredients ing_, ing_a_, ing_b_;
+  DeviceView1D sab_;
   std::vector<double> rho_h_, sigma_h_, gx_h_, gy_h_, gz_h_, tau_h_, lapl_h_;
   mutable std::vector<double> w_h_;
-  std::vector<double> work_;
 
   /// Which set_density overload was called last.
   enum class SpinState { None, Restricted, Unrestricted };
   SpinState spin_ = SpinState::None;
 
-  // Spin-resolved ingredients, used only by the unrestricted path.
-  DeviceView1D ra_, rb_;
-  DeviceView1D gax_, gay_, gaz_, gbx_, gby_, gbz_;
-  DeviceView1D saa_, sab_, sbb_, taua_, taub_, lapla_, laplb_;
   /// Interleaved for Libxc: (a, b) and (aa, ab, bb) per point.
   std::vector<double> rho_u_h_, sigma_u_h_, tau_u_h_, lapl_u_h_;
   /// Total density, for the energy and the electron count.
@@ -684,7 +566,59 @@ private:
   std::vector<double> gax_h_u_, gay_h_u_, gaz_h_u_, gbx_h_u_, gby_h_u_,
       gbz_h_u_;
   XCUnpackedDerivsU unpacked_;
-  std::vector<double> work_u_;
+};
+
+/**
+ *  @brief The kernel-backed session on a dense collocation tower.
+ *
+ *  Memory is ncomp * nbf * npts doubles and the basis is evaluated once in
+ *  the constructor -- but the kernel then contracts over the whole basis at
+ *  every point, which measures SLOWER than the screened session as well as
+ *  larger; xc_collocation_store.hpp has the table. What this one is for is
+ *  a Laplacian meta-GGA, which a packed block cannot carry, and being the
+ *  validated oracle for the other.
+ */
+template <typename Evaluator>
+class XCKernelSession
+    : public XCKernelSessionT<DenseCollocationStore<Evaluator>> {
+  using Base = XCKernelSessionT<DenseCollocationStore<Evaluator>>;
+
+public:
+  XCKernelSession(const Evaluator &basis, const FlatGrid &grid,
+                  XCFamily family)
+      : Base(DenseCollocationStore<Evaluator>(basis, grid, family), grid,
+             "XCKernelSession") {}
+};
+
+/**
+ *  @brief The kernel-backed session on packed per-box collocation blocks.
+ *
+ *  Memory is one chunk of boxes at a time instead of the whole tower, and
+ *  the basis is evaluated once per pass rather than once per session. That
+ *  is the same trade every other screened path in this library makes, but
+ *  unlike them this one also wins on time -- each kernel call contracts
+ *  over a box's local functions instead of the whole basis, and
+ *  libxckernel's contraction is not BLAS, so there is no dense advantage to
+ *  give back. Measured in xc_collocation_store.hpp.
+ *
+ *  Covers LDA, GGA and tau meta-GGAs. A Laplacian meta-GGA throws from the
+ *  store's constructor, since a packed block stops at the gradient.
+ */
+template <typename Evaluator>
+class XCScreenedKernelSession
+    : public XCKernelSessionT<PackedCollocationStore<Evaluator>> {
+  using Base = XCKernelSessionT<PackedCollocationStore<Evaluator>>;
+
+public:
+  XCScreenedKernelSession(const Evaluator &basis, const FlatGrid &grid,
+                          const NeighborList &nl, XCFamily family,
+                          const size_t budget_bytes = (size_t{64} << 20))
+      : Base(PackedCollocationStore<Evaluator>(basis, grid, nl, family,
+                                               budget_bytes),
+             grid, "XCScreenedKernelSession") {}
+
+  /// The packing layout, for a caller that wants the box statistics.
+  const PackedBlockLayout &layout() const { return this->store().layout(); }
 };
 
 } // namespace Nukexc

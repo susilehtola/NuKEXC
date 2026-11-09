@@ -47,6 +47,7 @@
 #include <nukexc/grid.hpp>
 #include <nukexc/host_interface.hpp>
 #include <nukexc/molecule.hpp>
+#include <nukexc/octree.hpp>
 #include <nukexc/stobasis.hpp>
 #include <nukexc/xc_kernel_session.hpp>
 
@@ -864,4 +865,253 @@ TEST_CASE("Mixing the spin cases up is caught", "[xckernel][unrestricted]") {
   REQUIRE_NOTHROW(s.accumulate_fock(
       {.vrho = ones2.data(), .vsigma = ones3.data()}, nullptr,
       HostMatrixRef{nullptr, nbf}, HostMatrixRef{nullptr, nbf}));
+}
+
+// ============================================================================
+//  The screened session against the dense one
+// ============================================================================
+//
+// The two sessions differ in one thing: where the collocation lives. So the
+// comparison feeds both the same density matrix and then the SAME
+// functional-derivative arrays -- the ones Libxc returned once, from the
+// dense ingredients -- which isolates the collocation path from the
+// functional evaluation. Ingredients are compared first, because a
+// difference there would otherwise reappear in the Fock matrix as if the
+// assembly were at fault.
+//
+// They are not expected to agree bit for bit: screening drops shells whose
+// cutoff radius does not reach a box, and the dense path evaluates those
+// tails rather than zeroing them -- the evaluator applies no pointwise
+// cutoff, the radial owns that decision. What the comparison measures is
+// therefore the size of those dropped tails plus the summation order, and
+// it comes out at round-off on these fixtures: the ingredients agree to
+// 1.6e-14 relative at worst and the Fock matrices to 2.9e-13. The
+// tolerances below are those measurements with headroom, and the headroom
+// on V is the wider of the two because the scatter accumulates with
+// atomics, so the summation order is not the same twice.
+
+namespace {
+
+using ScreenedSession = XCScreenedKernelSession<STOPrimitiveEvaluator>;
+
+/// Box the grid for the screened path. create_bounding_boxes PERMUTES the
+/// grid in place, so this has to run before either session is built: they
+/// must see the same point order, or every pointwise comparison below is
+/// comparing different points.
+NeighborList box_the_grid(FlatGrid &grid, const STOPrimitiveEvaluator &ev,
+                          const int mppb = 128) {
+  auto bb = create_bounding_boxes(grid, mppb);
+  NeighborList nl;
+  build_neighbor_list(ev, bb, mppb, grid.quad_points, nl);
+  return nl;
+}
+
+/// Worst difference of a grid quantity, relative to the reference's scale.
+double worst_grid(const char *what, const std::vector<double> &got,
+                  const std::vector<double> &ref, const double tol) {
+  REQUIRE(got.size() == ref.size());
+  double w = 0.0, scale = 0.0;
+  for (size_t i = 0; i < ref.size(); ++i) {
+    w = std::max(w, std::abs(got[i] - ref[i]));
+    scale = std::max(scale, std::abs(ref[i]));
+  }
+  INFO(what << ": worst |screened - dense| = " << w << ", scale " << scale
+            << ", relative " << w / scale);
+  REQUIRE(scale > 1e-6);
+  REQUIRE(w < tol * scale);
+  return w / scale;
+}
+
+struct ScreenedCase {
+  int id;
+  XCFamily fam;
+  const char *name;
+};
+
+const ScreenedCase screened_cases[] = {
+    {XC_LDA_X, XCFamily::LDA, "LDA_X"},
+    {XC_GGA_X_PBE, XCFamily::GGA, "GGA_X_PBE"},
+    {XC_MGGA_X_TPSS, XCFamily::MetaGGATau, "MGGA_X_TPSS"}};
+
+} // namespace
+
+TEST_CASE("The screened kernel session reproduces the dense one",
+          "[xckernel][screened]") {
+  Fixture f(35, 15);
+  const STOPrimitiveEvaluator ev(f.basis);
+  const NeighborList nl = box_the_grid(f.grid, ev);
+  const int nbf = ev.nbf();
+  auto P = make_P(nbf);
+  HostMatrixView Pv{P.data(), nbf, MatrixLayout::ColumnMajor};
+
+  for (const auto &c : screened_cases) {
+    INFO("functional " << c.name);
+    Session dense(ev, f.grid, c.fam);
+    ScreenedSession scr(ev, f.grid, nl, c.fam);
+    REQUIRE(scr.nbf() == dense.nbf());
+    REQUIRE(scr.npoints() == dense.npoints());
+    REQUIRE(scr.collocation_order() == dense.collocation_order());
+    // The screening has to actually be screening, or this test proves
+    // nothing: some box must be missing some shell.
+    REQUIRE(scr.layout().num_boxes > 1);
+
+    dense.set_density(Pv);
+    scr.set_density(Pv);
+    const int ng = dense.npoints();
+
+    // Measured, water/TZP at nrad 35 lmax 15, worst relative difference:
+    // rho 2.0e-15, sigma 2.6e-16, the gradient components 8.9e-16,
+    // tau 7.8e-16.
+    worst_grid("rho", scr.rho(), dense.rho(), 1e-13);
+    if (c.fam != XCFamily::LDA) {
+      worst_grid("sigma", scr.sigma(), dense.sigma(), 1e-13);
+      worst_grid("rho_x", scr.rho_x(), dense.rho_x(), 1e-13);
+      worst_grid("rho_y", scr.rho_y(), dense.rho_y(), 1e-13);
+      worst_grid("rho_z", scr.rho_z(), dense.rho_z(), 1e-13);
+    }
+    if (c.fam == XCFamily::MetaGGATau)
+      worst_grid("tau", scr.tau(), dense.tau(), 1e-13);
+
+    // One functional evaluation, from the dense ingredients, for both.
+    xc_func_type func;
+    REQUIRE(xc_func_init(&func, c.id, XC_UNPOLARIZED) == 0);
+    std::vector<double> zk(ng), vrho(ng), vsigma(ng), vlapl(ng), vtau(ng);
+    const std::vector<double> lapl_in(ng, 0.0);
+    if (c.fam == XCFamily::LDA)
+      xc_lda_exc_vxc(&func, ng, dense.rho().data(), zk.data(), vrho.data());
+    else if (c.fam == XCFamily::GGA)
+      xc_gga_exc_vxc(&func, ng, dense.rho().data(), dense.sigma().data(),
+                     zk.data(), vrho.data(), vsigma.data());
+    else
+      xc_mgga_exc_vxc(&func, ng, dense.rho().data(), dense.sigma().data(),
+                      lapl_in.data(), dense.tau().data(), zk.data(),
+                      vrho.data(), vsigma.data(), vlapl.data(), vtau.data());
+    xc_func_end(&func);
+
+    XCKernelDerivs d{.vrho = vrho.data()};
+    if (c.fam != XCFamily::LDA)
+      d.vsigma = vsigma.data();
+    if (c.fam == XCFamily::MetaGGATau)
+      d.vtau = vtau.data();
+
+    std::vector<double> Vd(static_cast<size_t>(nbf) * nbf, 0.0);
+    std::vector<double> Vs(static_cast<size_t>(nbf) * nbf, 0.0);
+    HostMatrixRef Rd{Vd.data(), nbf, MatrixLayout::ColumnMajor};
+    HostMatrixRef Rs{Vs.data(), nbf, MatrixLayout::ColumnMajor};
+    const XCOutput od = dense.accumulate_fock(d, zk.data(), Rd);
+    const XCOutput os = scr.accumulate_fock(d, zk.data(), Rs);
+
+    INFO("Exc dense " << od.Exc << ", screened " << os.Exc);
+    REQUIRE_THAT(os.Nel, Catch::Matchers::WithinRel(od.Nel, 1e-11));
+    REQUIRE_THAT(os.Exc, Catch::Matchers::WithinRel(od.Exc, 1e-11));
+
+    double scale = 0.0;
+    const double w = worst_diff(Vs, Vd, scale);
+    // Measured: 1.3e-13 (LDA), 2.3e-13 (GGA), 2.6e-13 (meta-GGA) relative.
+    INFO("V: worst |screened - dense| = " << w << ", scale " << scale
+                                          << ", relative " << w / scale);
+    REQUIRE(scale > 1e-3);
+    REQUIRE(w < 5e-12 * scale);
+  }
+}
+
+TEST_CASE("The screened kernel session reproduces the dense one, "
+          "spin-polarized",
+          "[xckernel][screened][unrestricted]") {
+  Fixture f(35, 15);
+  const STOPrimitiveEvaluator ev(f.basis);
+  const NeighborList nl = box_the_grid(f.grid, ev);
+  const int nbf = ev.nbf();
+  const auto Pa = scaled(make_P(nbf), 0.6);
+  const auto Pb = scaled(make_P(nbf, 1.3), 0.4);
+  HostMatrixView Pav{Pa.data(), nbf, MatrixLayout::ColumnMajor};
+  HostMatrixView Pbv{Pb.data(), nbf, MatrixLayout::ColumnMajor};
+
+  for (const auto &c : screened_cases) {
+    INFO("functional " << c.name);
+    Session dense(ev, f.grid, c.fam);
+    ScreenedSession scr(ev, f.grid, nl, c.fam);
+    dense.set_density(Pav, Pbv);
+    scr.set_density(Pav, Pbv);
+    const int ng = dense.npoints();
+
+    // The interleaved arrays carry both channels and, for a GGA, the cross
+    // term sigma_ab -- which is formed from two different density matrices'
+    // gradients and is the one ingredient no single contraction produces.
+    // Measured: rho_spin 1.6e-14, sigma_spin 5.4e-16, tau_spin 9.1e-16.
+    worst_grid("rho_spin", scr.rho_spin(), dense.rho_spin(), 1e-12);
+    if (c.fam != XCFamily::LDA)
+      worst_grid("sigma_spin", scr.sigma_spin(), dense.sigma_spin(), 1e-13);
+    if (c.fam == XCFamily::MetaGGATau)
+      worst_grid("tau_spin", scr.tau_spin(), dense.tau_spin(), 1e-13);
+
+    xc_func_type func;
+    REQUIRE(xc_func_init(&func, c.id, XC_POLARIZED) == 0);
+    std::vector<double> zk(ng), vrho(2 * ng), vsigma(3 * ng), vlapl(2 * ng),
+        vtau(2 * ng);
+    const std::vector<double> lapl_in(2 * ng, 0.0);
+    if (c.fam == XCFamily::LDA)
+      xc_lda_exc_vxc(&func, ng, dense.rho_spin().data(), zk.data(),
+                     vrho.data());
+    else if (c.fam == XCFamily::GGA)
+      xc_gga_exc_vxc(&func, ng, dense.rho_spin().data(),
+                     dense.sigma_spin().data(), zk.data(), vrho.data(),
+                     vsigma.data());
+    else
+      xc_mgga_exc_vxc(&func, ng, dense.rho_spin().data(),
+                      dense.sigma_spin().data(), lapl_in.data(),
+                      dense.tau_spin().data(), zk.data(), vrho.data(),
+                      vsigma.data(), vlapl.data(), vtau.data());
+    xc_func_end(&func);
+
+    XCPackedDerivsU packed{.vrho = vrho.data()};
+    if (c.fam != XCFamily::LDA)
+      packed.vsigma = vsigma.data();
+    if (c.fam == XCFamily::MetaGGATau)
+      packed.vtau = vtau.data();
+
+    std::vector<double> Vda(static_cast<size_t>(nbf) * nbf, 0.0),
+        Vdb(static_cast<size_t>(nbf) * nbf, 0.0),
+        Vsa(static_cast<size_t>(nbf) * nbf, 0.0),
+        Vsb(static_cast<size_t>(nbf) * nbf, 0.0);
+    HostMatrixRef Rda{Vda.data(), nbf, MatrixLayout::ColumnMajor};
+    HostMatrixRef Rdb{Vdb.data(), nbf, MatrixLayout::ColumnMajor};
+    HostMatrixRef Rsa{Vsa.data(), nbf, MatrixLayout::ColumnMajor};
+    HostMatrixRef Rsb{Vsb.data(), nbf, MatrixLayout::ColumnMajor};
+    const XCOutputPolarized od =
+        dense.accumulate_fock(packed, zk.data(), Rda, Rdb);
+    const XCOutputPolarized os =
+        scr.accumulate_fock(packed, zk.data(), Rsa, Rsb);
+
+    INFO("Exc dense " << od.Exc << ", screened " << os.Exc);
+    REQUIRE_THAT(os.Nel_alpha, Catch::Matchers::WithinRel(od.Nel_alpha, 1e-11));
+    REQUIRE_THAT(os.Nel_beta, Catch::Matchers::WithinRel(od.Nel_beta, 1e-11));
+    REQUIRE_THAT(os.Exc, Catch::Matchers::WithinRel(od.Exc, 1e-11));
+
+    for (int ch = 0; ch < 2; ++ch) {
+      INFO((ch == 0 ? "alpha channel" : "beta channel"));
+      double scale = 0.0;
+      const double w =
+          worst_diff(ch == 0 ? Vsa : Vsb, ch == 0 ? Vda : Vdb, scale);
+      // Measured: 1.6e-13 to 2.9e-13 relative over the six channels.
+      INFO("V: worst |screened - dense| = " << w << ", scale " << scale
+                                            << ", relative " << w / scale);
+      REQUIRE(scale > 1e-3);
+      REQUIRE(w < 5e-12 * scale);
+    }
+  }
+}
+
+TEST_CASE("A packed block stops at the gradient, and says so",
+          "[xckernel][screened]") {
+  // The Laplacian meta-GGA family needs second derivatives of the basis,
+  // which pack_collocation does not pack. Refusing in the constructor is
+  // the point: the alternative is a Fock matrix assembled from a tower
+  // whose Laplacian components were never written.
+  Fixture f(15, 7);
+  const STOPrimitiveEvaluator ev(f.basis);
+  const NeighborList nl = box_the_grid(f.grid, ev);
+  REQUIRE_THROWS_AS(ScreenedSession(ev, f.grid, nl, XCFamily::MetaGGALapl),
+                    std::invalid_argument);
+  REQUIRE_NOTHROW(ScreenedSession(ev, f.grid, nl, XCFamily::MetaGGATau));
 }
