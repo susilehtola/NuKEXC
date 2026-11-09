@@ -407,84 +407,12 @@ compute_lsda(const DeviceView2DLeft collocation_values,
   return XC_result_polarized{xc_energy, V_alpha, V_beta};
 }
 
-// ============================================================================
-//  Screened XC quadrature: pack -> GEMM -> scatter
-// ============================================================================
-//
-// The potential is the same product the core Hamiltonian is, with the
-// quadrature weight carrying the functional derivative instead of the
-// nuclear potential:
-//
-//     V_uv = sum_g w_g v_rho(g) chi_u(g) chi_v(g)
-//
-// for an LDA, and for a GGA the gradient term on top. Per box that is one
-// dense (nbe, npts) collocation block, one GEMM against itself, and a
-// scatter through the local-to-global function map -- see
-// packed_blocks.hpp.
-//
-// What this replaces gave each thread one pair of basis FUNCTIONS and
-// evaluated both functions' shells at every point of the box, so a shell
-// was evaluated once per function pair rather than once per point. It also
-// re-evaluated the whole basis once per occupied orbital when forming the
-// density. Both factors are gone: the density contracts through the density
-// matrix (density.hpp's packed_density) and the potential through the
-// packed blocks.
-
-template <typename Evaluator>
-  requires BasisEvaluatorWith<Evaluator, BasisDeriv::Value>
-inline XC_result_polarized
-compute_lsda_sparse(const Evaluator basis, const FlatGrid grid,
-                    const NeighborList nl, const DeviceView2DLeft mo_alpha,
-                    const DeviceView1D occ_alpha,
-                    const DeviceView2DLeft mo_beta, const DeviceView1D occ_beta,
-                    const xc_func_type func) {
-  if (func.info->family != XC_FAMILY_LDA)
-    throw std::runtime_error(
-        "Provided functional is not part of the LDA family");
-  if (func.nspin != XC_POLARIZED)
-    throw std::runtime_error(
-        "compute_lsda requires a functional initialized with XC_POLARIZED");
-
-  const int N_quad = grid.weights.extent(0);
-  const int N_bf = basis.nbf();
-
-  const PackedBlockLayout L = build_packed_block_layout(basis, nl);
-
-  DeviceView1D rho_a("rho_a", N_quad), rho_b("rho_b", N_quad);
-  packed_density<BasisDeriv::Value>(
-      basis, grid, nl, L, density_matrix_from_orbitals(mo_alpha, occ_alpha),
-      rho_a);
-  packed_density<BasisDeriv::Value>(
-      basis, grid, nl, L, density_matrix_from_orbitals(mo_beta, occ_beta),
-      rho_b);
-
-  const LDAPolarizedKernel kern = evaluate_lda_polarized(func, rho_a, rho_b);
-  const auto w = grid.weights;
-
-  // Z = w v_rho chi makes Z chi^T symmetric, so there is nothing to
-  // symmetrize: the dense path's "half the potential plus its transpose" is
-  // the same number reached in two steps.
-  auto build_potential = [&](const DeviceView1D &vrho) {
-    DeviceView2DLeft V("V LSDA", N_bf, N_bf);
-    accumulate_collocation_product<BasisDeriv::Value>(
-        basis, grid, nl, L, WeightedCollocation{w, vrho}, V);
-    return V;
-  };
-
-  DeviceView2DLeft V_alpha = build_potential(kern.vrho_up);
-  DeviceView2DLeft V_beta = build_potential(kern.vrho_down);
-
-  const auto exc = kern.exc;
-  double xc_energy = 0.0;
-  Kokkos::parallel_reduce(
-      "Compute xc energy", Kokkos::RangePolicy<ExecSpace>(0, N_quad),
-      KOKKOS_LAMBDA(const int g, double &acc) {
-        acc += w(g) * (rho_a(g) + rho_b(g)) * exc(g);
-      },
-      xc_energy);
-
-  return XC_result_polarized{xc_energy, V_alpha, V_beta};
-}
+// The screened counterparts of these dense quadratures are in
+// xc_screened.hpp, where there is one of them rather than one per family:
+// they take their potential from libxckernel instead of writing the chain
+// rule out, and the generated kernels do not care which family they came
+// from. The hand-written algebra below stays, deliberately -- it is
+// validated against ERKALE and so is the only oracle the kernels have.
 
 inline XC_result compute_gga(const DeviceView2DLeft collocation_values,
                       const DeviceView2DLeft collocation_gx,
@@ -709,99 +637,6 @@ compute_gga_lsda(const DeviceView2DLeft collocation_values,
       "Compute xc energy", N_quad,
       KOKKOS_LAMBDA(const int g, double &acc) {
         acc += weights(g) * (rho_a(g) + rho_b(g)) * exc(g);
-      },
-      xc_energy);
-
-  return XC_result_polarized{xc_energy, V_alpha, V_beta};
-}
-
-/**
- *  @brief Z = w (1/2 v_rho chi + vec . grad chi): the GGA potential's
- *         pointwise weight.
- *
- *  Z chi^T is NOT symmetric here -- the gradient sits on one index only --
- *  so the caller adds the transpose. That is the usual GGA form, not a
- *  shortcut: the two terms of the functional derivative differ by which
- *  basis function carries the derivative.
- */
-template <typename WView, typename VView> struct GGAPotentialWeight {
-  WView w;
-  VView vrho, vx, vy, vz;
-  KOKKOS_INLINE_FUNCTION double operator()(const int g, const double chi,
-                                           const double dx, const double dy,
-                                           const double dz) const {
-    return w(g) * (0.5 * chi * vrho(g) + vx(g) * dx + vy(g) * dy +
-                   vz(g) * dz);
-  }
-};
-
-template <typename Evaluator>
-  requires BasisEvaluatorWith<Evaluator, BasisDeriv::Gradient>
-inline XC_result_polarized
-compute_gga_lsda_sparse(const Evaluator basis, const FlatGrid grid,
-                        const NeighborList nl, const DeviceView2DLeft mo_alpha,
-                        const DeviceView1D occ_alpha,
-                        const DeviceView2DLeft mo_beta,
-                        const DeviceView1D occ_beta, const xc_func_type func) {
-  if (func.info->family != XC_FAMILY_GGA &&
-      func.info->family != XC_FAMILY_HYB_GGA)
-    throw std::runtime_error(
-        "Provided funtional is not a part of the GGA or Hybrid GGA family");
-  if (func.nspin != XC_POLARIZED)
-    throw std::runtime_error("compute_gga_lsda requires a functional "
-                             "initialized with XC_POLARIZED; "
-                             "use compute_gga for XC_UNPOLARIZED");
-
-  const int N_quad = grid.weights.extent(0);
-  const int N_bf = basis.nbf();
-
-  const PackedBlockLayout L = build_packed_block_layout(basis, nl);
-
-  DeviceView1D rho_a("rho_a", N_quad), gxa("gxa", N_quad), gya("gya", N_quad),
-      gza("gza", N_quad);
-  DeviceView1D rho_b("rho_b", N_quad), gxb("gxb", N_quad), gyb("gyb", N_quad),
-      gzb("gzb", N_quad);
-  packed_density<BasisDeriv::Gradient>(
-      basis, grid, nl, L, density_matrix_from_orbitals(mo_alpha, occ_alpha),
-      rho_a, gxa, gya, gza);
-  packed_density<BasisDeriv::Gradient>(
-      basis, grid, nl, L, density_matrix_from_orbitals(mo_beta, occ_beta),
-      rho_b, gxb, gyb, gzb);
-
-  const GGAPolarizedKernel kern = evaluate_gga_polarized(
-      func, rho_a, gxa, gya, gza, rho_b, gxb, gyb, gzb);
-  const auto w = grid.weights;
-
-  auto build_potential = [&](const DeviceView1D &vrho, const DeviceView1D &vx,
-                             const DeviceView1D &vy, const DeviceView1D &vz) {
-    DeviceView2DLeft raw("V GGA pol one sided", N_bf, N_bf);
-    accumulate_collocation_product<BasisDeriv::Gradient>(
-        basis, grid, nl, L, GGAPotentialWeight{w, vrho, vx, vy, vz}, raw);
-
-    DeviceView2DLeft V("V GGA pol", N_bf, N_bf);
-    Kokkos::parallel_for(
-        "Symmetrize Result",
-        Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0},
-                                                          {N_bf, N_bf}),
-        KOKKOS_LAMBDA(const int i, const int j) {
-          V(i, j) = raw(i, j) + raw(j, i);
-        });
-    Kokkos::fence();
-    return V;
-  };
-
-  DeviceView2DLeft V_alpha =
-      build_potential(kern.vrho_up, kern.vecx_up, kern.vecy_up, kern.vecz_up);
-  DeviceView2DLeft V_beta =
-      build_potential(kern.vrho_down, kern.vecx_dn, kern.vecy_dn,
-                      kern.vecz_dn);
-
-  const auto exc = kern.exc;
-  double xc_energy = 0.0;
-  Kokkos::parallel_reduce(
-      "Compute xc energy", Kokkos::RangePolicy<ExecSpace>(0, N_quad),
-      KOKKOS_LAMBDA(const int g, double &acc) {
-        acc += w(g) * (rho_a(g) + rho_b(g)) * exc(g);
       },
       xc_energy);
 

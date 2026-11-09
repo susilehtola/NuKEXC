@@ -48,6 +48,7 @@
 #include "nukexc/octree.hpp"
 #include <nukexc/nukexc_config.hpp>
 #include <nukexc/xc_integrals.hpp>
+#include <nukexc/xc_screened.hpp>
 
 #include <Kokkos_Core.hpp>
 #include <armadillo>
@@ -171,13 +172,15 @@ constexpr std::uint32_t fnv1a(const char *s, std::uint32_t h = 2166136261u) {
 inline std::uint32_t fnv1a_rt(const std::string &s) { return fnv1a(s.c_str()); }
 
 // ---------------------------------------------------------------------------
-// Functional family + libxc id, resolved from a runtime name via switch.
+// Libxc id, resolved from a runtime name via switch.
+//
+// This carried an XCFamily enum of its own, written by every entry below and
+// read by nobody: both evaluators dispatch on func.info->family, which is
+// Libxc's answer rather than a second list to keep in step. It also shadowed
+// the library's XCFamily, which covers the meta-GGAs this one did not. Gone.
 // ---------------------------------------------------------------------------
-enum class XCFamily { LDA, GGA };
-
 struct FunctionalInfo {
   int xc_id = -1;
-  XCFamily family = XCFamily::LDA;
   std::string canonical_name;
 };
 
@@ -185,37 +188,37 @@ inline FunctionalInfo lookup_functional(const std::string &name) {
   switch (fnv1a_rt(name)) {
   // ---- LDA exchange -----------------------------------------------------
   case fnv1a("lda_x"):
-    return {XC_LDA_X, XCFamily::LDA, "lda_x"};
+    return {XC_LDA_X, "lda_x"};
 
   // ---- LDA correlation ---------------------------------------------------
   case fnv1a("lda_c_pw"):
-    return {XC_LDA_C_PW, XCFamily::LDA, "lda_c_pw"};
+    return {XC_LDA_C_PW, "lda_c_pw"};
   case fnv1a("lda_c_vwn"):
-    return {XC_LDA_C_VWN, XCFamily::LDA, "lda_c_vwn"};
+    return {XC_LDA_C_VWN, "lda_c_vwn"};
 
   // ---- GGA exchange -------------------------------------------------------
   case fnv1a("gga_x_pbe"):
-    return {XC_GGA_X_PBE, XCFamily::GGA, "gga_x_pbe"};
+    return {XC_GGA_X_PBE, "gga_x_pbe"};
   case fnv1a("gga_x_b88"):
-    return {XC_GGA_X_B88, XCFamily::GGA, "gga_x_b88"};
+    return {XC_GGA_X_B88, "gga_x_b88"};
   case fnv1a("gga_x_pw91"):
-    return {XC_GGA_X_PW91, XCFamily::GGA, "gga_x_pw91"};
+    return {XC_GGA_X_PW91, "gga_x_pw91"};
   case fnv1a("gga_xc_b3lyp"):
-    return {XC_HYB_GGA_XC_B3LYP, XCFamily::GGA, "gga_xc_b3lyp"};
+    return {XC_HYB_GGA_XC_B3LYP, "gga_xc_b3lyp"};
   case fnv1a("gga_xc_b3lyp3"):
-    return {XC_HYB_GGA_XC_B3LYP3, XCFamily::GGA, "gga_xc_b3lyp3"};
+    return {XC_HYB_GGA_XC_B3LYP3, "gga_xc_b3lyp3"};
   case fnv1a("gga_xc_b3lyp5"):
-    return {XC_HYB_GGA_XC_B3LYP5, XCFamily::GGA, "gga_xc_b3lyp5"};
+    return {XC_HYB_GGA_XC_B3LYP5, "gga_xc_b3lyp5"};
   case fnv1a("gga_xc_b3lyps"):
-    return {XC_HYB_GGA_XC_B3LYPS, XCFamily::GGA, "gga_xc_b3lyp5"};
+    return {XC_HYB_GGA_XC_B3LYPS, "gga_xc_b3lyp5"};
 
   // ---- GGA correlation ------------------------------------------------
   case fnv1a("gga_c_pbe"):
-    return {XC_GGA_C_PBE, XCFamily::GGA, "gga_c_pbe"};
+    return {XC_GGA_C_PBE, "gga_c_pbe"};
   case fnv1a("gga_c_lyp"):
-    return {XC_GGA_C_LYP, XCFamily::GGA, "gga_c_lyp"};
+    return {XC_GGA_C_LYP, "gga_c_lyp"};
   case fnv1a("gga_c_pw91"):
-    return {XC_GGA_C_PW91, XCFamily::GGA, "gga_c_pw91"};
+    return {XC_GGA_C_PW91, "gga_c_pw91"};
 
   default:
     throw std::runtime_error(
@@ -254,14 +257,17 @@ inline XC_result_polarized evaluate_functional(
                             basis_collocation_gy, basis_collocation_gz, weights,
                             k_C_alpha, k_occ_alpha, k_C_beta, k_occ_beta, func);
   default:
-    throw std::runtime_error("Unhandled XCFamily in evaluate_functional");
+    throw std::runtime_error(
+        "evaluate_functional: no dense quadrature for this Libxc family");
   }
 }
 
 // ---------------------------------------------------------------------------
-// Dispatch a single functional (X or C) to the correct polarized evaluator
-// based on its family. Both compute_lsda and compute_gga_lsda must return
-// XC_result_polarized { energy, potential_alpha, potential_beta }.
+// The screened polarized evaluator. There is no family switch here: one
+// screened quadrature covers LDA, GGA and tau meta-GGA, since the potential
+// comes from the generated kernels and the family only decides which
+// collocation order and which Libxc call it needs. The dense counterpart
+// above still switches, because its chain rule is written per family.
 // ---------------------------------------------------------------------------
 inline XC_result_polarized evaluate_functional_sparse(
     const FunctionalInfo &info, const xc_func_type &func,
@@ -269,22 +275,9 @@ inline XC_result_polarized evaluate_functional_sparse(
     const DeviceView2DLeft &k_C_alpha, const DeviceView1D &k_occ_alpha,
     const DeviceView2DLeft &k_C_beta, const DeviceView1D &k_occ_beta) {
   (void)info;
-  switch (func.info->family) {
-  case XC_FAMILY_LDA:
-    return compute_lsda_sparse(STOPrimitiveEvaluator(basis), grid, nl, k_C_alpha, k_occ_alpha,
-                               k_C_beta, k_occ_beta, func);
-  case XC_FAMILY_HYB_LDA:
-    return compute_lsda_sparse(STOPrimitiveEvaluator(basis), grid, nl, k_C_alpha, k_occ_alpha,
-                               k_C_beta, k_occ_beta, func);
-  case XC_FAMILY_GGA:
-    return compute_gga_lsda_sparse(STOPrimitiveEvaluator(basis), grid, nl, k_C_alpha, k_occ_alpha,
-                                   k_C_beta, k_occ_beta, func);
-  case XC_FAMILY_HYB_GGA:
-    return compute_gga_lsda_sparse(STOPrimitiveEvaluator(basis), grid, nl, k_C_alpha, k_occ_alpha,
-                                   k_C_beta, k_occ_beta, func);
-  default:
-    throw std::runtime_error("Unhandled XCFamily in evaluate_functional");
-  }
+  return compute_xc_polarized_sparse(STOPrimitiveEvaluator(basis), grid, nl,
+                                     k_C_alpha, k_occ_alpha, k_C_beta,
+                                     k_occ_beta, func);
 }
 
 // ---------------------------------------------------------------------------
