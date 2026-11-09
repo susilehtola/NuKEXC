@@ -34,6 +34,7 @@
 #include <nukexc/octree.hpp>
 #include <nukexc/stobasis.hpp>
 #include <nukexc/xc_integrals.hpp>
+#include <nukexc/xc_kernel_session.hpp>
 
 #include <xc.h>
 #include <xc_funcs.h>
@@ -55,6 +56,11 @@ struct Config {
   double screening_tol = 1e-6;
   int max_points_per_box = 32;
   double occupied_fraction = 0.1; ///< occupied orbitals as a share of nbf
+  /// Also time the kernel-backed sessions, dense against screened. Off by
+  /// default because the dense store holds the whole collocation tower --
+  /// gigabytes on benzene at these grid sizes -- and a benchmark should not
+  /// surprise a shared machine with that.
+  bool sessions = false;
 };
 
 Config parse_args(int argc, char *argv[]) {
@@ -74,8 +80,12 @@ Config parse_args(int argc, char *argv[]) {
                 << "  --box-size=<int>  Max points per box    (default: "
                 << cfg.max_points_per_box << ")\n"
                 << "  --occ=<float>     Occupied fraction     (default: "
-                << cfg.occupied_fraction << ")\n";
+                << cfg.occupied_fraction << ")\n"
+                << "  --sessions        Also time the kernel sessions, "
+                   "dense against screened\n";
       std::exit(0);
+    } else if (p.arg == "--sessions") {
+      cfg.sessions = true;
     } else if (!p.string_opt("--basis=", cfg.basis_dir) &&
                !p.int_opt("--nrad=", cfg.nrad) &&
                !p.int_opt("--nang=", cfg.nang) &&
@@ -123,6 +133,102 @@ struct Row {
   double e_gga = 0.0;
 };
 
+// ---------------------------------------------------------------------------
+//  The kernel-backed sessions, dense against screened
+// ---------------------------------------------------------------------------
+//
+// Same density matrix, same grid, same functional, same kernels: the two
+// differ only in where the collocation lives. What the table measures is
+// therefore exactly what that choice costs -- time per Fock build against
+// the memory held between builds -- for the three families whose
+// collocation stops at the gradient.
+
+struct SessionRow {
+  std::string molecule;
+  const char *family = "";
+  double t_ctor_dense = 0.0, t_ctor_scr = 0.0;
+  double t_fock_dense = 0.0, t_fock_scr = 0.0;
+  double mem_dense = 0.0, mem_scr = 0.0; ///< MiB held between builds
+  double e_dense = 0.0, e_scr = 0.0;
+};
+
+/// A symmetric density matrix from the model orbitals, column-major, in the
+/// layout the sessions take.
+std::vector<double> model_density(const DeviceView2DLeft &C) {
+  const int nbf = static_cast<int>(C.extent(0));
+  const int nocc = static_cast<int>(C.extent(1));
+  auto h = Kokkos::create_mirror_view_and_copy(HostSpace{}, C);
+  std::vector<double> P(static_cast<size_t>(nbf) * nbf, 0.0);
+  for (int u = 0; u < nbf; ++u)
+    for (int v = 0; v < nbf; ++v) {
+      double acc = 0.0;
+      for (int k = 0; k < nocc; ++k)
+        acc += h(u, k) * h(v, k);
+      P[static_cast<size_t>(u) + static_cast<size_t>(v) * nbf] = acc;
+    }
+  return P;
+}
+
+/// One Fock build: contract the density, evaluate the functional, assemble.
+/// Returns the wall time and the energy.
+template <typename Session>
+std::pair<double, double> one_fock_build(Session &s, const HostMatrixView &P,
+                                         xc_func_type &func, XCFamily fam) {
+  const int nbf = s.nbf(), ng = s.npoints();
+  std::vector<double> V(static_cast<size_t>(nbf) * nbf, 0.0);
+  HostMatrixRef R{V.data(), nbf, MatrixLayout::ColumnMajor};
+  std::vector<double> zk(ng), vrho(ng), vsigma(ng), vlapl(ng), vtau(ng);
+  const std::vector<double> lapl_in(ng, 0.0);
+
+  Kokkos::Timer t;
+  s.set_density(P);
+  if (fam == XCFamily::LDA)
+    xc_lda_exc_vxc(&func, ng, s.rho().data(), zk.data(), vrho.data());
+  else if (fam == XCFamily::GGA)
+    xc_gga_exc_vxc(&func, ng, s.rho().data(), s.sigma().data(), zk.data(),
+                   vrho.data(), vsigma.data());
+  else
+    xc_mgga_exc_vxc(&func, ng, s.rho().data(), s.sigma().data(),
+                    lapl_in.data(), s.tau().data(), zk.data(), vrho.data(),
+                    vsigma.data(), vlapl.data(), vtau.data());
+
+  XCKernelDerivs d{.vrho = vrho.data()};
+  if (fam != XCFamily::LDA)
+    d.vsigma = vsigma.data();
+  if (fam == XCFamily::MetaGGATau)
+    d.vtau = vtau.data();
+  const XCOutput out = s.accumulate_fock(d, zk.data(), R);
+  Kokkos::fence();
+  return {t.seconds(), out.Exc};
+}
+
+constexpr double to_mib(size_t doubles) {
+  return static_cast<double>(doubles) * sizeof(double) / (1024.0 * 1024.0);
+}
+
+void print_session_rows(const std::vector<SessionRow> &rows) {
+  std::cout << "\nKernel sessions, dense against screened. Construction is "
+               "once per session,\nFock is once per SCF iteration; memory is "
+               "what the store holds between builds.\n\n"
+            << std::left << std::setw(10) << "Molecule" << std::setw(10)
+            << "Family" << std::right << std::setw(11) << "ctor D"
+            << std::setw(11) << "ctor S" << std::setw(11) << "Fock D"
+            << std::setw(11) << "Fock S" << std::setw(11) << "MiB D"
+            << std::setw(11) << "MiB S" << std::setw(16) << "Exc (dense)"
+            << std::setw(14) << "dExc\n";
+  for (const auto &r : rows)
+    std::cout << std::left << std::setw(10) << r.molecule << std::setw(10)
+              << r.family << std::right << std::fixed << std::setprecision(4)
+              << std::setw(11) << r.t_ctor_dense << std::setw(11)
+              << r.t_ctor_scr << std::setw(11) << r.t_fock_dense
+              << std::setw(11) << r.t_fock_scr << std::setprecision(1)
+              << std::setw(11) << r.mem_dense << std::setw(11) << r.mem_scr
+              << std::setprecision(8) << std::setw(16) << r.e_dense
+              << std::scientific << std::setprecision(2) << std::setw(14)
+              << std::abs(r.e_scr - r.e_dense) << std::defaultfloat << "\n";
+  std::cout << std::flush;
+}
+
 void print_rows(const std::vector<Row> &rows) {
   std::cout << "\n"
             << std::left << std::setw(12) << "Molecule" << std::right
@@ -169,7 +275,19 @@ int main(int argc, char *argv[]) {
       return 1;
     }
 
+    // Unpolarized handles for the restricted sessions; the screened
+    // routines above want the polarized ones.
+    xc_func_type lda_u, gga_u, mgga_u;
+    if (xc_func_init(&lda_u, XC_LDA_X, XC_UNPOLARIZED) != 0 ||
+        xc_func_init(&gga_u, XC_GGA_X_PBE, XC_UNPOLARIZED) != 0 ||
+        xc_func_init(&mgga_u, XC_MGGA_X_TPSS, XC_UNPOLARIZED) != 0) {
+      std::cerr << "libxc refused to initialize a functional\n";
+      Kokkos::finalize();
+      return 1;
+    }
+
     std::vector<Row> rows;
+    std::vector<SessionRow> srows;
     try {
       for (auto &[name, mol] : mols) {
         STOBasisSet basis =
@@ -215,8 +333,55 @@ int main(int argc, char *argv[]) {
         r.e_gga = res_gga.energy;
 
         rows.push_back(r);
+
+        if (!cfg.sessions)
+          continue;
+
+        // One density matrix for both stores, and two builds each: on a
+        // shared machine a single timing is worth little, so the second is
+        // the one reported.
+        const auto P = model_density(Ca);
+        const HostMatrixView Pv{P.data(), r.nbf, MatrixLayout::ColumnMajor};
+        struct Fam {
+          XCFamily fam;
+          xc_func_type *func;
+          const char *name;
+        };
+        const Fam fams[] = {{XCFamily::LDA, &lda_u, "LDA"},
+                            {XCFamily::GGA, &gga_u, "GGA"},
+                            {XCFamily::MetaGGATau, &mgga_u, "mGGA-tau"}};
+        for (const auto &fm : fams) {
+          SessionRow sr;
+          sr.molecule = name;
+          sr.family = fm.name;
+
+          t.reset();
+          XCKernelSession<STOPrimitiveEvaluator> dense(ev, grid, fm.fam);
+          Kokkos::fence();
+          sr.t_ctor_dense = t.seconds();
+          sr.mem_dense = to_mib(dense.collocation_doubles());
+          one_fock_build(dense, Pv, *fm.func, fm.fam);
+          const auto dres = one_fock_build(dense, Pv, *fm.func, fm.fam);
+          sr.t_fock_dense = dres.first;
+          sr.e_dense = dres.second;
+
+          t.reset();
+          XCScreenedKernelSession<STOPrimitiveEvaluator> scr(ev, grid, nl,
+                                                             fm.fam);
+          Kokkos::fence();
+          sr.t_ctor_scr = t.seconds();
+          sr.mem_scr = to_mib(scr.collocation_doubles());
+          one_fock_build(scr, Pv, *fm.func, fm.fam);
+          const auto sres = one_fock_build(scr, Pv, *fm.func, fm.fam);
+          sr.t_fock_scr = sres.first;
+          sr.e_scr = sres.second;
+
+          srows.push_back(sr);
+        }
       }
       print_rows(rows);
+      if (cfg.sessions)
+        print_session_rows(srows);
     } catch (const std::exception &e) {
       std::cerr << "benchmark_xc failed: " << e.what() << "\n";
       status = 1;
@@ -224,6 +389,9 @@ int main(int argc, char *argv[]) {
 
     xc_func_end(&lda);
     xc_func_end(&gga);
+    xc_func_end(&lda_u);
+    xc_func_end(&gga_u);
+    xc_func_end(&mgga_u);
   }
   Kokkos::finalize();
   return status;
