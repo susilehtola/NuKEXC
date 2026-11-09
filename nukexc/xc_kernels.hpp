@@ -238,6 +238,12 @@ inline void check_operands(XCFamily f, const XCKernelFields &fl,
  *  Returns the kernel's status, nonzero only on an internal allocation
  *  failure -- which cannot happen when `work` is supplied.
  */
+inline int xc_fock_restricted_unchecked(XCFamily f, int64_t npts, int64_t nbf,
+                                        const double *chi,
+                                        const XCKernelFields &fl,
+                                        const XCKernelDerivs &d, double *out,
+                                        double *work);
+
 inline int xc_fock_restricted(XCFamily f, int64_t npts, int64_t nbf,
                               const double *chi, const XCKernelFields &fl,
                               const XCKernelDerivs &d, double *out,
@@ -245,7 +251,25 @@ inline int xc_fock_restricted(XCFamily f, int64_t npts, int64_t nbf,
   detail::check_operands(f, fl, d);
   if (!chi || !out)
     throw std::invalid_argument("xc_fock_restricted: null chi or out");
+  return xc_fock_restricted_unchecked(f, npts, nbf, chi, fl, d, out, work);
+}
 
+/**
+ *  @brief The kernel dispatch alone: no operand checking, and no throw.
+ *
+ *  A screened quadrature calls the kernel once per spatial box with the
+ *  SAME operands sliced to that box's points, and the operands are not
+ *  worth re-validating ten thousand times -- nor can a throw cross a
+ *  parallel region. So the caller checks once, with check_operands, and
+ *  then drives this.
+ *
+ *  @return the kernel's status, or -1 for an unknown family
+ */
+inline int xc_fock_restricted_unchecked(XCFamily f, int64_t npts, int64_t nbf,
+                                        const double *chi,
+                                        const XCKernelFields &fl,
+                                        const XCKernelDerivs &d, double *out,
+                                        double *work) {
   switch (f) {
   case XCFamily::LDA: {
     const xckernel::xck_lda_r_o1_fields<double> kf{.w = fl.w};
@@ -279,7 +303,7 @@ inline int xc_fock_restricted(XCFamily f, int64_t npts, int64_t nbf,
                                              work);
   }
   }
-  throw std::invalid_argument("xc_fock_restricted: unknown family");
+  return -1;
 }
 
 /**
@@ -571,6 +595,12 @@ inline int64_t xc_fock_work_size_unrestricted(XCFamily f, int64_t npts,
  *  Returns the kernel's status, nonzero only on an internal allocation
  *  failure -- which cannot happen when `work` is supplied.
  */
+inline int xc_fock_unrestricted_unchecked(XCFamily f, XCSpin s, int64_t npts,
+                                          int64_t nbf, const double *chi,
+                                          const XCKernelFieldsU &fl,
+                                          const XCKernelDerivsU &d,
+                                          double *out, double *work);
+
 inline int xc_fock_unrestricted(XCFamily f, XCSpin s, int64_t npts,
                                 int64_t nbf, const double *chi,
                                 const XCKernelFieldsU &fl,
@@ -579,7 +609,17 @@ inline int xc_fock_unrestricted(XCFamily f, XCSpin s, int64_t npts,
   detail::check_operands_u(f, s, fl, d);
   if (!chi || !out)
     throw std::invalid_argument("xc_fock_unrestricted: null chi or out");
+  return xc_fock_unrestricted_unchecked(f, s, npts, nbf, chi, fl, d, out,
+                                        work);
+}
 
+/// The unrestricted kernel dispatch alone; see
+/// xc_fock_restricted_unchecked for why it exists.
+inline int xc_fock_unrestricted_unchecked(XCFamily f, XCSpin s, int64_t npts,
+                                          int64_t nbf, const double *chi,
+                                          const XCKernelFieldsU &fl,
+                                          const XCKernelDerivsU &d,
+                                          double *out, double *work) {
   const bool alpha = (s == XCSpin::Alpha);
 
   switch (f) {
@@ -694,7 +734,7 @@ inline int xc_fock_unrestricted(XCFamily f, XCSpin s, int64_t npts,
                                               work);
   }
   }
-  throw std::invalid_argument("xc_fock_unrestricted: unknown family");
+  return -1;
 }
 
 } // namespace Nukexc
