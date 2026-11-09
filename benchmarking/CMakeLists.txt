@@ -13,6 +13,7 @@ add_executable(benchmark_coreH     ${SUPPORT}/standards.cxx benchmark_coreH.cxx 
 add_executable(benchmark_cutoff    ${SUPPORT}/standards.cxx benchmark_cutoff.cxx ${SUPPORT}/test_io.cxx)
 add_executable(benchmark_xc        ${SUPPORT}/standards.cxx benchmark_xc.cxx     ${SUPPORT}/test_io.cxx)
 add_executable(benchmark_collocation ${SUPPORT}/standards.cxx benchmark_collocation.cxx)
+add_executable(benchmark_exchange  ${SUPPORT}/standards.cxx benchmark_exchange.cxx ${SUPPORT}/test_io.cxx)
 
 set(ALL_BENCHMARK_TARGETS
     benchmark_partition
@@ -20,6 +21,7 @@ set(ALL_BENCHMARK_TARGETS
     benchmark_cutoff
     benchmark_xc
     benchmark_collocation
+    benchmark_exchange
 )
 
 # The benchmarks resolve their data with paths relative to the working
