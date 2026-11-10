@@ -893,12 +893,14 @@ TEST_CASE("Mixing the spin cases up is caught", "[xckernel][unrestricted]") {
 namespace {
 
 using ScreenedSession = XCScreenedKernelSession<STOPrimitiveEvaluator>;
+using GTOScreenedSession = XCScreenedKernelSession<GTOEvaluator>;
 
 /// Box the grid for the screened path. create_bounding_boxes PERMUTES the
 /// grid in place, so this has to run before either session is built: they
 /// must see the same point order, or every pointwise comparison below is
 /// comparing different points.
-NeighborList box_the_grid(FlatGrid &grid, const STOPrimitiveEvaluator &ev,
+template <typename Evaluator>
+NeighborList box_the_grid(FlatGrid &grid, const Evaluator &ev,
                           const int mppb = 128) {
   auto bb = create_bounding_boxes(grid, mppb);
   NeighborList nl;
@@ -1102,16 +1104,128 @@ TEST_CASE("The screened kernel session reproduces the dense one, "
   }
 }
 
-TEST_CASE("A packed block stops at the gradient, and says so",
+TEST_CASE("The Laplacian family is refused for the evaluator's reason, not "
+          "the store's",
           "[xckernel][screened]") {
-  // The Laplacian meta-GGA family needs second derivatives of the basis,
-  // which pack_collocation does not pack. Refusing in the constructor is
-  // the point: the alternative is a Fock matrix assembled from a tower
-  // whose Laplacian components were never written.
+  // STOPrimitiveEvaluator::max_deriv is Gradient, so neither store can
+  // build a Laplacian meta-GGA on a Slater basis -- and the refusal has to
+  // come from the constructor, because the alternative is a Fock matrix
+  // assembled from a tower whose Laplacian components were never written.
+  // The screened store refusing where the dense one does is the property
+  // worth pinning: it used to refuse MORE, on the packing's own account,
+  // and a caller could then get the family by choosing the dense store.
   Fixture f(15, 7);
   const STOPrimitiveEvaluator ev(f.basis);
   const NeighborList nl = box_the_grid(f.grid, ev);
   REQUIRE_THROWS_AS(ScreenedSession(ev, f.grid, nl, XCFamily::MetaGGALapl),
                     std::invalid_argument);
+  REQUIRE_THROWS_AS(Session(ev, f.grid, XCFamily::MetaGGALapl),
+                    std::invalid_argument);
   REQUIRE_NOTHROW(ScreenedSession(ev, f.grid, nl, XCFamily::MetaGGATau));
+
+  // Gaussians do carry second derivatives, and then both stores take it.
+  const auto host = test::sto3g_basis(f.mol);
+  const GTOEvaluator gev(make_gto_device_basis(host));
+  const NeighborList gnl = box_the_grid(f.grid, gev);
+  REQUIRE_NOTHROW(GTOScreenedSession(gev, f.grid, gnl, XCFamily::MetaGGALapl));
+}
+
+TEST_CASE("The screened kernel session reproduces the dense one for a "
+          "Laplacian meta-GGA",
+          "[xckernel][screened]") {
+  // The fourth family, and the one the packed store used to refuse. It is
+  // the only one whose collocation goes past the gradient: the tower the
+  // kernel indexes has ten components and the density contraction needs
+  // the trace of the Hessian on top of the gradient it already had, so
+  // this is the case that tests pack_collocation at Hessian order and
+  // packed_density's Laplacian against the dense derivation of both.
+  //
+  // A Gaussian basis, because the Slater radials stop at the gradient.
+  Fixture f(35, 15);
+  const auto host = test::sto3g_basis(f.mol);
+  const GTOEvaluator ev(make_gto_device_basis(host));
+  const NeighborList nl = box_the_grid(f.grid, ev);
+  const int nbf = ev.nbf();
+  auto P = make_P(nbf);
+  HostMatrixView Pv{P.data(), nbf, MatrixLayout::ColumnMajor};
+
+  GTOSession dense(ev, f.grid, XCFamily::MetaGGALapl);
+  GTOScreenedSession scr(ev, f.grid, nl, XCFamily::MetaGGALapl);
+  REQUIRE(scr.nbf() == dense.nbf());
+  REQUIRE(scr.npoints() == dense.npoints());
+  REQUIRE(scr.collocation_order() == BasisDeriv::Hessian);
+  REQUIRE(scr.collocation_order() == dense.collocation_order());
+  REQUIRE(scr.layout().num_boxes > 1);
+
+  dense.set_density(Pv);
+  scr.set_density(Pv);
+  const int ng = dense.npoints();
+
+  // Measured, water/STO-3G on the nrad 35 lmax 15 grid, worst difference
+  // relative to each quantity's own scale: rho 1.8e-13, sigma 2.4e-15,
+  // the gradient components 3.8e-13 / 4.7e-13 / 6.5e-13, tau 2.9e-13,
+  // lapl 3.2e-13.
+  //
+  // Three orders of magnitude looser than the Slater cases above, and the
+  // reason is the basis, not this family: rho's packed derivation is the
+  // same code at every order and never reads a second derivative, so its
+  // 1.8e-13 is what the Gaussian screening already cost. The Laplacian
+  // landing in the same decade is the result worth having -- the dense
+  // path derives it from global GEMMs over the whole basis and this one
+  // from per-box blocks, so a dropped term or a wrong factor of two would
+  // show up as O(1), not as round-off.
+  const double TOL = 1e-11;
+  worst_grid("rho", scr.rho(), dense.rho(), TOL);
+  worst_grid("sigma", scr.sigma(), dense.sigma(), TOL);
+  worst_grid("rho_x", scr.rho_x(), dense.rho_x(), TOL);
+  worst_grid("rho_y", scr.rho_y(), dense.rho_y(), TOL);
+  worst_grid("rho_z", scr.rho_z(), dense.rho_z(), TOL);
+  worst_grid("tau", scr.tau(), dense.tau(), TOL);
+  worst_grid("lapl", scr.lapl(), dense.lapl(), TOL);
+
+  // BR89 is a functional that genuinely differentiates with respect to the
+  // Laplacian, so vlapl comes back nonzero and the Laplacian-weighted part
+  // of the kernel is actually exercised. With TPSS it would not be: vlapl
+  // would be zero and the comparison would pass without the new term ever
+  // reaching the Fock matrix.
+  xc_func_type func;
+  REQUIRE(xc_func_init(&func, XC_MGGA_X_BR89_EXPLICIT, XC_UNPOLARIZED) == 0);
+  std::vector<double> zk(ng), vrho(ng), vsigma(ng), vlapl(ng), vtau(ng);
+  xc_mgga_exc_vxc(&func, ng, dense.rho().data(), dense.sigma().data(),
+                  dense.lapl().data(), dense.tau().data(), zk.data(),
+                  vrho.data(), vsigma.data(), vlapl.data(), vtau.data());
+  xc_func_end(&func);
+
+  double vlapl_scale = 0.0;
+  for (const double v : vlapl)
+    vlapl_scale = std::max(vlapl_scale, std::abs(v));
+  INFO("max |vlapl| = " << vlapl_scale);
+  REQUIRE(vlapl_scale > 1e-6);
+
+  const XCKernelDerivs d{.vrho = vrho.data(),
+                         .vsigma = vsigma.data(),
+                         .vtau = vtau.data(),
+                         .vlapl = vlapl.data()};
+
+  std::vector<double> Vd(static_cast<size_t>(nbf) * nbf, 0.0);
+  std::vector<double> Vs(static_cast<size_t>(nbf) * nbf, 0.0);
+  HostMatrixRef Rd{Vd.data(), nbf, MatrixLayout::ColumnMajor};
+  HostMatrixRef Rs{Vs.data(), nbf, MatrixLayout::ColumnMajor};
+  const XCOutput od = dense.accumulate_fock(d, zk.data(), Rd);
+  const XCOutput os = scr.accumulate_fock(d, zk.data(), Rs);
+
+  INFO("Exc dense " << od.Exc << ", screened " << os.Exc);
+  REQUIRE_THAT(os.Nel, Catch::Matchers::WithinRel(od.Nel, 1e-11));
+  REQUIRE_THAT(os.Exc, Catch::Matchers::WithinRel(od.Exc, 1e-11));
+
+  double scale = 0.0;
+  const double w = worst_diff(Vs, Vd, scale);
+  // Measured 1.3e-11 relative, which is looser than the Slater families'
+  // 2.6e-13 for a reason the numbers above show: the density Laplacian's
+  // scale on this grid is 703 against rho's 1.9, so vlapl multiplies an
+  // operand with nearly three more decades of dynamic range.
+  INFO("V: worst |screened - dense| = " << w << ", scale " << scale
+                                        << ", relative " << w / scale);
+  REQUIRE(scale > 1e-3);
+  REQUIRE(w < 2e-10 * scale);
 }

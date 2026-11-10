@@ -601,8 +601,9 @@ public:
  *  that does not grow with nbf * npts, which is what lets a molecule run
  *  whose tower would not fit at all.
  *
- *  Covers LDA, GGA and tau meta-GGAs. A Laplacian meta-GGA throws from the
- *  store's constructor, since a packed block stops at the gradient.
+ *  Covers every family the dense session covers, and refuses a Laplacian
+ *  meta-GGA in exactly the same case: an evaluator without second
+ *  derivatives, which the Slater radials are and the Gaussians are not.
  */
 template <typename Evaluator>
 class XCScreenedKernelSession

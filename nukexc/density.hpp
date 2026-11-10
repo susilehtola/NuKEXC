@@ -672,7 +672,18 @@ inline void dot_gradients(const DeviceView1D &ax, const DeviceView1D &ay,
  *  times the width of the one the density needs, which is why it is opt-in
  *  rather than always computed. The convention is the one
  *  compute_meta_fields_dm documents: the TOTAL kinetic energy density for
- *  the density matrix given, so P^alpha in gives Libxc's tau_a. The work is O(sum_b n_be_b^2 npts_b) with ONE shell
+ *  the density matrix given, so P^alpha in gives Libxc's tau_a.
+ *
+ *  Pass a non-empty @p lapl, at BasisDeriv::Hessian, to get the density
+ *  Laplacian,
+ *
+ *      lapl_rho(g) = 2 sum_i lapl_chi(i, g) X(i, g)
+ *                    + 2 sum_c sum_i dchi_c(i, g) Xg_c(i, g),
+ *
+ *  the second term being the same gradient product tau halves, so asking
+ *  for the Laplacian pays for the Xg GEMM whether or not tau was asked
+ *  for. Both terms carry the factor two of the product rule on a symmetric
+ *  P, exactly as compute_meta_fields_dm derives them for the dense path. The work is O(sum_b n_be_b^2 npts_b) with ONE shell
  *  evaluation per (shell, point) -- the orbital-loop kernels this replaces
  *  re-evaluated every shell once per occupied orbital, so their evaluation
  *  count carried a factor N_occ that nothing in the mathematics asks for.
@@ -689,11 +700,17 @@ inline void packed_density(const Evaluator &basis, const FlatGrid &grid,
                            DeviceView1D gx = DeviceView1D(),
                            DeviceView1D gy = DeviceView1D(),
                            DeviceView1D gz = DeviceView1D(),
-                           DeviceView1D tau = DeviceView1D()) {
+                           DeviceView1D tau = DeviceView1D(),
+                           DeviceView1D lapl = DeviceView1D()) {
   using policy_type = Kokkos::TeamPolicy<ExecSpace>;
   using member_type = policy_type::member_type;
-  constexpr bool want_grad = (Deriv == BasisDeriv::Gradient);
+  constexpr bool want_grad = (Deriv >= BasisDeriv::Gradient);
+  constexpr bool want_hess = (Deriv >= BasisDeriv::Hessian);
   const bool want_tau = tau.extent(0) > 0;
+  const bool want_lapl = lapl.extent(0) > 0;
+  // The Laplacian's second term is the gradient product tau halves, so one
+  // flag drives the extra GEMM for both.
+  const bool want_gprod = want_tau || want_lapl;
 
   if constexpr (want_grad) {
     if (gx.extent(0) != rho.extent(0) || gy.extent(0) != rho.extent(0) ||
@@ -709,6 +726,16 @@ inline void packed_density(const Evaluator &basis, const FlatGrid &grid,
   if (want_tau && tau.extent(0) != rho.extent(0))
     throw std::invalid_argument(
         "packed_density: tau must match rho in length");
+  if constexpr (!want_hess) {
+    if (want_lapl)
+      throw std::invalid_argument(
+          "packed_density: the density Laplacian needs the second "
+          "derivatives of the basis, so it is only available at "
+          "BasisDeriv::Hessian");
+  }
+  if (want_lapl && lapl.extent(0) != rho.extent(0))
+    throw std::invalid_argument(
+        "packed_density: lapl must match rho in length");
 
   Kokkos::deep_copy(rho, 0.0);
   if constexpr (want_grad) {
@@ -718,14 +745,19 @@ inline void packed_density(const Evaluator &basis, const FlatGrid &grid,
   }
   if (want_tau)
     Kokkos::deep_copy(tau, 0.0);
+  if (want_lapl)
+    Kokkos::deep_copy(lapl, 0.0);
 
   Kokkos::View<double *> chi("packed chi", L.max_chunk_coll);
   Kokkos::View<double *> grad("packed grad",
                               want_grad ? 3 * L.max_chunk_coll : 0);
+  // The trace of the Hessian, which is all the Blocks layout keeps of it.
+  Kokkos::View<double *> lapl_chi("packed lapl chi",
+                                  want_hess ? L.max_chunk_coll : 0);
   Kokkos::View<double *> X("P chi", L.max_chunk_coll);
-  // P times the gradient block, for tau. Three times the size, so it is
-  // allocated only when tau was asked for.
-  Kokkos::View<double *> Xg("P dchi", want_tau ? 3 * L.max_chunk_coll : 0);
+  // P times the gradient block, for tau and for the Laplacian's second
+  // term. Three times the size, so it is allocated only when asked for.
+  Kokkos::View<double *> Xg("P dchi", want_gprod ? 3 * L.max_chunk_coll : 0);
   Kokkos::View<double *> Pblk("P blocks", L.max_chunk_blk);
 
   auto nbf_v = L.map.nbf;
@@ -737,11 +769,11 @@ inline void packed_density(const Evaluator &basis, const FlatGrid &grid,
     const int b0 = L.chunk_begin[c], b1 = L.chunk_begin[c + 1];
     const int nbox = b1 - b0;
 
-    pack_collocation<Deriv>(basis, grid, nl, L, b0, b1, chi, grad);
+    pack_collocation<Deriv>(basis, grid, nl, L, b0, b1, chi, grad, lapl_chi);
     gather_packed_blocks(L, b0, b1, P, Pblk);
     ExecSpace().fence();
     block_gemm_matrix_times_collocation(L, b0, b1, 1, Pblk, chi, X);
-    if (want_tau)
+    if (want_gprod)
       block_gemm_matrix_times_collocation(L, b0, b1, 3, Pblk, grad, Xg);
     ExecSpace().fence();
 
@@ -756,13 +788,15 @@ inline void packed_density(const Evaluator &basis, const FlatGrid &grid,
           const size_t cb = coll_off(b) - coll_off(b0);
           const double *chi_b = chi.data() + cb;
           const double *grad_b = want_grad ? grad.data() + 3 * cb : nullptr;
+          const double *lc_b = want_hess ? lapl_chi.data() + cb : nullptr;
           const double *X_b = X.data() + cb;
-          const double *Xg_b = want_tau ? Xg.data() + 3 * cb : nullptr;
+          const double *Xg_b = want_gprod ? Xg.data() + 3 * cb : nullptr;
           const int g0 = b * mppb;
 
           Kokkos::parallel_for(
               Kokkos::TeamVectorRange(team, np), [&](const int g) {
-                double r = 0.0, dx = 0.0, dy = 0.0, dz = 0.0, t = 0.0;
+                double r = 0.0, dx = 0.0, dy = 0.0, dz = 0.0, t = 0.0,
+                       lp = 0.0;
                 for (int i = 0; i < n; ++i) {
                   const double x = X_b[static_cast<size_t>(i) * np + g];
                   r += chi_b[static_cast<size_t>(i) * np + g] * x;
@@ -772,13 +806,17 @@ inline void packed_density(const Evaluator &basis, const FlatGrid &grid,
                     dx += gr[0 * np + g] * x;
                     dy += gr[1 * np + g] * x;
                     dz += gr[2 * np + g] * x;
-                    if (want_tau) {
+                    if (want_gprod) {
                       const double *xg =
                           Xg_b + static_cast<size_t>(i) * 3 * np;
                       t += gr[0 * np + g] * xg[0 * np + g] +
                            gr[1 * np + g] * xg[1 * np + g] +
                            gr[2 * np + g] * xg[2 * np + g];
                     }
+                  }
+                  if constexpr (want_hess) {
+                    if (want_lapl)
+                      lp += lc_b[static_cast<size_t>(i) * np + g] * x;
                   }
                 }
                 rho(g0 + g) = r;
@@ -788,6 +826,11 @@ inline void packed_density(const Evaluator &basis, const FlatGrid &grid,
                   gz(g0 + g) = 2.0 * dz;
                   if (want_tau)
                     tau(g0 + g) = 0.5 * t;
+                }
+                if constexpr (want_hess) {
+                  // t still holds the RAW gradient product, which is 2 tau.
+                  if (want_lapl)
+                    lapl(g0 + g) = 2.0 * lp + 2.0 * t;
                 }
               });
         });
