@@ -47,6 +47,7 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <vector>
 
 #include <KokkosBlas2_gemv.hpp>
 #include <KokkosBlas2_gemv_impl.hpp>
@@ -172,6 +173,144 @@ DeviceView2DLeft compute_exact_exchange(
 // the auxiliary basis by function, so neither could be instantiated for a
 // Gaussian basis. Nothing here has that restriction.
 
+namespace detail {
+
+/// The maximum occupied-orbital batch, and so the size of the per-point
+/// register accumulator in chunk_orbitals_on_grid.
+constexpr int MAX_ORBITAL_BATCH = 32;
+
+/**
+ *  @brief A batch of occupied orbitals on the points of one chunk of boxes.
+ *
+ *     psi_i(g) = sum_{u in box} C(u, i) chi_u(g)
+ *
+ *  with u running over the BOX's functions and the local-to-global map
+ *  applied to reach C -- which is the whole point of the screening, since
+ *  the alternative is a sum over all nbf functions of the basis.
+ *
+ *  psi is laid out (batch, chunk points): the exchange build scales one
+ *  orbital's points at a time and wants them contiguous.
+ */
+inline void chunk_orbitals_on_grid(const ExecSpace &space,
+                                   const PackedBlockLayout &L, const int b0,
+                                   const int b1, const int g0,
+                                   const Kokkos::View<double *> &chi,
+                                   const DeviceView2DLeft &C, const int i0,
+                                   const int nb,
+                                   const Kokkos::View<double *> &psi,
+                                   const size_t psi_stride) {
+  using policy_type = Kokkos::TeamPolicy<ExecSpace>;
+  using member_type = typename policy_type::member_type;
+  const int nbox = b1 - b0;
+  if (nbox <= 0 || nb <= 0)
+    return;
+  if (nb > MAX_ORBITAL_BATCH)
+    throw std::invalid_argument(
+        "chunk_orbitals_on_grid: batch exceeds MAX_ORBITAL_BATCH");
+
+  auto nbf_v = L.map.nbf;
+  auto npts_v = L.npts;
+  auto coll_off = L.coll_off;
+  auto bf_off = L.bf_off;
+  auto l2g = L.loc2glob;
+  const int mppb = L.mppb;
+
+  Kokkos::parallel_for(
+      "Occupied orbitals on the grid", policy_type(space, nbox, Kokkos::AUTO()),
+      KOKKOS_LAMBDA(const member_type &team) {
+        const int b = b0 + team.league_rank();
+        const int n = nbf_v(b);
+        const int np = npts_v(b);
+        if (np == 0)
+          return;
+        const double *chi_b = chi.data() + (coll_off(b) - coll_off(b0));
+        const size_t base = bf_off(b);
+        const int gloc = b * mppb - g0;
+        double *psi_b = psi.data();
+
+        Kokkos::parallel_for(
+            Kokkos::TeamVectorRange(team, np), [&](const int g) {
+              double acc[MAX_ORBITAL_BATCH];
+              for (int j = 0; j < nb; ++j)
+                acc[j] = 0.0;
+              for (int i = 0; i < n; ++i) {
+                const double ci = chi_b[static_cast<size_t>(i) * np + g];
+                const int mu = l2g(base + i);
+                for (int j = 0; j < nb; ++j)
+                  acc[j] += C(mu, i0 + j) * ci;
+              }
+              for (int j = 0; j < nb; ++j)
+                psi_b[j * psi_stride + static_cast<size_t>(gloc + g)] =
+                    acc[j];
+            });
+      });
+}
+
+/**
+ *  @brief max_g |psi_j(g)| over each box of a chunk, written at the ABSOLUTE
+ *         box index.
+ *
+ *  One pass over psi -- nbox * np * nb reads, against naux GEMMs per
+ *  orbital in the build that uses it -- so the build computes it whether or
+ *  not it will screen on it. Boxes with no points are left untouched;
+ *  every reader guards on the point count as well.
+ */
+inline void chunk_box_amplitudes(const ExecSpace &space,
+                                 const PackedBlockLayout &L, const int b0,
+                                 const int b1, const int g0,
+                                 const Kokkos::View<double *> &psi,
+                                 const size_t psi_stride, const int nb,
+                                 const Kokkos::View<double **> &pmax) {
+  using policy_type = Kokkos::TeamPolicy<ExecSpace>;
+  using member_type = typename policy_type::member_type;
+  const int nbox = b1 - b0;
+  if (nbox <= 0 || nb <= 0)
+    return;
+  auto npts_v = L.npts;
+  const int mppb = L.mppb;
+
+  Kokkos::parallel_for(
+      "Orbital amplitude per box", policy_type(space, nbox, Kokkos::AUTO()),
+      KOKKOS_LAMBDA(const member_type &team) {
+        const int b = b0 + team.league_rank();
+        const int np = npts_v(b);
+        if (np == 0)
+          return;
+        const int gloc = b * mppb - g0;
+        for (int j = 0; j < nb; ++j) {
+          double m = 0.0;
+          Kokkos::parallel_reduce(
+              Kokkos::TeamVectorRange(team, np),
+              [&](const int g, double &acc) {
+                const double v = Kokkos::abs(
+                    psi(j * psi_stride + static_cast<size_t>(gloc + g)));
+                if (v > acc)
+                  acc = v;
+              },
+              Kokkos::Max<double>(m));
+          Kokkos::single(Kokkos::PerTeam(team), [&]() { pmax(b, j) = m; });
+        }
+      });
+}
+
+} // namespace detail
+
+/// How much the orbital screening actually skipped.
+///
+/// Counted over (box, orbital) pairs, which is the unit of work the
+/// screening decides on: one scale, one GEMM and one scatter per pair.
+struct ExchangeScreeningStats {
+  long long pairs_total = 0; ///< pairs that carry work at all
+  long long pairs_alive = 0; ///< pairs whose work was done
+
+  double alive_fraction() const {
+    return pairs_total > 0
+               ? static_cast<double>(pairs_alive) /
+                     static_cast<double>(pairs_total)
+               : 1.0;
+  }
+};
+
 template <typename Evaluator, typename PotEvaluator>
   requires BasisEvaluatorWith<Evaluator, BasisDeriv::Value> &&
            PotentialEvaluator<PotEvaluator>
@@ -179,7 +318,9 @@ inline DeviceView2DLeft compute_exact_exchange_screened(
     const ExecSpace space, const DeviceView2DLeft mo_orbitals,
     const DeviceView1D mo_coeff, const Evaluator basis,
     const PotEvaluator basis_aux, const FlatGrid grid, const NeighborList nl,
-    const DeviceView2DLeft half_inverse_X, const int orbital_batch = 8) {
+    const DeviceView2DLeft half_inverse_X, const int orbital_batch = 8,
+    const double orbital_tol = 0.0,
+    ExchangeScreeningStats *stats = nullptr) {
 
   Kokkos::Profiling::pushRegion("Compute Exact Exchange Integral Screened");
 
@@ -241,7 +382,82 @@ inline DeviceView2DLeft compute_exact_exchange_screened(
   // only together with much larger boxes, and then only above roughly 75
   // occupied orbitals. benchmark_exchange --layout-only prints the numbers
   // for any system, and its header carries the tables.
-  constexpr int MAX_ORBITAL_BATCH = 32;
+  // ORBITAL SCREENING, the other half of issue #8
+  //
+  // Everything inside the orbital loop is box-local: the box's collocation
+  // scaled by the orbital, one GEMM against the box's auxiliary potential,
+  // and the scatter of the (naux, nbf_b) block. If the orbital has no
+  // amplitude anywhere in the box, all three contribute nothing and can be
+  // skipped. orbital_tol is the threshold on max_g |psi_i(g)| over the box,
+  // and zero -- the default -- screens nothing.
+  //
+  // This is where issue #8's "screen on the density matrix" lands in THIS
+  // formalism, and it needs the caller's cooperation. Nothing here looks at
+  // |P| directly, because the loop does not index function pairs; it indexes
+  // occupied orbitals. Canonical orbitals are delocalized and the screening
+  // then does nothing at all -- every orbital is alive in every box. The
+  // density matrix's decay is available only through a factorization of P
+  // that inherits it, which is what localize.hpp provides and what the
+  // caller should pass: K depends on the occupied set only through P, so
+  // substituting the pivoted Cholesky vectors for the orbitals is exact
+  // rather than an approximation.
+  //
+  // The threshold is absolute, on an orbital normalized against the overlap,
+  // so |psi| is O(1) in atomic units and a tolerance reads as a relative
+  // one.
+  //
+  // WHAT IT IS WORTH, MEASURED
+  //
+  // Aligned alkanes, DZ, 128-point boxes, SAP-guess occupied orbitals, the
+  // work weighted by nbf_b * np_b because that is what a kept pair costs
+  // (benchmark_exchange --screen-only):
+  //
+  //     work kept        1e-6    1e-5    1e-4
+  //     C4H10   canon    100.0    100.0   92.9
+  //             Cholesky 100.0    100.0  100.0
+  //     C8H18   canon    100.0     98.2   86.3
+  //             Cholesky 100.0    100.0   98.9
+  //     C12H26  canon     99.8     96.2   85.4
+  //             Cholesky  99.9     98.2   89.5
+  //     C16H34  canon     98.8     93.5   83.2
+  //             Cholesky  98.3     92.6   79.5
+  //
+  // So it is real but small: a fifth of the three-centre work at C16H34,
+  // for about 1e-6 relative error in K, improving with chain length (100 ->
+  // 79 per cent from C4 to C16) but nowhere near the change of scaling
+  // issue #8 asks for. The default is therefore off.
+  //
+  // The localization is not what limits this. The Cholesky factors' spread
+  // is SIZE-INDEPENDENT -- 5.9, 6.4, 6.9, 7.0 basis functions across those
+  // four chains -- while the canonical spread tracks the fully delocalized
+  // limit almost exactly (61.3 against 65.8 at C16H34). What limits it is
+  // that a second moment of 7 says nothing about the TAILS, and the tails
+  // are what screening needs: over twenty angstroms of alkane a localized
+  // orbital's amplitude falls only about four orders of magnitude, so the
+  // tolerance that skips appreciable work is the same tolerance that costs
+  // appreciable accuracy. That the two factorizations differ so little --
+  // and that at 1e-4 the CANONICAL set sometimes keeps less, by dilution
+  // rather than by locality -- is the same statement.
+  //
+  // It is also not the basis screening. Loosening it from 1e-8 to 1e-4
+  // moves nbf/box from 143.9 to 92.2 at C16H34 and leaves the work-kept
+  // curve where it was, to a tenth of a per cent. max_g |psi| over a box is
+  // robust against which marginal functions the layout happens to keep.
+  //
+  // Why this does not reproduce GauXC's result: exx_ek_screening screens
+  // SHELL PAIRS for (mu nu|la si) on |P_mu nu| times an integral bound --
+  // a product of two decaying quantities, over a list that is quadratic in
+  // the basis, so there is a great deal to remove. This loop has no pair
+  // list. It has one orbital index, and one decaying quantity.
+  //
+  // What this does NOT fix: Bten is (naux, nbf, batch) dense and the
+  // per-orbital contraction through the fitting metric is naux * nbf * K,
+  // with no grid factor and no screening. Once the grid term is screened
+  // down to O(N) that contraction is what is left, and it is cubic. Its
+  // operand is sparse for a localized orbital -- the same boxes that were
+  // skipped leave zero columns in Bten -- so the same information would
+  // screen it, but that is a separate restructure.
+  constexpr int MAX_ORBITAL_BATCH = detail::MAX_ORBITAL_BATCH;
   if (orbital_batch < 1)
     throw std::invalid_argument(
         "compute_exact_exchange_screened: orbital_batch must be positive");
@@ -266,6 +482,12 @@ inline DeviceView2DLeft compute_exact_exchange_screened(
   Kokkos::View<double *> psi("psi", static_cast<size_t>(batch) * psi_stride);
   // chi scaled by one orbital, and the (naux, nbf_b) blocks the GEMM writes.
   Kokkos::View<double *> X("chi times psi", L.max_chunk_coll);
+  // max_g |psi_j| over each box, for the orbital screening. Indexed by the
+  // ABSOLUTE box number so no chunk-local bookkeeping is needed; it is
+  // num_boxes * batch doubles, megabytes at the sizes where the exchange
+  // build itself needs gigabytes.
+  Kokkos::View<double **> pmax("orbital amplitude per box", L.num_boxes,
+                               batch);
   Kokkos::View<double *> Tblk("three center blocks",
                               static_cast<size_t>(N_aux) * L.max_chunk_nbf);
   Kokkos::View<double ***, Kokkos::LayoutLeft, MemSpace> Bten(
@@ -280,6 +502,9 @@ inline DeviceView2DLeft compute_exact_exchange_screened(
   auto bf_off = L.bf_off;
   auto l2g = L.loc2glob;
   const int mppb = L.mppb;
+  // Captured by value into the device lambdas; zero screens nothing, since
+  // pmax is a maximum of absolute values and is never negative.
+  const double tol = orbital_tol;
 
   using policy_type = Kokkos::TeamPolicy<ExecSpace>;
   using member_type = policy_type::member_type;
@@ -312,36 +537,44 @@ inline DeviceView2DLeft compute_exact_exchange_screened(
             Vaux(a, g) *= w(g0 + g);
           });
 
-      Kokkos::parallel_for(
-          "Occupied orbitals on the grid", policy_type(nbox, Kokkos::AUTO()),
-          KOKKOS_LAMBDA(const member_type &team) {
-            const int b = b0 + team.league_rank();
-            const int n = nbf_v(b);
-            const int np = npts_v(b);
-            if (np == 0)
-              return;
-            const double *chi_b = chi.data() + (coll_off(b) - coll_off(b0));
-            const size_t base = bf_off(b);
-            const int gloc = b * mppb - g0;
-            double *psi_b = psi.data();
-
-            Kokkos::parallel_for(
-                Kokkos::TeamVectorRange(team, np), [&](const int g) {
-                  double acc[MAX_ORBITAL_BATCH];
-                  for (int j = 0; j < nb; ++j)
-                    acc[j] = 0.0;
-                  for (int i = 0; i < n; ++i) {
-                    const double ci = chi_b[static_cast<size_t>(i) * np + g];
-                    const int mu = l2g(base + i);
-                    for (int j = 0; j < nb; ++j)
-                      acc[j] += mo_orbitals(mu, i0 + j) * ci;
-                  }
-                  for (int j = 0; j < nb; ++j)
-                    psi_b[j * psi_stride + static_cast<size_t>(gloc + g)] =
-                        acc[j];
-                });
-          });
+      detail::chunk_orbitals_on_grid(space, L, b0, b1, g0, chi, mo_orbitals,
+                                     i0, nb, psi, psi_stride);
       space.fence();
+
+      // The orbital's amplitude in each box, for the screening below. The
+      // same quantity orbital_box_amplitudes reports, and cheap enough to
+      // compute whether or not it will be used.
+      detail::chunk_box_amplitudes(space, L, b0, b1, g0, psi, psi_stride, nb,
+                                   pmax);
+      space.fence();
+
+      if (stats) {
+        // Both counts exclude the boxes that carry no work at all -- no
+        // points, or no functions reaching them -- because the build skips
+        // those whether or not it screens, and counting them as "skipped"
+        // would credit the screening with work nobody was going to do.
+        long long alive = 0, boxes = 0;
+        Kokkos::parallel_reduce(
+            "Count live box-orbital pairs",
+            Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>(space, {b0, 0},
+                                                              {b1, nb}),
+            KOKKOS_LAMBDA(const int b, const int j, long long &acc) {
+              if (npts_v(b) > 0 && nbf_v(b) > 0 && pmax(b, j) >= tol)
+                acc += 1;
+            },
+            alive);
+        Kokkos::parallel_reduce(
+            "Count boxes that carry work",
+            Kokkos::RangePolicy<ExecSpace>(space, b0, b1),
+            KOKKOS_LAMBDA(const int b, long long &acc) {
+              if (npts_v(b) > 0 && nbf_v(b) > 0)
+                acc += 1;
+            },
+            boxes);
+        space.fence();
+        stats->pairs_total += boxes * nb;
+        stats->pairs_alive += alive;
+      }
 
       // One orbital at a time: scale the packed collocation by psi_j, then
       // ONE GEMM per box against the box's auxiliary potential block, then
@@ -362,6 +595,8 @@ inline DeviceView2DLeft compute_exact_exchange_screened(
               const int n = nbf_v(b);
               const int np = npts_v(b);
               if (n == 0 || np == 0)
+                return;
+              if (pmax(b, j) < tol)
                 return;
               const size_t cb = coll_off(b) - coll_off(b0);
               const double *chi_b = chi.data() + cb;
@@ -391,6 +626,8 @@ inline DeviceView2DLeft compute_exact_exchange_screened(
               const int np = npts_v(b);
               if (n == 0 || np == 0)
                 return;
+              if (pmax(b, j) < tol)
+                return;
               const size_t cb = coll_off(b) - coll_off(b0);
               const size_t tb =
                   static_cast<size_t>(N_aux) * (bf_off(b) - bf_off(b0));
@@ -419,6 +656,8 @@ inline DeviceView2DLeft compute_exact_exchange_screened(
               const int b = b0 + team.league_rank();
               const int n = nbf_v(b);
               if (n == 0 || npts_v(b) == 0)
+                return;
+              if (pmax(b, j) < tol)
                 return;
               const size_t tb =
                   static_cast<size_t>(N_aux) * (bf_off(b) - bf_off(b0));
@@ -453,6 +692,94 @@ inline DeviceView2DLeft compute_exact_exchange_screened(
   Kokkos::fence();
   Kokkos::Profiling::popRegion();
   return result;
+}
+
+/**
+ *  @brief max_g |psi_i(g)| per (box, orbital), without the exchange build.
+ *
+ *  This is exactly the quantity compute_exact_exchange_screened screens on,
+ *  and it is produced by the same two kernels -- but without the auxiliary
+ *  potential, the three-centre GEMMs, the scatter or the fitting metric, so
+ *  it costs a small fraction of one build. That is what makes choosing a
+ *  tolerance, or asking whether a tolerance would skip anything at all,
+ *  affordable on a system large enough for the answer to differ.
+ *
+ *  The chunking does not enter the result: a box's amplitude does not depend
+ *  on which chunk the box was processed in, nor on the orbital batch, so
+ *  max_chunk_points may be left at zero even though the build caps it to
+ *  pair the chunk with an (naux, npts) potential block.
+ *
+ *  @param box_work  if non-null, filled with nbf_b * np_b per box -- what
+ *                   one (box, orbital) pair costs, up to the naux factor
+ *                   every pair shares. A count of skipped pairs is not a
+ *                   speedup; a count weighted by this is.
+ *
+ *  @return (num_boxes, norb) on the host. A box with no points reads zero.
+ */
+template <typename Evaluator>
+  requires BasisEvaluatorWith<Evaluator, BasisDeriv::Value>
+inline Kokkos::View<double **, HostSpace>
+orbital_box_amplitudes(const ExecSpace space, const Evaluator basis,
+                       const FlatGrid grid, const NeighborList nl,
+                       const DeviceView2DLeft C,
+                       const int max_chunk_points = 0,
+                       std::vector<double> *box_work = nullptr) {
+  const int norb = static_cast<int>(C.extent(1));
+  const int N_quad = static_cast<int>(grid.quad_points.extent(0));
+  const PackedBlockLayout L = build_packed_block_layout(
+      basis, nl, (size_t{64} << 20), max_chunk_points);
+
+  Kokkos::View<double **, HostSpace> out("orbital box amplitudes",
+                                         std::max(L.num_boxes, 0), norb);
+  if (box_work) {
+    box_work->assign(static_cast<size_t>(std::max(L.num_boxes, 0)), 0.0);
+    const auto nbf_h =
+        Kokkos::create_mirror_view_and_copy(HostSpace{}, L.map.nbf);
+    const auto npts_h =
+        Kokkos::create_mirror_view_and_copy(HostSpace{}, L.npts);
+    for (int b = 0; b < L.num_boxes; ++b)
+      (*box_work)[static_cast<size_t>(b)] =
+          static_cast<double>(nbf_h(b)) * static_cast<double>(npts_h(b));
+  }
+  if (norb == 0 || L.num_boxes == 0)
+    return out;
+
+  const int batch = std::min(norb, detail::MAX_ORBITAL_BATCH);
+  Kokkos::View<double *> chi("packed chi", L.max_chunk_coll);
+  const size_t psi_stride = static_cast<size_t>(L.max_chunk_npts);
+  Kokkos::View<double *> psi("psi", static_cast<size_t>(batch) * psi_stride);
+  Kokkos::View<double **> pmax("orbital amplitude per box", L.num_boxes,
+                               batch);
+  auto pmax_h = Kokkos::create_mirror_view(pmax);
+  const int mppb = L.mppb;
+
+  for (int i0 = 0; i0 < norb; i0 += batch) {
+    const int nb = std::min(batch, norb - i0);
+    Kokkos::deep_copy(pmax, 0.0);
+
+    for (size_t c = 0; c + 1 < L.chunk_begin.size(); ++c) {
+      const int b0 = L.chunk_begin[c], b1 = L.chunk_begin[c + 1];
+      if (b1 <= b0)
+        continue;
+      const int g0 = b0 * mppb;
+      if (std::min(b1 * mppb, N_quad) - g0 <= 0)
+        continue;
+      pack_collocation<BasisDeriv::Value>(basis, grid, nl, L, b0, b1, chi);
+      space.fence();
+      detail::chunk_orbitals_on_grid(space, L, b0, b1, g0, chi, C, i0, nb,
+                                     psi, psi_stride);
+      space.fence();
+      detail::chunk_box_amplitudes(space, L, b0, b1, g0, psi, psi_stride, nb,
+                                   pmax);
+      space.fence();
+    }
+
+    Kokkos::deep_copy(pmax_h, pmax);
+    for (int b = 0; b < L.num_boxes; ++b)
+      for (int j = 0; j < nb; ++j)
+        out(b, i0 + j) = pmax_h(b, j);
+  }
+  return out;
 }
 
 } // namespace Nukexc

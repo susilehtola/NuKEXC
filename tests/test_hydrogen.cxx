@@ -52,6 +52,7 @@
 #include <nukexc/diagonalizer.hpp>
 #include <nukexc/exact_exchange.hpp>
 #include <nukexc/grid.hpp>
+#include <nukexc/localize.hpp>
 #include <nukexc/molecule.hpp>
 #include <nukexc/partitioning.hpp>
 #include <nukexc/stobasis.hpp>
@@ -1008,6 +1009,187 @@ TEST_CASE("The screened Coulomb and exchange match the dense ones",
       REQUIRE_THAT(Ks_h(a, b),
                    Catch::Matchers::WithinAbs(Kd_h(a, b), 1e-8 * kscale));
     }
+}
+
+TEST_CASE("Pivoted Cholesky reproduces the matrix and finds its rank",
+          "[localize]") {
+  // A rank-3 positive semidefinite matrix in five dimensions, built as an
+  // outer product so the rank is known rather than assumed.
+  const int n = 5, r = 3;
+  DeviceView2DLeft V("V", n, r);
+  auto vh = Kokkos::create_mirror_view(V);
+  for (int mu = 0; mu < n; ++mu)
+    for (int k = 0; k < r; ++k)
+      vh(mu, k) = std::cos(0.9 * (mu + 1) * (k + 2)) + 0.1 * (mu - k);
+  Kokkos::deep_copy(V, vh);
+
+  DeviceView1D ones("ones", r);
+  Kokkos::deep_copy(ones, 1.0);
+  const auto P = occupied_density_matrix(V, ones);
+  const auto L = pivoted_cholesky(P, 1e-14);
+
+  // The rank is found, not given: the factorization stops when the residual
+  // diagonal is exhausted, and the matrix has exactly three directions.
+  REQUIRE(L.extent(1) == static_cast<size_t>(r));
+
+  auto Ph = Kokkos::create_mirror_view_and_copy(HostSpace{}, P);
+  auto Lh = Kokkos::create_mirror_view_and_copy(HostSpace{}, L);
+  double scale = 0.0;
+  for (int mu = 0; mu < n; ++mu)
+    scale = std::max(scale, std::abs(Ph(mu, mu)));
+  REQUIRE(scale > 1e-6);
+  for (int mu = 0; mu < n; ++mu)
+    for (int nu = 0; nu < n; ++nu) {
+      double acc = 0.0;
+      for (size_t k = 0; k < Lh.extent(1); ++k)
+        acc += Lh(mu, k) * Lh(nu, k);
+      INFO("P(" << mu << ", " << nu << "): L L^T " << acc << ", P "
+                << Ph(mu, nu) << ", scale " << scale);
+      REQUIRE_THAT(acc, Catch::Matchers::WithinAbs(Ph(mu, nu), 1e-12 * scale));
+    }
+}
+
+TEST_CASE("Cholesky factors give the same exchange, and the screening is "
+          "bounded by its tolerance",
+          "[exchange][screened][localize]") {
+  // Two H atoms, two s-STOs each, and TWO occupied orbitals with DIFFERENT
+  // occupations. The unequal occupations are the point: a unitary rotation
+  // of the occupied set would not leave K invariant here, and the Cholesky
+  // substitution still does, because K sees nothing but P.
+  Molecule mol(std::vector<std::vector<double>>{{0., 0., 0.}, {0., 0., 1.4}},
+               std::vector<unsigned>{1u, 1u});
+  auto grid = make_flat_grid<bk_type, ll_type>(mol, 60, 14);
+
+  STOBasisSet basis = make_manual_basis({
+      {1, 0, 0, 1.0, 0., 0., 0.},
+      {1, 0, 0, 1.6, 0., 0., 0.},
+      {1, 0, 0, 1.0, 0., 0., 1.4},
+      {1, 0, 0, 1.6, 0., 0., 1.4},
+  });
+  STOBasisSet basis_aux = make_manual_basis({
+      {1, 0, 0, 0.7, 0., 0., 0.},
+      {1, 0, 0, 2.0, 0., 0., 0.},
+      {1, 0, 0, 0.7, 0., 0., 1.4},
+      {1, 0, 0, 2.0, 0., 0., 1.4},
+  });
+
+  const int N_bf = basis.nbf();
+  DeviceView2DLeft C("C", N_bf, 2);
+  DeviceView1D occ("occ", 2);
+  auto ch = Kokkos::create_mirror_view(C);
+  auto oh = Kokkos::create_mirror_view(occ);
+  ch(0, 0) = 0.6;  ch(1, 0) = 0.3;  ch(2, 0) = 0.6;  ch(3, 0) = 0.3;
+  ch(0, 1) = 0.5;  ch(1, 1) = -0.2; ch(2, 1) = -0.5; ch(3, 1) = 0.2;
+  oh(0) = 2.0;
+  oh(1) = 1.0;
+  Kokkos::deep_copy(C, ch);
+  Kokkos::deep_copy(occ, oh);
+
+  ExecSpace space;
+  const int max_points_per_box = 32;
+  auto bb = create_bounding_boxes(grid, max_points_per_box);
+  NeighborList nl;
+  build_neighbor_list(STOPrimitiveEvaluator(basis), bb, max_points_per_box,
+                      grid.quad_points, nl);
+  auto metric =
+      coulomb_overlap_metric(space, STOPotentialEvaluator(basis_aux), grid);
+  auto half_inverse_X = compute_half_inverse(metric, 1e-6);
+
+  const auto chol = cholesky_localized_occupied(C, occ);
+  REQUIRE(chol.rank == 2);
+
+  auto run = [&](const DeviceView2DLeft &Cx, const DeviceView1D &ox,
+                 const double tol, ExchangeScreeningStats *st) {
+    return compute_exact_exchange_screened(
+        space, Cx, ox, STOPrimitiveEvaluator(basis),
+        STOPotentialEvaluator(basis_aux), grid, nl, half_inverse_X, 8, tol,
+        st);
+  };
+
+  const auto K_ref = run(C, occ, 0.0, nullptr);
+  auto Kr = Kokkos::create_mirror_view_and_copy(HostSpace{}, K_ref);
+  double scale = 0.0;
+  for (int a = 0; a < N_bf; ++a)
+    for (int b = 0; b < N_bf; ++b)
+      scale = std::max(scale, std::abs(Kr(a, b)));
+  REQUIRE(scale > 1e-3);
+
+  {
+    // Same density matrix, different factors, same K. The agreement is at
+    // round-off and not at the screening tolerance, because this is an
+    // identity rather than an approximation.
+    const auto K_chol = run(chol.C, chol.occ, 0.0, nullptr);
+    auto Kc = Kokkos::create_mirror_view_and_copy(HostSpace{}, K_chol);
+    for (int a = 0; a < N_bf; ++a)
+      for (int b = 0; b < N_bf; ++b) {
+        INFO("K(" << a << ", " << b << "): Cholesky " << Kc(a, b)
+                  << ", canonical " << Kr(a, b) << ", scale " << scale);
+        REQUIRE_THAT(Kc(a, b),
+                     Catch::Matchers::WithinAbs(Kr(a, b), 1e-11 * scale));
+      }
+  }
+
+  {
+    // A tolerance of zero is the screening switched off, and the statistics
+    // have to say so: pmax is a maximum of absolute values, so nothing is
+    // ever below zero.
+    ExchangeScreeningStats st;
+    run(chol.C, chol.occ, 0.0, &st);
+    REQUIRE(st.pairs_total > 0);
+    REQUIRE(st.pairs_alive == st.pairs_total);
+  }
+
+    // The smallest positive tolerance there is can only drop boxes where
+    // the orbital vanishes to the last bit, so K must come back unchanged.
+    // Whether any box qualifies is a property of the system and not
+    // something to assert; what is asserted is that the screening cannot
+    // claim more pairs than carry work, and that K does not move.
+  {
+    ExchangeScreeningStats st;
+    const auto K = run(chol.C, chol.occ, 1e-300, &st);
+    REQUIRE(st.pairs_alive <= st.pairs_total);
+    auto Kh = Kokkos::create_mirror_view_and_copy(HostSpace{}, K);
+    for (int a = 0; a < N_bf; ++a)
+      for (int b = 0; b < N_bf; ++b) {
+        INFO("K(" << a << ", " << b << "): " << Kh(a, b) << " vs " << Kr(a, b)
+                  << ", alive " << st.pairs_alive << " of "
+                  << st.pairs_total);
+        REQUIRE_THAT(Kh(a, b),
+                     Catch::Matchers::WithinAbs(Kr(a, b), 1e-11 * scale));
+      }
+  }
+
+  {
+    // A tolerance above every amplitude drops every box, which must give
+    // exactly zero rather than something small: that is what proves the
+    // skip removes the work instead of leaving stale blocks behind.
+    ExchangeScreeningStats st;
+    const auto K = run(chol.C, chol.occ, 1e300, &st);
+    REQUIRE(st.pairs_alive == 0);
+    auto Kh = Kokkos::create_mirror_view_and_copy(HostSpace{}, K);
+    for (int a = 0; a < N_bf; ++a)
+      for (int b = 0; b < N_bf; ++b)
+        REQUIRE(Kh(a, b) == 0.0);
+  }
+
+  {
+    // And a tolerance in between is an approximation whose error tracks it.
+    // A box contributes at most its own amplitude times a bounded integral,
+    // so the error in K stays near the tolerance rather than near one. The
+    // bound asserted is loose on purpose: the point is the ORDER, which a
+    // sign error or a stale block would miss by many of them.
+    ExchangeScreeningStats st;
+    const auto K = run(chol.C, chol.occ, 1e-6, &st);
+    REQUIRE(st.pairs_alive < st.pairs_total);
+    auto Kh = Kokkos::create_mirror_view_and_copy(HostSpace{}, K);
+    double worst = 0.0;
+    for (int a = 0; a < N_bf; ++a)
+      for (int b = 0; b < N_bf; ++b)
+        worst = std::max(worst, std::abs(Kh(a, b) - Kr(a, b)));
+    INFO("worst |dK| " << worst << ", scale " << scale << ", alive "
+                       << st.pairs_alive << " of " << st.pairs_total);
+    REQUIRE(worst < 1e-3 * scale);
+  }
 }
 
 // ============================================================
