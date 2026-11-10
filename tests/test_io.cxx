@@ -63,6 +63,14 @@ bool ArgParser::double_opt(const std::string &prefix, double &out) const {
   return false;
 }
 
+bool ArgParser::bool_opt(const std::string &name, bool &out) const {
+  if (arg == name) {
+    out = true;
+    return true;
+  }
+  return false;
+}
+
 std::string repeat(const std::string &s, int n) {
   std::string r;
   for (int i = 0; i < n; ++i)

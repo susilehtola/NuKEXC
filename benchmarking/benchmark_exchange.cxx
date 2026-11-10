@@ -54,6 +54,59 @@
 // construction out of the orbital loop at all, which is what issue #8
 // proposes -- needs those two numbers first.
 //
+// The sweep also answers a question it cannot time directly. Separating P
+// from Q shows WHERE the time is, and N_occ * Q is the large majority of
+// the total -- so issue #8's proposal to hoist the three-centre
+// construction out of the orbital loop is a question about that one GEMM.
+// Which ordering is cheaper follows from the LAYOUT alone, so --layout-only
+// prints it rather than guessing; layout_cost() below derives it.
+//
+// What it says, and it is not what the issue assumes. Aligned alkanes, DZ,
+// 128-point boxes, from --layout-only --alkane=n:
+//
+//     system     nbf   nbf/box   floor B/C   pair-first needs   neutral
+//                        mean                      nocc >        nocc
+//     CH4         18      17.7      0.139            11            5
+//     C4H10       60      54.2      0.426            48           17
+//     C8H18      116      88.5      0.702           152           33
+//     C16H34     228     114.9      0.936           940           65
+//     C24H50     340     124.8      1.014          never          97
+//     C32H66     452     129.2      1.041          never         129
+//     benzene     72      63.6      0.500            65           21
+//
+// The occupancy pair-first would need RUNS AWAY -- 11, 48, 152, 940 -- and
+// past about C24 no occupancy works at all, because the floor B/C passes
+// one. The floor is essentially nbf_b / np_b, and nbf_b saturates at the
+// screening radius while np_b is pinned by max_points_per_box, so the two
+// meet and then cross. The occupancy, meanwhile, only grows linearly. The
+// gap therefore WIDENS with system size rather than closing.
+//
+// That makes box size the lever, not the loop order. C16H34 again, varying
+// --box-size:
+//
+//     box pts    128     256     512    1024    2048
+//     nbf/box  114.9   117.9   122.0   126.4   131.3
+//     floor    0.936   0.481   0.248   0.129   0.068
+//     needs      940     119      85      76      74
+//
+// nbf/box barely moves -- 115 to 131 while the point count went up
+// sixteenfold -- because the screening already localizes the functions, so
+// the floor falls as 1/box. The required occupancy then asymptotes to about
+// 74 for this basis, which is A/C: the grid-work-only crossover.
+//
+// So the hoist is not independently worth doing; it is worth doing WITH a
+// boxing change, and only above roughly 75 occupied orbitals (about C20).
+// At the current 128-point boxes it is a loss at every size measured here.
+// Note also that pair-first must hold naux * nbf_b(nbf_b+1)/2 per box --
+// 128 MiB for C16H34 at these sizes -- so it needs blocking over the
+// auxiliary index, which the orbital-first form does not.
+//
+// These are flop counts from the measured layout, not timings. The two
+// orderings' constant factors are not identical: pair-first's grid step is
+// a larger GEMM with more reuse, and its contraction is a clean one. A
+// ratio near one should be settled by building the thing; a ratio of 1.04
+// that grows with system size should not.
+//
 // RUN IT MORE THAN ONCE. The first sweep taken on this machine showed a
 // clean minimum at a batch of eight and a penalty beyond it; the next two
 // showed a flat curve from four upwards. The difference between adjacent
@@ -87,6 +140,7 @@
 #include <nukexc/stobasis.hpp>
 #include <nukexc/stopotential.hpp>
 
+#include "alkane.hpp"
 #include "standards.hpp"
 #include "sto_basis_reader.hpp"
 #include "test_io.hpp"
@@ -105,6 +159,8 @@ struct Config {
   int max_points_per_box = 128;
   double occupied_fraction = 0.1;
   double lin_dep = 1e-6;
+  int alkane = 0;        ///< >0: use C_nH_(2n+2) instead of water + benzene
+  bool layout_only = false;
 };
 
 Config parse_args(int argc, char *argv[]) {
@@ -124,13 +180,19 @@ Config parse_args(int argc, char *argv[]) {
                 << "  --box-size=<int>  Max points per box    (default: "
                 << cfg.max_points_per_box << ")\n"
                 << "  --occ=<float>     Occupied fraction     (default: "
-                << cfg.occupied_fraction << ")\n";
+                << cfg.occupied_fraction << ")\n"
+                << "  --alkane=<int>    Use C_nH_(2n+2) instead of the\n"
+                << "                    default water + benzene pair\n"
+                << "  --layout-only     Print the loop-ordering analysis\n"
+                << "                    and skip the timing sweep\n";
       std::exit(0);
     } else if (!p.string_opt("--basis=", cfg.basis_dir) &&
                !p.int_opt("--nrad=", cfg.nrad) &&
                !p.int_opt("--nang=", cfg.nang) &&
                !p.double_opt("--tol=", cfg.screening_tol) &&
                !p.int_opt("--box-size=", cfg.max_points_per_box) &&
+               !p.int_opt("--alkane=", cfg.alkane) &&
+               !p.bool_opt("--layout-only", cfg.layout_only) &&
                !p.double_opt("--occ=", cfg.occupied_fraction)) {
       throw std::runtime_error("Unknown argument: " + p.arg + " (try --help)");
     }
@@ -161,6 +223,74 @@ DeviceView2DLeft model_orbitals(const int nbf, const int n_occ) {
   return C;
 }
 
+/// What the two loop orderings cost, from the layout alone.
+///
+/// The three-centre GEMM is where the time goes, and the two orderings
+/// contract the same box-local quantities in a different order. Per box,
+/// with x = nbf_b, p = np_b and pairs = x(x+1)/2:
+///
+///   orbital-first (what the code does)
+///       nocc * naux * x * p            -- one GEMM per orbital per box
+///   pair-first (what issue #8 proposes: build (Q|mu nu) per box once,
+///              then contract with the orbital coefficients)
+///       naux * pairs * p               -- build it, on the grid
+///     + nocc * naux * x * x            -- contract it, NO point factor
+///
+/// The second line is the one that decides this, and it is easy to leave
+/// out: hoisting the build off the orbital loop does not hoist away the
+/// contraction that replaces it, and that contraction costs naux * x^2 per
+/// orbital where the direct form costs naux * x * p. So pair-first is
+/// cheaper only when x is small against p -- when a box holds many more
+/// POINTS than functions.
+///
+/// Summing over boxes with A = sum pairs*p, B = sum x^2, C = sum x*p,
+///
+///       pair / orbital = A / (nocc * C)  +  B / C
+///
+/// so pair-first wins iff nocc > A / (C - B), and NEVER, at any occupancy,
+/// once B >= C. That is the whole criterion, and both parts are printed:
+/// B/C is a floor pair-first cannot get under no matter how many orbitals
+/// there are.
+struct LayoutCost {
+  int num_boxes = 0;
+  double mean_nbf = 0.0, mean_npts = 0.0;
+  int max_nbf = 0;
+  double floor_ratio = 0.0;  ///< B/C: pair-first's irreducible cost
+  double crossover = 0.0;    ///< nocc above which pair-first wins, or <0
+};
+
+template <typename Evaluator>
+LayoutCost layout_cost(const Evaluator &ev, const NeighborList &nl,
+                       const int naux, const int npts) {
+  const PackedBlockLayout L = build_packed_block_layout(
+      ev, nl, (size_t{64} << 20), aux_chunk_points(naux, npts));
+  const auto nbf_h =
+      Kokkos::create_mirror_view_and_copy(HostSpace{}, L.map.nbf);
+  const auto npts_h = Kokkos::create_mirror_view_and_copy(HostSpace{}, L.npts);
+
+  LayoutCost c;
+  c.num_boxes = L.num_boxes;
+  c.max_nbf = L.max_nbf;
+  double sum_nbf = 0.0, sum_npts = 0.0, A = 0.0, B = 0.0, C = 0.0;
+  for (int b = 0; b < L.num_boxes; ++b) {
+    const double x = nbf_h(b), p = npts_h(b);
+    sum_nbf += x;
+    sum_npts += p;
+    A += x * (x + 1.0) / 2.0 * p;
+    B += x * x;
+    C += x * p;
+  }
+  if (L.num_boxes > 0) {
+    c.mean_nbf = sum_nbf / L.num_boxes;
+    c.mean_npts = sum_npts / L.num_boxes;
+  }
+  c.floor_ratio = C > 0.0 ? B / C : 0.0;
+  // Negative means the floor alone already costs more than orbital-first
+  // pays in total, so no occupancy makes pair-first win.
+  c.crossover = C > B ? A / (C - B) : -1.0;
+  return c;
+}
+
 /// Largest absolute element, so a wrong batch size shows up as a wrong
 /// matrix rather than only as a different time.
 double max_abs(const DeviceView2DLeft &m) {
@@ -188,8 +318,20 @@ int main(int argc, char *argv[]) {
   {
     ExecSpace space;
     std::vector<std::pair<std::string, Molecule>> mols;
-    mols.push_back({"water", make_water()});
-    mols.push_back({"benzene", make_benzene()});
+    if (cfg.alkane > 0) {
+      // The canonical screening system: nbf/box saturates along the chain
+      // while the occupancy keeps growing, which is the only way to reach
+      // the crossover below. Aligned, so the boxes are as small as an
+      // axis-aligned subdivision can make them -- the diagonal chain would
+      // inflate nbf/box and push the crossover UP, flattering the current
+      // ordering.
+      mols.push_back({"C" + std::to_string(cfg.alkane) + "H" +
+                          std::to_string(2 * cfg.alkane + 2),
+                      test::alkane(cfg.alkane, test::ChainAxis::Aligned)});
+    } else {
+      mols.push_back({"water", make_water()});
+      mols.push_back({"benzene", make_benzene()});
+    }
 
     try {
       for (auto &[name, mol] : mols) {
@@ -204,6 +346,10 @@ int main(int argc, char *argv[]) {
         const int naux = ev_aux.nbf();
         const int n_occ =
             std::max(1, static_cast<int>(cfg.occupied_fraction * nbf + 0.5));
+        // The timing sweep uses the model occupancy above, because the
+        // sweep is about the batch. The crossover is a statement about the
+        // real molecule, so it is compared against the neutral one.
+        const int n_occ_neutral = static_cast<int>(mol.Z_total / 2);
 
         FlatGrid grid = make_flat_grid<ta_type, ll_type>(mol, cfg.nrad,
                                                          cfg.nang);
@@ -214,18 +360,28 @@ int main(int argc, char *argv[]) {
                             nl);
         Kokkos::fence();
 
-        // The metric, once -- an SCF builds it once too.
-        const auto metric = coulomb_overlap_metric(space, ev_aux, grid);
-        const auto X = compute_half_inverse(metric, cfg.lin_dep);
-        Kokkos::fence();
-
-        const auto C = model_orbitals(nbf, n_occ);
-        DeviceView1D occ("occ", n_occ);
-        Kokkos::deep_copy(occ, 1.0);
-
+        const LayoutCost lc = layout_cost(ev, nl, naux, npts);
+        const double mib = 8.0 / (1024.0 * 1024.0);
         std::cout << "\n" << name << ": nbf " << nbf << ", naux " << naux
-                  << ", nocc " << n_occ << ", grid " << npts << ", fit rank "
-                  << X.extent(1) << "\n"
+                  << ", nocc " << n_occ << ", grid " << npts << "\n"
+                  << "  boxes " << lc.num_boxes << ", nbf/box mean "
+                  << std::fixed << std::setprecision(1) << lc.mean_nbf
+                  << " max " << lc.max_nbf << ", pts/box mean "
+                  << lc.mean_npts << "\n"
+                  << "  pair-first floor B/C " << std::setprecision(3)
+                  << lc.floor_ratio << " of orbital-first; "
+                  << (lc.crossover < 0.0
+                          ? std::string("NO occupancy makes it win")
+                          : "wins for nocc > " +
+                                std::to_string(
+                                    static_cast<int>(lc.crossover + 0.5)))
+                  << "; neutral nocc is " << n_occ_neutral << "\n"
+                  << "  three-centre tensor: orbital-first (batch 8) "
+                  << std::setprecision(1)
+                  << static_cast<double>(naux) * nbf * 8 * mib
+                  << " MiB, pair-first "
+                  << static_cast<double>(naux) * nbf * n_occ * mib
+                  << " MiB\n"
                   << std::left << std::setw(9) << "batch" << std::right
                   << std::setw(10) << "passes" << std::setw(12) << "seconds"
                   << std::setw(14) << "max|K|" << "\n";
@@ -233,6 +389,25 @@ int main(int argc, char *argv[]) {
         // Stop AFTER the first batch that takes the whole orbital set in
         // one pass -- that case is the interesting end of the sweep, so
         // breaking before it would leave out the answer.
+        // --layout-only stops here, before the metric: its half-inverse is
+        // an naux x naux eigendecomposition, which the layout report does
+        // not use and which dominates the run at a few thousand
+        // auxiliaries.
+        if (cfg.layout_only) {
+          std::cout << std::flush;
+          continue;
+        }
+
+        // The metric, once -- an SCF builds it once too.
+        const auto metric = coulomb_overlap_metric(space, ev_aux, grid);
+        const auto X = compute_half_inverse(metric, cfg.lin_dep);
+        Kokkos::fence();
+        std::cout << "  fit rank " << X.extent(1) << "\n";
+
+        const auto C = model_orbitals(nbf, n_occ);
+        DeviceView1D occ("occ", n_occ);
+        Kokkos::deep_copy(occ, 1.0);
+
         for (const int want : {1, 2, 4, 8, 16, 32}) {
           const int passes = (n_occ + want - 1) / want;
           Kokkos::Timer t;

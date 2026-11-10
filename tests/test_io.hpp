@@ -73,6 +73,11 @@ struct ArgParser {
   bool string_opt(const std::string &prefix, std::string &out) const;
   bool int_opt(const std::string &prefix, int &out) const;
   bool double_opt(const std::string &prefix, double &out) const;
+
+  // A valueless switch: if `arg` is exactly `name`, set `out` to true and
+  // return true. Takes the WHOLE token, not a prefix, so "--foo" does not
+  // also match "--foobar".
+  bool bool_opt(const std::string &name, bool &out) const;
 };
 
 // Concatenate `n` copies of `s` (used to draw the box frame lines).

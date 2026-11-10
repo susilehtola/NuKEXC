@@ -228,6 +228,19 @@ inline DeviceView2DLeft compute_exact_exchange_screened(
   // The parameter exists so the sweep above can be re-measured rather than
   // believed. The cap is a compile-time constant because the per-point
   // accumulator lives in registers.
+  //
+  // The orbital loop STAYS outermost. Issue #8 proposes hoisting the
+  // three-centre construction out of it -- building (Q|mu nu) per box once
+  // and contracting with the coefficients afterwards -- and the layout says
+  // not to. That ordering replaces naux * nbf_b * np_b per orbital with
+  // naux * nbf_b^2 per orbital plus a grid term, so its floor relative to
+  // this one is about nbf_b / np_b. With 128-point boxes nbf_b saturates at
+  // the screening radius and reaches the point count, the floor passes one
+  // around C24, and beyond that NO occupancy makes the hoist cheaper; the
+  // gap widens with system size rather than closing. It becomes worth doing
+  // only together with much larger boxes, and then only above roughly 75
+  // occupied orbitals. benchmark_exchange --layout-only prints the numbers
+  // for any system, and its header carries the tables.
   constexpr int MAX_ORBITAL_BATCH = 32;
   if (orbital_batch < 1)
     throw std::invalid_argument(
