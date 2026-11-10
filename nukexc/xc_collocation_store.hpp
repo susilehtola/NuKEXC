@@ -370,10 +370,12 @@ private:
  *  ingredients come from density.hpp's packed_density, which packs the same
  *  blocks for the density contraction.
  *
- *  A Laplacian meta-GGA is rejected: pack_collocation goes to the gradient,
- *  and extending it is a code-generation job in the solid-harmonic
- *  switches, not a change here. LDA, GGA and tau meta-GGA are covered,
- *  which is every family whose collocation stops at the gradient.
+ *  Every family the dense store covers is covered here, under the same
+ *  condition: a Laplacian meta-GGA needs an evaluator that provides second
+ *  derivatives, which the Gaussians do (BasisDeriv::LaplGradient) and the
+ *  Slater radial shells do not (BasisDeriv::Gradient). That limit is the
+ *  evaluator's, not the packing's, so it falls in the same place for both
+ *  stores and neither can be worked around by choosing the other.
  */
 template <typename Evaluator>
   requires BasisEvaluatorWith<Evaluator, BasisDeriv::Gradient>
@@ -388,11 +390,11 @@ public:
         mppb_(nl.max_points_per_box) {
     if (n_ <= 0)
       throw std::invalid_argument("PackedCollocationStore: empty basis");
-    if (family_ == XCFamily::MetaGGALapl)
+    if (family_ == XCFamily::MetaGGALapl &&
+        !BasisEvaluatorWith<Evaluator, BasisDeriv::Hessian>)
       throw std::invalid_argument(
-          "PackedCollocationStore: a Laplacian meta-GGA needs the second "
-          "derivatives of the basis, which a packed block does not carry; "
-          "use the dense store for XCFamily::MetaGGALapl");
+          "PackedCollocationStore: a Laplacian meta-GGA needs an evaluator "
+          "that provides second derivatives");
 
     L_ = build_packed_block_layout(basis_, nl_, budget_bytes);
     nbf_h_ = Kokkos::create_mirror_view_and_copy(HostSpace{}, L_.map.nbf);
@@ -439,6 +441,21 @@ public:
     if (family_ == XCFamily::LDA) {
       packed_density<BasisDeriv::Value>(basis_, grid_, nl_, L_, P, out.rho);
       return;
+    }
+    // out.lapl is empty for every other family, and packed_density writes
+    // only what it was handed, so the one call covers the gradient families
+    // and the Laplacian one alike. The if constexpr is what keeps the
+    // Hessian instantiation out of an evaluator that cannot do it.
+    if constexpr (BasisEvaluatorWith<Evaluator, BasisDeriv::Hessian>) {
+      if (deriv_ == BasisDeriv::Hessian) {
+        packed_density<BasisDeriv::Hessian>(basis_, grid_, nl_, L_, P, out.rho,
+                                            out.rho_x, out.rho_y, out.rho_z,
+                                            out.tau, out.lapl);
+        dot_gradients(out.rho_x, out.rho_y, out.rho_z, out.rho_x, out.rho_y,
+                      out.rho_z, out.sigma);
+        Kokkos::fence();
+        return;
+      }
     }
     packed_density<BasisDeriv::Gradient>(basis_, grid_, nl_, L_, P, out.rho,
                                          out.rho_x, out.rho_y, out.rho_z,
@@ -545,12 +562,21 @@ private:
     for (size_t c = 0; c + 1 < L_.chunk_begin.size(); ++c) {
       const int b0 = L_.chunk_begin[c], b1 = L_.chunk_begin[c + 1];
 
-      if (deriv_ == BasisDeriv::Value)
+      if (deriv_ == BasisDeriv::Value) {
         pack_collocation<BasisDeriv::Value, PackedLayout::Tower>(
             basis_, grid_, nl_, L_, b0, b1, tower_);
-      else
+      } else if (deriv_ == BasisDeriv::Gradient) {
         pack_collocation<BasisDeriv::Gradient, PackedLayout::Tower>(
             basis_, grid_, nl_, L_, b0, b1, tower_);
+      } else if constexpr (BasisEvaluatorWith<Evaluator,
+                                              BasisDeriv::Hessian>) {
+        pack_collocation<BasisDeriv::Hessian, PackedLayout::Tower>(
+            basis_, grid_, nl_, L_, b0, b1, tower_);
+      } else {
+        throw std::invalid_argument(
+            "PackedCollocationStore: evaluator provides no second "
+            "derivatives");
+      }
       Kokkos::fence();
 
       // On a host backend the mirror IS the tower, and there is nothing to

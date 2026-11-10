@@ -136,8 +136,10 @@ namespace Nukexc {
  *  @param mo_alpha   (nbf, n_occ) orbitals, contracted with @p occ_alpha
  *  @param func       a functional initialized with XC_POLARIZED
  *
- *  Covers LDA, GGA and tau meta-GGA. A Laplacian meta-GGA throws: a packed
- *  collocation block stops at the gradient.
+ *  Covers every family: LDA, GGA, tau meta-GGA and Laplacian meta-GGA. The
+ *  last needs an evaluator that provides second derivatives, and the
+ *  session's constructor is what says so -- the condition is the
+ *  evaluator's, identical for the dense path.
  *
  *  @return the energy and both spin channels' potentials, as device matrices
  */
@@ -181,14 +183,21 @@ inline XC_result_polarized compute_xc_polarized_sparse(
     xc_gga_exc_vxc(&func, ng, s.rho_spin().data(), s.sigma_spin().data(),
                    zk.data(), vrho.data(), vsigma.data());
     break;
-  case XCFamily::MetaGGATau: {
-    // A tau-only meta-GGA reads no Laplacian, but Libxc's interface takes
-    // one anyway; zeros are what it is entitled to see, and vlapl comes
-    // back unused.
-    const std::vector<double> lapl_in(2 * static_cast<size_t>(ng), 0.0);
+  case XCFamily::MetaGGATau:
+  case XCFamily::MetaGGALapl: {
+    // The two meta-GGA families differ in one argument. A tau-only
+    // functional reads no Laplacian, but Libxc's interface takes one
+    // anyway; zeros are what it is entitled to see, and vlapl comes back
+    // unused. Asking the session for a Laplacian it did not compute would
+    // throw, which is why the zeros are a local array.
+    const bool want_lapl = family == XCFamily::MetaGGALapl;
+    const std::vector<double> zero_lapl(
+        want_lapl ? 0 : 2 * static_cast<size_t>(ng), 0.0);
+    const double *lapl_in =
+        want_lapl ? s.lapl_spin().data() : zero_lapl.data();
     xc_mgga_exc_vxc(&func, ng, s.rho_spin().data(), s.sigma_spin().data(),
-                    lapl_in.data(), s.tau_spin().data(), zk.data(),
-                    vrho.data(), vsigma.data(), vlapl.data(), vtau.data());
+                    lapl_in, s.tau_spin().data(), zk.data(), vrho.data(),
+                    vsigma.data(), vlapl.data(), vtau.data());
     break;
   }
   default:
@@ -200,8 +209,10 @@ inline XC_result_polarized compute_xc_polarized_sparse(
   XCPackedDerivsU d{.vrho = vrho.data()};
   if (family != XCFamily::LDA)
     d.vsigma = vsigma.data();
-  if (family == XCFamily::MetaGGATau)
+  if (family == XCFamily::MetaGGATau || family == XCFamily::MetaGGALapl)
     d.vtau = vtau.data();
+  if (family == XCFamily::MetaGGALapl)
+    d.vlapl = vlapl.data();
 
   DeviceView2DLeft Va("V alpha", nbf, nbf), Vb("V beta", nbf, nbf);
   auto Vah = Kokkos::create_mirror_view(Va);

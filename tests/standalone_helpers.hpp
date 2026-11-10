@@ -264,9 +264,11 @@ inline XC_result_polarized evaluate_functional(
 
 // ---------------------------------------------------------------------------
 // The screened polarized evaluator. There is no family switch here: one
-// screened quadrature covers LDA, GGA and tau meta-GGA, since the potential
-// comes from the generated kernels and the family only decides which
-// collocation order and which Libxc call it needs. The dense counterpart
+// screened quadrature covers every family, since the potential comes from
+// the generated kernels and the family only decides which collocation
+// order and which Libxc call it needs. On this driver's Slater basis that
+// means LDA, GGA and tau meta-GGA -- a Laplacian meta-GGA needs second
+// derivatives, which the radials do not provide. The dense counterpart
 // above still switches, because its chain rule is written per family.
 // ---------------------------------------------------------------------------
 inline XC_result_polarized evaluate_functional_sparse(

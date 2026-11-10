@@ -374,6 +374,9 @@ enum class PackedLayout {
   /// chi as (nbf_b, npts_b) and grad as (nbf_b, 3 * npts_b), the Cartesian
   /// components along each row's point axis. The block GEMMs contract over
   /// all three at once, which is why the components sit inside the row.
+  /// At Hessian order this layout carries the LAPLACIAN as a fourth buffer
+  /// and drops the off-diagonal second derivatives: the density operands
+  /// contract the trace and nothing here wants the other three.
   Blocks,
   /// One (ncomp, nbf_b, npts_b) tower per box, component-major, which is
   /// what libxckernel indexes as chi + k*nbf*npts + u*npts + g. Everything
@@ -390,13 +393,18 @@ enum class PackedLayout {
  *  O(sum_b nshell_b * npts_b) rather than the O(nbf_b^2 * npts_b) a
  *  function-pair kernel pays.
  *
- *  @tparam Deriv  Value packs only chi; Gradient also packs grad.
+ *  @tparam Deriv  Value packs only chi; Gradient also packs grad; Hessian
+ *                 under Tower packs all ten components and under Blocks
+ *                 adds the Laplacian (see PackedLayout::Blocks).
  *  @tparam Layout which of the two orders above to write.
  *  @param chi   packed (nbf_b, npts_b) blocks, row-major per box -- or the
  *               whole (ncomp, nbf_b, npts_b) tower under PackedLayout::Tower
  *  @param grad  packed (nbf_b, 3 * npts_b) blocks; ignored, and may be a
  *               default-constructed View, when Deriv is Value or the layout
  *               is Tower
+ *  @param lapl  packed (nbf_b, npts_b) blocks holding the trace of the
+ *               Hessian; required at Hessian order under Blocks, ignored
+ *               otherwise
  */
 template <BasisDeriv Deriv, PackedLayout Layout = PackedLayout::Blocks,
           typename Evaluator>
@@ -406,9 +414,23 @@ inline void pack_collocation(const Evaluator &basis, const FlatGrid &grid,
                              const PackedBlockLayout &L, const int box_begin,
                              const int box_end, Kokkos::View<double *> chi,
                              Kokkos::View<double *> grad =
+                                 Kokkos::View<double *>(),
+                             Kokkos::View<double *> lapl =
                                  Kokkos::View<double *>()) {
-  static_assert(Deriv == BasisDeriv::Value || Deriv == BasisDeriv::Gradient,
-                "pack_collocation packs values or values and gradients");
+  static_assert(Deriv == BasisDeriv::Value || Deriv == BasisDeriv::Gradient ||
+                    Deriv == BasisDeriv::Hessian,
+                "pack_collocation packs up to the second derivatives");
+  constexpr bool want_grad = Deriv >= BasisDeriv::Gradient;
+  constexpr bool want_hess = Deriv >= BasisDeriv::Hessian;
+  constexpr bool tower = (Layout == PackedLayout::Tower);
+  if constexpr (want_hess && !tower) {
+    // Sized by the caller, which is the only party that knows the chunk, so
+    // say so here rather than writing past the end of an empty View.
+    if (lapl.size() == 0)
+      throw std::invalid_argument(
+          "pack_collocation: a Blocks packing at Hessian order writes the "
+          "Laplacian, so `lapl` must be a chunk-sized buffer");
+  }
   using policy_type = Kokkos::TeamPolicy<ExecSpace>;
   using member_type = policy_type::member_type;
 
@@ -439,14 +461,12 @@ inline void pack_collocation(const Evaluator &basis, const FlatGrid &grid,
           return;
 
         const size_t cb = coll_off(b) - coll_off(box_begin);
-        constexpr bool tower = (Layout == PackedLayout::Tower);
         // Under Tower every component lives in `chi`, so the box's base
         // offset carries the component factor and the component stride is
         // one whole (nbf_b, npts_b) block.
         double *chi_b = chi.data() + (tower ? NC * cb : cb);
-        double *grad_b = (Deriv == BasisDeriv::Gradient && !tower)
-                             ? grad.data() + 3 * cb
-                             : nullptr;
+        double *grad_b = (want_grad && !tower) ? grad.data() + 3 * cb : nullptr;
+        double *lapl_b = (want_hess && !tower) ? lapl.data() + cb : nullptr;
         const int g0 = b * mppb;
 
         Kokkos::parallel_for(
@@ -464,22 +484,27 @@ inline void pack_collocation(const Evaluator &basis, const FlatGrid &grid,
 
               for (int i = 0; i < n; ++i) {
                 const size_t row = static_cast<size_t>(l0 + i);
-                chi_b[row * np + g] = local[BF_VAL * MBS + i];
-                if constexpr (Deriv == BasisDeriv::Gradient) {
-                  if constexpr (Layout == PackedLayout::Tower) {
-                    // One whole (nbf_b, npts_b) block between components.
-                    const size_t comp_stride =
-                        static_cast<size_t>(nbf_b) * np;
-                    double *t = chi_b + row * np + g;
-                    t[1 * comp_stride] = local[BF_DX * MBS + i];
-                    t[2 * comp_stride] = local[BF_DY * MBS + i];
-                    t[3 * comp_stride] = local[BF_DZ * MBS + i];
-                  } else {
+                if constexpr (tower) {
+                  // Component k of the evaluator's output IS component k of
+                  // the tower -- BF_VAL..BF_DZZ is libxckernel's own order,
+                  // which is what lets this be a loop instead of a list.
+                  // One whole (nbf_b, npts_b) block between components.
+                  const size_t comp_stride = static_cast<size_t>(nbf_b) * np;
+                  double *t = chi_b + row * np + g;
+                  for (int k = 0; k < NC; ++k)
+                    t[k * comp_stride] = local[k * MBS + i];
+                } else {
+                  chi_b[row * np + g] = local[BF_VAL * MBS + i];
+                  if constexpr (want_grad) {
                     double *gr = grad_b + row * 3 * static_cast<size_t>(np);
                     gr[0 * np + g] = local[BF_DX * MBS + i];
                     gr[1 * np + g] = local[BF_DY * MBS + i];
                     gr[2 * np + g] = local[BF_DZ * MBS + i];
                   }
+                  if constexpr (want_hess)
+                    lapl_b[row * np + g] = local[BF_DXX * MBS + i] +
+                                           local[BF_DYY * MBS + i] +
+                                           local[BF_DZZ * MBS + i];
                 }
               }
             });
@@ -714,6 +739,9 @@ inline void accumulate_collocation_product(const Evaluator &basis,
                                            const DeviceView2DLeft &out) {
   using policy_type = Kokkos::TeamPolicy<ExecSpace>;
   using member_type = policy_type::member_type;
+  static_assert(Deriv == BasisDeriv::Value || Deriv == BasisDeriv::Gradient,
+                "accumulate_collocation_product's zf takes a value and a "
+                "gradient; there is no second-derivative product to form");
   constexpr bool want_grad = (Deriv == BasisDeriv::Gradient);
 
   // Allocated once at the largest chunk and reused, so the loop over chunks

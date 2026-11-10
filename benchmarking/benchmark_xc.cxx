@@ -141,8 +141,9 @@ struct Row {
 // Same density matrix, same grid, same functional, same kernels: the two
 // differ only in where the collocation lives. What the table measures is
 // therefore exactly what that choice costs -- time per Fock build against
-// the memory held between builds -- for the three families whose
-// collocation stops at the gradient.
+// the memory held between builds. Three families, not four: the basis here
+// is Slater, whose radials stop at the gradient, so neither store can do a
+// Laplacian meta-GGA on it.
 
 struct SessionRow {
   std::string molecule;
